@@ -29,6 +29,7 @@ const qjs = @import("rove-qjs");
 const c = qjs.c;
 
 const globals = @import("../globals.zig");
+const held_mod = @import("../held.zig");
 
 const js_undefined = globals.js_undefined;
 const js_exception = globals.js_exception;
@@ -169,4 +170,45 @@ pub fn jsOnKv(
     };
     if (list.items[list.items.len - 1].on != null) return js_undefined;
     return armPromise(state, ctx, list);
+}
+
+/// `_system.held.nextInput()` — one pull of the connection's input
+/// iterator (`request.messages`, `held.zig`). Returns a promise the
+/// worker settles with the next inbound frame's iterator-result object
+/// (`{value, done}`); the resolving pair is kept Zig-side by index and
+/// recorded as THE activation's input pull (at most one outstanding —
+/// an async iterator hands out one pending step at a time). On a path
+/// without the promise model (connectionless) the pull can never be
+/// settled: return a promise rejected up-front so the misuse is loud at
+/// the call site, not a silent hang into the hold deadline.
+pub fn jsHeldNextInput(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    _ = argc;
+    _ = argv;
+    const state = globals.getState(ctx);
+    var funcs: [2]c.JSValue = undefined;
+    const promise = c.JS_NewPromiseCapability(ctx, &funcs);
+    if (c.JS_IsException(promise)) return promise;
+    const fail: ?[]const u8 = blk: {
+        const promises = state.host_promises orelse break :blk "request input cannot be awaited on this activation";
+        if (state.input_promise != null) break :blk held_mod.INPUT_ALREADY_PULLED;
+        promises.append(state.allocator, .{ .resolve = funcs[0], .reject = funcs[1] }) catch break :blk "nextInput: out of memory";
+        state.input_promise = @intCast(promises.items.len - 1);
+        break :blk null;
+    };
+    if (fail) |msg| {
+        const err = c.JS_NewError(ctx);
+        _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
+        var argv1 = [_]c.JSValue{err};
+        const rv = c.JS_Call(ctx, funcs[1], js_undefined, 1, &argv1);
+        c.JS_FreeValue(ctx, rv);
+        c.JS_FreeValue(ctx, err);
+        c.JS_FreeValue(ctx, funcs[0]);
+        c.JS_FreeValue(ctx, funcs[1]);
+    }
+    return promise;
 }

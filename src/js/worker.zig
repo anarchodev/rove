@@ -2223,9 +2223,14 @@ pub fn Worker(comptime opts: Options) type {
             for (self.fetch_pending_durability.items) |*pe|
                 components_mod.UpstreamFetchEvent.deinitItem(&pe.event, allocator);
             self.fetch_pending_durability.deinit(allocator);
-            self.dispatcher.deinit();
+            // Entities die BEFORE the dispatcher: a held chain's
+            // `HeldRequest` frees its request arena in its component
+            // deinit (`held.zig`), which must run while the dispatcher's
+            // dual arena is still alive — the reverse order walks a
+            // freed arena list at every shutdown with a held connection.
             if (self.log.log_push_curl) |easy| easy.deinit();
             self.h2.destroy();
+            self.dispatcher.deinit();
             allocator.destroy(self);
         }
 
@@ -4250,6 +4255,19 @@ pub fn recordFetchPromise(worker: anytype, ent: rove.Entity, coll: anytype, fetc
     grown[hr.fetch_promises.len] = .{ .id = id, .idx = idx };
     if (hr.fetch_promises.len > 0) a.free(hr.fetch_promises);
     hr.fetch_promises = grown;
+}
+
+/// Free whatever a `RunOutcome` owns, releasing a held arena too — for
+/// paths that must discard an outcome wholesale (a defined author
+/// error at a site with no park for it).
+pub fn discardRunOutcome(worker: anytype, oc: *dispatcher_mod.RunOutcome) void {
+    switch (oc.*) {
+        .terminal => |*r| r.deinit(worker.allocator),
+        .continuation => |*cont| cont.deinit(worker.allocator),
+        .stream => |*st| st.deinit(worker.allocator),
+        .held => |*h| dropHeld(worker, h),
+        .no_onheaders, .no_onchunk, .no_onmessage => {},
+    }
 }
 
 /// Release a `.held` outcome on a path that cannot park it: free the

@@ -251,6 +251,7 @@ fn runOne(
             @panic("runOne: handler returned a stream; use runOneOutcome");
         },
         .no_onheaders => @panic("runOne: no_onheaders outside an inbound_headers dispatch"),
+        .no_onmessage => @panic("runOne: no_onmessage outside a ws_message dispatch"),
         .no_onchunk => @panic("runOne: no_onchunk outside an inbound_chunk dispatch"),
     }
 }
@@ -303,7 +304,7 @@ test "dispatch: next(...) return is classified as a continuation" {
             try testing.expect(std.mem.indexOf(u8, cont.ctx_json, "\"u\":\"alice\"") != null);
             try testing.expect(std.mem.indexOf(u8, cont.ctx_json, "\"tries\":0") != null);
         },
-        .no_onheaders, .no_onchunk => return error.TestExpectedContinuation,
+        .no_onheaders, .no_onchunk, .no_onmessage => return error.TestExpectedContinuation,
     }
 }
 
@@ -344,7 +345,7 @@ test "dispatch: ordinary return stays terminal (trampoline does not engage)" {
             return error.TestExpectedContinuation;
         },
         .continuation => |*cont| cont.deinit(testing.allocator),
-        .no_onheaders, .no_onchunk => return error.TestExpectedContinuation,
+        .no_onheaders, .no_onchunk, .no_onmessage => return error.TestExpectedContinuation,
     }
 }
 
@@ -995,7 +996,7 @@ test "dispatch: ws_message frame payload on request.bytes/.text (§2.2)" {
             s.deinit(testing.allocator);
             return error.TestExpectedTerminal;
         },
-        .no_onheaders, .no_onchunk => return error.TestExpectedTerminal,
+        .no_onheaders, .no_onchunk, .no_onmessage => return error.TestExpectedTerminal,
     }
 }
 

@@ -58,6 +58,7 @@ const SURFACE_TESTS = [_]SurfaceTest{
     .{ .name = "textcodec", .src = @embedFile("surface_tests/textcodec.surface.mjs") },
     .{ .name = "blob", .src = @embedFile("surface_tests/blob.surface.mjs") },
     .{ .name = "request", .src = @embedFile("surface_tests/request.surface.mjs") },
+    .{ .name = "held", .src = @embedFile("surface_tests/held.surface.mjs") },
 };
 
 /// Non-shim surfaces that legitimately have a test module.
@@ -222,7 +223,7 @@ fn runSurfaceModule(
             std.debug.print("\nsurface-tests [{s}]: ended as a stream — return done() or next({{ctx: report}})\n", .{name});
             return error.SurfaceModuleBadEnding;
         },
-        .no_onheaders, .no_onchunk => {
+        .no_onheaders, .no_onchunk, .no_onmessage => {
             std.debug.print("\nsurface-tests [{s}]: probe outcome — surface modules must dispatch classic inbound\n", .{name});
             return error.SurfaceModuleBadEnding;
         },

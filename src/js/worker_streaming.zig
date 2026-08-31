@@ -1038,7 +1038,7 @@ fn finishStreamResume(
             markStreamDrainingAnywhere(server, ctx.ent);
             captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0, ctx.exec_seq);
         },
-        .no_onheaders, .no_onchunk => {
+        .no_onheaders, .no_onchunk, .no_onmessage => {
             ctx.txn.rollback() catch {};
             ctx.txn_done.* = true;
             markStreamDrainingAnywhere(server, ctx.ent);
@@ -1975,7 +1975,7 @@ pub fn runFire(
         // Only `.inbound_headers` / `.inbound_chunk` activations
         // produce these; connectionless fires never dispatch as one.
         // Defined failure.
-        .no_onheaders, .no_onchunk => {
+        .no_onheaders, .no_onchunk, .no_onmessage => {
             p.txn.rollback() catch {};
             p.txn_done = true;
             captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, fallback_tags, spec.act, 0, p.exec_seq);
@@ -3399,6 +3399,11 @@ pub fn flushResumeFetches(
                 pf.deinit(allocator);
                 continue;
             }
+            // Promise-bound (`held.zig`): a fetch awaited from a RESUME
+            // hop maps its id to the resolver here, same as the inbound
+            // bind seam.
+            if (pf.promise_idx) |pi|
+                worker_mod.recordFetchPromise(worker, ent, worker.parked_continuations, pf.id, pi);
             // The trampoline's own count bump targets `request_out`
             // (the open-hop home); on the resume path the entity is
             // parked — bump where it actually lives.

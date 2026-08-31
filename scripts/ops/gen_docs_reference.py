@@ -71,7 +71,7 @@ GROUPS = [
 # claim about live surface, and advertising one that is merged but not
 # switched on is the same false-claim class this page is audited for
 # (rove#322). Promote each into a GROUPS entry when it goes live.
-SKIPPED = {"request", "export", "stripe"}
+SKIPPED = {"request", "export", "stripe", "held"}  # held patches the request prototype — contract territory (handler-shape), not a reference group
 
 # Files whose surface has no @namespace block: section name + one-line
 # description fallback (the file header covers the rest in-repo).

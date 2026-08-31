@@ -623,6 +623,10 @@ pub const DispatchState = struct {
     /// handler can `await`. Null ⇒ the arms are not awaitable here
     /// (connectionless, or a path without the promise model).
     host_promises: ?*std.ArrayListUnmanaged(held_mod.HostPromise) = null,
+    /// The resolver index of THIS activation's `request.messages` pull
+    /// (`_system.held.nextInput`), if the handler made one. Read by the
+    /// dispatcher into `HeldOutcome.input_promise`.
+    input_promise: ?u32 = null,
     /// `stream.*` effects (`docs/handler-shape.md`
     /// §2.2): true once the handler called `stream.start()` or the first
     /// `stream.write()` — the activation opens/continues a streamed
@@ -1079,6 +1083,9 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // `__rove_request_proto` whose `text`/`json` accessors derive from
     // `request.bytes` (decisions.md §4.11).
     evalSnippet(ctx, "request.js", REQUEST_JS);
+    // AFTER request.js: held.js patches the shared request prototype
+    // (`request.messages` / `request.chunks`, `held.zig`).
+    evalSnippet(ctx, "held.js", HELD_JS);
     evalSnippet(ctx, "base64.js", BASE64_JS);
     evalSnippet(ctx, "urlsearchparams.js", URLSEARCHPARAMS_JS);
     evalSnippet(ctx, "time.js", TIME_JS);
@@ -1332,6 +1339,14 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // accumulate onto `DispatchState.pending_wakes`; the worker arms
     // them on the held entity at park. Inert when there's no held
     // connection (the accumulator is null).
+    // The held-request input pull (`held.zig`): `request.messages`'
+    // iterator steps come from here — each call is one pull promise the
+    // worker settles with the next inbound frame (or `{done:true}` at
+    // close). Captured by the request prototype shim (globals/request.js)
+    // before `_harden.js` deletes `_system`.
+    .{ .path = &.{ "_system", "held" }, .fns = &.{
+        .{ .name = "nextInput", .cfunc = on_b.jsHeldNextInput, .argc = 0 },
+    } },
     .{
         .path = &.{ "_system", "after" },
         .fns = &.{
@@ -1570,6 +1585,7 @@ const NEXT_JS = @embedFile("next_js");
 const WEBHOOK_JS = @embedFile("webhook_js");
 const TEXTCODEC_JS = @embedFile("textcodec_js");
 const REQUEST_JS = @embedFile("request_js");
+const HELD_JS = @embedFile("held_js");
 const BLOB_JS = @embedFile("blob_js");
 
 /// (public name, embedded source) for every `globals/*.js` file. The
@@ -1599,6 +1615,7 @@ pub const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "webhook", .src = WEBHOOK_JS },
     .{ .name = "textcodec", .src = TEXTCODEC_JS },
     .{ .name = "blob", .src = BLOB_JS },
+    .{ .name = "held", .src = HELD_JS },
 };
 
 fn installNamespace(ctx: *c.JSContext, global: c.JSValue, ns: NamespaceBindings) void {

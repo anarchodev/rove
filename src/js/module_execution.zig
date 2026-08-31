@@ -72,6 +72,13 @@ pub const PendingResponse = struct {
     /// `RunOutcome.no_onchunk` — the dispatch site falls back to the
     /// classic `.inbound` dispatch instead of a 404.
     no_onchunk: bool = false,
+    /// Set by `runModule` when a `.ws_message` dispatch found no
+    /// `onMessage` export: the module wants the iterable flow
+    /// (`request.messages`, `held.zig`) — its DEFAULT runs once at
+    /// connection open and pulls frames. `finishResponse` maps it to
+    /// `RunOutcome.no_onmessage`; the WS dispatch site opens the
+    /// held chain and replays the probing frame into it.
+    no_onmessage: bool = false,
     /// Set by `runModule` when the handler returned a promise still
     /// pending on a host promise (`held.zig`). `finishResponse` maps it
     /// to `RunOutcome.held`; `held_outer` is the handler's outer promise
@@ -355,6 +362,15 @@ pub fn runModule(
         if (request.activation == .inbound_chunk) {
             _ = ctx.takeException();
             pending.no_onchunk = true;
+            return;
+        }
+        // WS-mode probe: a module without `onMessage` wants the
+        // iterable flow — same fall-back posture, not a 404. Only the
+        // kind's own default lands here (an explicit `{on}` wake export
+        // that is missing stays a 404).
+        if (request.activation == .ws_message and request.fn_override == null) {
+            _ = ctx.takeException();
+            pending.no_onmessage = true;
             return;
         }
         pending.status = 404;

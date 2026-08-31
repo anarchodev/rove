@@ -41,6 +41,7 @@ const panic_mod = @import("panic.zig");
 const Request = dispatcher_mod.Request;
 
 const worker_mod = @import("worker.zig");
+const held_mod = @import("held.zig");
 const worker_streaming = @import("worker_streaming.zig");
 const worker_drain = @import("worker_drain.zig");
 const globals = @import("globals.zig");
@@ -73,6 +74,14 @@ fn sweepStaleWsChains(worker: anytype) void {
     }
     for (stale[0..n]) |conn_ent| {
         if (worker.ws_conns.get(conn_ent)) |st| {
+            // A held chain's loop must still END (its post-loop cleanup
+            // writes are the export flow's onDisconnect analog) even
+            // when the socket died abruptly.
+            if (heldWsState(worker, st.chain).held) {
+                resumeHeldWsEof(worker, st.chain, conn_ent);
+                tearDownWsChain(worker, conn_ent);
+                continue;
+            }
             fireWsDisconnect(worker, st.chain);
         }
         tearDownWsChain(worker, conn_ent);
@@ -339,22 +348,43 @@ fn flushWsGates(worker: anytype) void {
             st.gate_deadline_ns = 0;
         }
         while (st.queue.items.len != 0) {
+            // BEFORE the pop: a held chain whose handler is mid-await on
+            // something other than input keeps its frames queued — a
+            // check after the pop drops the frame it meant to keep.
+            const hwq0 = heldWsState(worker, st.chain);
+            if (hwq0.held and hwq0.pull == null) continue :outer;
             const f = st.queue.orderedRemove(0);
             defer if (f.payload.len > 0) worker.allocator.free(f.payload);
             if (worker.h2.reg.isStale(conn_ent)) {
                 // Conn died while frames were queued — replies are
                 // undeliverable; the next sweep would fire onDisconnect,
-                // but the chain is right here: do it now.
+                // but the chain is right here: do it now (a held chain's
+                // loop ends instead — its post-loop cleanup is the
+                // onDisconnect analog).
+                if (hwq0.held) {
+                    resumeHeldWsEof(worker, st.chain, conn_ent);
+                    tearDownWsChain(worker, conn_ent);
+                    continue :outer;
+                }
                 fireWsDisconnect(worker, st.chain);
                 tearDownWsChain(worker, conn_ent);
                 continue :outer;
             }
+            const hwq = hwq0;
             if (f.opcode == 8) {
-                fireWsDisconnect(worker, st.chain);
+                if (hwq.held) {
+                    resumeHeldWsEof(worker, st.chain, conn_ent);
+                } else {
+                    fireWsDisconnect(worker, st.chain);
+                }
                 tearDownWsChain(worker, conn_ent);
                 continue :outer;
             }
-            fireWsMessage(worker, st.chain, conn_ent, f.opcode, f.payload);
+            if (hwq.held) {
+                resumeHeldWsFrame(worker, st.chain, conn_ent, f.opcode, f.payload);
+            } else {
+                fireWsMessage(worker, st.chain, conn_ent, f.opcode, f.payload);
+            }
             // fireWsMessage may have torn the chain down (terminal /
             // error) or re-armed the gate (writing frame) — re-resolve.
             st = worker.ws_conns.getPtr(conn_ent) orelse continue :outer;
@@ -398,7 +428,12 @@ pub fn serviceWsMessages(worker: anytype) !void {
     for (buf[0..n]) |p| {
         if (server.reg.isStale(p.conn)) {
             // Conn already gone — reap any chain (no onDisconnect: the socket
-            // is dead, and an abrupt close is swept above). Drop the message.
+            // is dead, and an abrupt close is swept above). A held chain's
+            // loop still ends so its post-loop cleanup runs. Drop the message.
+            if (worker.ws_conns.get(p.conn)) |st| {
+                if (heldWsState(worker, st.chain).held)
+                    resumeHeldWsEof(worker, st.chain, p.conn);
+            }
             tearDownWsChain(worker, p.conn);
             worker.h2.destroyEntity(p.ment) catch {};
             continue;
@@ -408,7 +443,8 @@ pub fn serviceWsMessages(worker: anytype) !void {
         // queues instead of activating. Opcode 8 queues too, so a close
         // behind queued data frames fires onDisconnect only after they run.
         if (worker.ws_conns.getPtr(p.conn)) |st| {
-            if (st.gate_seq != 0 or st.queue.items.len != 0) {
+            const hw0 = heldWsState(worker, st.chain);
+            if (st.gate_seq != 0 or st.queue.items.len != 0 or (hw0.held and hw0.pull == null)) {
                 const copy: []u8 = if (p.payload.len > 0)
                     worker.allocator.dupe(u8, p.payload) catch {
                         // OOM on the queue copy — can't preserve order, so
@@ -430,9 +466,14 @@ pub fn serviceWsMessages(worker: anytype) !void {
             }
         }
         if (p.opcode == 8) {
-            // Client close → onDisconnect (best-effort), then tear down.
+            // Client close → the iterator ends (held) or onDisconnect
+            // (export flow), then tear down.
             if (worker.ws_conns.get(p.conn)) |st| {
-                fireWsDisconnect(worker, st.chain);
+                if (heldWsState(worker, st.chain).held) {
+                    resumeHeldWsEof(worker, st.chain, p.conn);
+                } else {
+                    fireWsDisconnect(worker, st.chain);
+                }
             }
             tearDownWsChain(worker, p.conn);
             worker.h2.destroyEntity(p.ment) catch {};
@@ -450,7 +491,11 @@ pub fn serviceWsMessages(worker: anytype) !void {
                 worker.h2.destroyEntity(p.ment) catch {};
                 continue;
             };
-        fireWsMessage(worker, chain_ent, p.conn, p.opcode, p.payload);
+        if (heldWsState(worker, chain_ent).held) {
+            resumeHeldWsFrame(worker, chain_ent, p.conn, p.opcode, p.payload);
+        } else {
+            fireWsMessage(worker, chain_ent, p.conn, p.opcode, p.payload);
+        }
         worker.h2.destroyEntity(p.ment) catch {};
     }
 }
@@ -522,6 +567,10 @@ fn finishWsResume(
         .terminal => |*r| {
             defer r.deinit(allocator);
             if (r.exception.len > 0) {
+                // Operator-visible, like the connectionless fires — a WS
+                // handler exception closing a socket that only the log
+                // store records is undiagnosable from a terminal.
+                std.log.warn("rove-js {s}: handler exception: {s}", .{ tag, r.exception });
                 p.txn.rollback() catch {};
                 p.txn_done = true;
                 captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, r.console, r.exception, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.saga_id, &.{}, act, 0, p.exec_seq);
@@ -639,17 +688,58 @@ fn finishWsResume(
         },
         // Only `.inbound_headers`/`.inbound_chunk` activations produce these;
         // a WS resume never dispatches as one. Defined failure: close + tear down.
-        .held => |*h| {
-            // Held (`held.zig`) on a path that does not park it yet: the
-            // arena is released and the hop fails as a defined 500.
-            worker_mod.dropHeld(worker, h);
-            p.txn.rollback() catch {};
+        .held => |*hv| {
+            // (Re-)held (`held.zig`): the chain keeps (or takes) the
+            // arena, this hop's resolvers replace the old set, frames
+            // ship, and the chain stays parked — the WS sibling of
+            // `finishContResume`'s repark conversion.
+            const hr = worker.h2.reg.get(chain_ent, worker.parked_continuations, components_mod.HeldRequest) catch {
+                worker_mod.dropHeld(worker, hv);
+                p.txn.rollback() catch {};
+                p.txn_done = true;
+                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+                tearDownWsChain(worker, conn_ent);
+                return;
+            };
+            if (hr.req == null) {
+                // First hold: the entity takes the arena AND the outer
+                // promise — the handler's return value, whose settlement
+                // ends the chain. Without it every later resume reads
+                // undefined memory as a JSValue.
+                hr.req = hv.req;
+                hr.outer = hv.outer;
+            }
+            hv.req = null;
+            if (hr.resolvers.len > 0) allocator.free(hr.resolvers);
+            hr.resolvers = hv.resolvers;
+            hv.resolvers = &.{};
+            hr.input_promise = hv.input_promise;
+            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, act, rl.method, rl.path, rl.host, chain_ctx.saga_id, p.now_ns, p.exec_seq);
+            const wrote = p.ws.ops.items.len > 0;
+            const read_version = p.txn.readVersion();
+            const tapes = wsResumeTapes(worker, &p.readset, ws_ctx_body, msg);
+            const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, false) catch |perr| {
+                std.log.warn("rove-js {s} (held+writes): propose failed: {s}", .{ tag, @errorName(perr) });
+                p.txn_done = true;
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, chain_ctx.saga_id, &.{}, act, 0, p.exec_seq);
+                hv.deinit(allocator);
+                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+                tearDownWsChain(worker, conn_ent);
+                return;
+            };
             p.txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.saga_id, &.{}, act, 0, p.exec_seq);
-            effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
-            tearDownWsChain(worker, conn_ent);
+            chain_st.activation_count += 1;
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, tapes, chain_ctx.saga_id, hv.tags, act, 0, p.exec_seq);
+            hv.deinit(allocator);
+            if (fw_seq != 0) armWsGate(worker, conn_ent, chain_ctx.tenant_id, fw_seq);
+            if (!wrote) {
+                worker_streaming.flushResumeFetches(worker, chain_ent, pending_fetches, true);
+            } else if (pending_fetches.items.len > 0) {
+                std.log.warn("rove-js {s}: {d} on.fetch from a WRITING resume dropped (issue on.fetch from a read-only hop) tenant={s}", .{ tag, pending_fetches.items.len, chain_ctx.tenant_id });
+            }
+            if (pending_wakes.items.len > 0) installWsWakes(worker, chain_ent, pending_wakes, read_version);
         },
-        .no_onheaders, .no_onchunk => {
+        .no_onheaders, .no_onchunk, .no_onmessage => {
             p.txn.rollback() catch {};
             p.txn_done = true;
             captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.saga_id, &.{}, act, 0, p.exec_seq);
@@ -752,7 +842,332 @@ fn fireWsMessage(
     };
 
     var oc = run_oc;
+    if (oc == .no_onmessage) {
+        // No `onMessage`: the module wants the iterable flow
+        // (`request.messages`, `held.zig`) — roll the probe back, run
+        // the default once as the connection-open activation, then feed
+        // this frame into the held chain.
+        p.txn.rollback() catch {};
+        p.txn_done = true;
+        std.log.info("rove-js ws: module has no onMessage — iterable flow, opening held chain", .{});
+        wsOpenHeld(worker, chain_ent, conn_ent, opcode, payload);
+        return;
+    }
     finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .ws_message, "ws-message", .{ .frame = .{ .opcode = opcode, .data = payload } });
+}
+
+/// The chain's held-request view (`held.zig`): whether it holds an
+/// arena, and the resolver of its outstanding `request.messages` pull.
+const HeldWs = struct { held: bool, pull: ?u32 };
+fn heldWsState(worker: anytype, chain_ent: rove.Entity) HeldWs {
+    const hr = worker.h2.reg.get(chain_ent, worker.parked_continuations, components_mod.HeldRequest) catch
+        return .{ .held = false, .pull = null };
+    return .{ .held = hr.req != null, .pull = hr.input_promise };
+}
+
+/// Consume the chain's outstanding input pull (settle-once).
+fn takeWsPull(worker: anytype, chain_ent: rove.Entity) ?u32 {
+    const hr = worker.h2.reg.get(chain_ent, worker.parked_continuations, components_mod.HeldRequest) catch return null;
+    const idx = hr.input_promise;
+    hr.input_promise = null;
+    return idx;
+}
+
+/// Queue a frame on the connection's input gate (order is sacred; the
+/// handler is mid-await on something other than input, or mid-commit).
+fn queueWsFrame(worker: anytype, conn_ent: rove.Entity, opcode: u8, payload: []const u8) void {
+    const st = worker.ws_conns.getPtr(conn_ent) orelse return;
+    const copy: []u8 = if (payload.len > 0)
+        worker.allocator.dupe(u8, payload) catch {
+            effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+            tearDownWsChain(worker, conn_ent);
+            return;
+        }
+    else
+        &.{};
+    st.queue.append(worker.allocator, .{ .opcode = opcode, .payload = copy }) catch {
+        if (copy.len > 0) worker.allocator.free(copy);
+        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+        tearDownWsChain(worker, conn_ent);
+    };
+}
+
+/// The shared held-WS resume (`held.zig`): re-enter the chain's kept
+/// arena, settle the given promises, and finish through the SAME
+/// `finishWsResume` every WS resume uses — frames ship, the §4.5 gate
+/// arms on writes, a re-hold refreshes the entity's resolvers, a
+/// terminal closes the socket.
+fn resumeHeldWs(
+    worker: anytype,
+    chain_ent: rove.Entity,
+    conn_ent: rove.Entity,
+    settle: held_mod.Settle,
+    activation: @FieldType(Request, "activation"),
+    act: log_mod.ActivationSource,
+    msg: WsMsgTape,
+    comptime tag: []const u8,
+) void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    const hr = server.reg.get(chain_ent, worker.parked_continuations, components_mod.HeldRequest) catch return;
+    const req_arena = hr.req orelse return;
+    const chain_ctx = server.reg.get(chain_ent, worker.parked_continuations, components_mod.ChainContext) catch return;
+    const chain_st = server.reg.get(chain_ent, worker.parked_continuations, components_mod.StreamChain) catch return;
+    const path = chain_st.module_path;
+    const rl = wsRootLine(chain_ctx, path);
+    var p = worker_streaming.firePrep(worker, chain_ctx.tenant_id, path, tag) orelse {
+        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+        tearDownWsChain(worker, conn_ent);
+        return;
+    };
+    defer p.deinit(allocator);
+    const tc = p.dep.tc;
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
+    defer allocator.free(spath);
+    var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stream_chunks.items) |ch| allocator.free(ch);
+        stream_chunks.deinit(allocator);
+    }
+    var chunk_opcodes: std.ArrayListUnmanaged(u8) = .empty;
+    defer chunk_opcodes.deinit(allocator);
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
+    var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (pending_wakes.items) |*pw| pw.deinit(allocator);
+        pending_wakes.deinit(allocator);
+    }
+    const fetches_pending: u32 = blk: {
+        const cnt = server.reg.get(chain_ent, worker.parked_continuations, components_mod.BoundFetchCount) catch break :blk 0;
+        break :blk cnt.pending;
+    };
+    const request: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = "",
+        .query = null,
+        .fn_override = null,
+        .activation = activation,
+        .activation_entity = chain_ent,
+        .activation_fetches_pending = fetches_pending,
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = chain_ctx.saga_id, .exec_seq = p.exec_seq },
+        .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = p.dep.inst.platform },
+        .effects = .{
+            .pending_stream_chunks = &stream_chunks,
+            .pending_stream_chunk_opcodes = &chunk_opcodes,
+            .pending_fetches = &pending_fetches,
+            .pending_wakes = &pending_wakes,
+        },
+    };
+    std.log.info("rove-js {s}: settle corr={s}", .{ tag, chain_ctx.saga_id orelse "(none)" });
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    var oc = worker_mod.runResumeHeld(worker, p.dep.inst, tc, p.txn, &p.ws, request, &budget, .{ .req = req_arena, .outer = hr.outer, .resolvers = hr.resolvers }, settle) catch {
+        p.txn.rollback() catch {};
+        worker_mod.dropPartialDigest(&p.readset);
+        p.txn_done = true;
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.saga_id, &.{}, act, 0, p.exec_seq);
+        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+        tearDownWsChain(worker, conn_ent);
+        return;
+    };
+    finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, act, tag, msg);
+}
+
+/// A due `after.*` wake on a promise-held WS chain: drain the fired
+/// batch and settle each arm's promise (`held.zig`).
+pub fn resumeHeldWsWake(worker: anytype, chain_ent: rove.Entity, conn_ent: rove.Entity) void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    var batch_owned: []components_mod.WakeEntry = &.{};
+    defer if (batch_owned.len > 0) {
+        for (batch_owned) |*w| w.deinit(allocator);
+        allocator.free(batch_owned);
+    };
+    if (server.reg.get(chain_ent, worker.parked_continuations, components_mod.StreamWakes)) |sw| {
+        if (sw.nextWakeBatch(allocator) catch null) |wb| {
+            batch_owned = wb.entries;
+            allocator.free(wb.export_name);
+        }
+        // A settled promise consumes its arm (one-shot; `held.zig`).
+        sw.consumePromiseArms(allocator, batch_owned);
+    } else |_| {}
+    var settles: std.ArrayListUnmanaged(held_mod.SettleWake) = .empty;
+    defer settles.deinit(allocator);
+    for (batch_owned) |w| {
+        const pi = w.promise_idx orelse {
+            // An `{on}` arm fired on a promise-held chain — nothing
+            // awaits it and its export cannot run there. Defined close.
+            effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+            tearDownWsChain(worker, conn_ent);
+            return;
+        };
+        settles.append(allocator, .{
+            .idx = pi,
+            .kind = if (w.tag == .kv) .kv else .timer,
+            .prefix = w.prefix,
+            .fired_at_ms = @divFloor(w.fired_at_ns, std.time.ns_per_ms),
+        }) catch return;
+    }
+    if (settles.items.len == 0) return;
+    resumeHeldWs(worker, chain_ent, conn_ent, .{ .wakes = settles.items }, .{ .wake_batch = .{ .wakes = batch_owned } }, .wake_batch, .{ .wakes = .{ .batch = batch_owned, .export_name = "" } }, "ws-held-wake");
+}
+
+/// A bound fetch's event on a promise-held WS chain: settle the awaited
+/// fetch promise. Returns false when the fetch is not promise-bound
+/// (export flow — the caller dispatches it normally). Borrows `ev`.
+fn tryResumeHeldWsFetch(worker: anytype, chain_ent: rove.Entity, conn_ent: rove.Entity, ev: *components_mod.UpstreamFetchEvent) bool {
+    const idx = worker_drain.takeHeldFetchPromise(worker, chain_ent, ev.fetch_id) orelse return false;
+    if (ev.final) {
+        if (worker.h2.reg.get(chain_ent, worker.parked_continuations, components_mod.BoundFetchCount)) |cnt| {
+            if (cnt.pending > 0) cnt.pending -= 1;
+        } else |_| {}
+    }
+    const settle: held_mod.Settle = .{ .fetch = if (ev.seq != 0 or !ev.final) .{
+        .idx = idx,
+        .reject = "await after.fetch cannot consume a streamed response — omit {stream:true} or use the {on} export form",
+    } else .{
+        .idx = idx,
+        .status = ev.terminal_status,
+        .bytes = ev.bytes,
+        .headers_json = ev.fetch_headers orelse "",
+        .truncated = ev.body_truncated,
+    } };
+    const fetch_ev: worker_mod.FetchEvent = .{
+        .fetch_id = ev.fetch_id,
+        .seq = ev.seq,
+        .byte_offset = ev.byte_offset,
+        .bytes = ev.bytes,
+        .headers = ev.fetch_headers orelse "",
+        .final = ev.final,
+        .terminal_status = ev.terminal_status,
+        .terminal_ok = ev.terminal_ok,
+        .body_truncated = ev.body_truncated,
+        .export_name = "",
+        .content_hash = if (ev.content_hash) |*h| h[0..] else "",
+    };
+    resumeHeldWs(worker, chain_ent, conn_ent, settle, .{ .fetch_chunk = .{
+        .id = ev.fetch_id,
+        .seq = ev.seq,
+        .byte_offset = ev.byte_offset,
+        .bytes = ev.bytes,
+        .headers = ev.fetch_headers,
+        .final = ev.final,
+        .terminal_status = if (ev.final) ev.terminal_status else 0,
+        .terminal_ok = if (ev.final) ev.terminal_ok else false,
+        .body_truncated = if (ev.final) ev.body_truncated else false,
+    } }, .fetch_chunk, .{ .fetch = fetch_ev }, "ws-held-fetch");
+    return true;
+}
+
+/// An inbound frame settles the outstanding `request.messages` pull.
+fn resumeHeldWsFrame(worker: anytype, chain_ent: rove.Entity, conn_ent: rove.Entity, opcode: u8, payload: []const u8) void {
+    const pull = takeWsPull(worker, chain_ent) orelse {
+        queueWsFrame(worker, conn_ent, opcode, payload);
+        return;
+    };
+    resumeHeldWs(worker, chain_ent, conn_ent, .{ .input = .{ .idx = pull, .payload = .{ .frame = .{ .opcode = opcode, .bytes = payload } } } }, .{ .ws_message = .{ .opcode = opcode, .data = payload } }, .ws_message, .{ .frame = .{ .opcode = opcode, .data = payload } }, "ws-held-frame");
+}
+
+/// Client close on a promise-held chain: the iterator ends
+/// (`{done: true}`); the handler's loop exits and its terminal return
+/// closes the (already-closing) socket.
+fn resumeHeldWsEof(worker: anytype, chain_ent: rove.Entity, conn_ent: rove.Entity) void {
+    const pull = takeWsPull(worker, chain_ent) orelse return;
+    resumeHeldWs(worker, chain_ent, conn_ent, .{ .input = .{ .idx = pull, .payload = .eof } }, .disconnect, .disconnect, .none, "ws-held-eof");
+}
+
+/// Run the module's DEFAULT export once as the connection-open
+/// activation (`held.zig`, the iterable flow): the activation is the
+/// upgrade request the client opened (its method/host/path, empty
+/// body). A `.held` outcome parks the arena on the chain and the
+/// probing frame is delivered (or queued until the handler pulls); a
+/// `.terminal` declines the connection. A default that neither holds
+/// nor returns a terminal is a defined author error.
+fn wsOpenHeld(worker: anytype, chain_ent: rove.Entity, conn_ent: rove.Entity, first_opcode: u8, first_payload: []const u8) void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    const chain_ctx = server.reg.get(chain_ent, worker.parked_continuations, components_mod.ChainContext) catch return;
+    const chain_st = server.reg.get(chain_ent, worker.parked_continuations, components_mod.StreamChain) catch return;
+    const rl = wsRootLine(chain_ctx, chain_st.module_path);
+    var p = worker_streaming.firePrep(worker, chain_ctx.tenant_id, chain_st.module_path, "ws-open") orelse {
+        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+        tearDownWsChain(worker, conn_ent);
+        return;
+    };
+    defer p.deinit(allocator);
+    const tc = p.dep.tc;
+    var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stream_chunks.items) |ch| allocator.free(ch);
+        stream_chunks.deinit(allocator);
+    }
+    var chunk_opcodes: std.ArrayListUnmanaged(u8) = .empty;
+    defer chunk_opcodes.deinit(allocator);
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
+    var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (pending_wakes.items) |*pw| pw.deinit(allocator);
+        pending_wakes.deinit(allocator);
+    }
+    const request: Request = .{
+        .method = chain_ctx.root_method,
+        .path = chain_ctx.root_path,
+        .host = chain_ctx.root_host,
+        .body = "",
+        .query = null,
+        .activation_entity = chain_ent,
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .saga_id = chain_ctx.saga_id, .exec_seq = p.exec_seq },
+        .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = p.dep.inst.platform },
+        .effects = .{
+            .pending_stream_chunks = &stream_chunks,
+            .pending_stream_chunk_opcodes = &chunk_opcodes,
+            .pending_fetches = &pending_fetches,
+            .pending_wakes = &pending_wakes,
+        },
+    };
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    var oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget) catch {
+        p.txn.rollback() catch {};
+        worker_mod.dropPartialDigest(&p.readset);
+        p.txn_done = true;
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.saga_id, &.{}, .inbound, 0, p.exec_seq);
+        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+        tearDownWsChain(worker, conn_ent);
+        return;
+    };
+    switch (oc) {
+        .held, .terminal => {},
+        else => {
+            std.log.warn("rove-js ws-open: default neither held nor declined (outcome={s}) — closing", .{@tagName(oc)});
+            worker_mod.discardRunOutcome(worker, &oc);
+            p.txn.rollback() catch {};
+            p.txn_done = true;
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.saga_id, &.{}, .inbound, 0, p.exec_seq);
+            effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+            tearDownWsChain(worker, conn_ent);
+            return;
+        },
+    }
+    finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .inbound, "ws-open", .none);
+    // Deliver the probing frame into the (possibly) held chain.
+    if (worker.ws_conns.get(conn_ent) == null) return; // declined / torn down
+    const hw = heldWsState(worker, chain_ent);
+    if (!hw.held) return;
+    if (hw.pull != null) {
+        resumeHeldWsFrame(worker, chain_ent, conn_ent, first_opcode, first_payload);
+    } else {
+        queueWsFrame(worker, conn_ent, first_opcode, first_payload);
+    }
 }
 
 /// Resolve the WS connection entity holding `chain_ent`, or null if it's not a
@@ -800,6 +1215,7 @@ fn installWsWakes(
 
     var interval_ms: i64 = 0;
     var timer_on: ?[]u8 = null;
+    var timer_promise: ?u32 = null;
     var arms: std.ArrayListUnmanaged(components_mod.KvArm) = .empty;
     for (pending.items) |reg| {
         switch (reg.kind) {
@@ -807,11 +1223,12 @@ fn installWsWakes(
                 interval_ms = reg.interval_ms;
                 if (timer_on) |old_to| allocator.free(old_to);
                 timer_on = if (reg.on) |t| allocator.dupe(u8, t) catch null else null;
+                timer_promise = reg.promise_idx;
             },
             .kv => if (reg.prefix.len > 0) {
                 const dup = allocator.dupe(u8, reg.prefix) catch continue;
                 const on: ?[]u8 = if (reg.on) |t| allocator.dupe(u8, t) catch null else null;
-                arms.append(allocator, .{ .prefix = dup, .on = on }) catch {
+                arms.append(allocator, .{ .prefix = dup, .on = on, .promise_idx = reg.promise_idx }) catch {
                     allocator.free(dup);
                     if (on) |t| allocator.free(t);
                 };
@@ -840,6 +1257,7 @@ fn installWsWakes(
         .kv_prefixes = kv_prefixes,
         .read_version = read_version,
         .timer_on = timer_on,
+        .timer_promise = timer_promise,
         .pending_batches = carried,
     }) catch {};
 }
@@ -857,6 +1275,9 @@ pub fn resumeBoundFetchChainWs(
     ev: *components_mod.UpstreamFetchEvent,
 ) void {
     defer components_mod.UpstreamFetchEvent.deinitItem(ev, worker.allocator);
+
+    // A chain parked by promise settles its awaited fetch (`held.zig`).
+    if (tryResumeHeldWsFetch(worker, chain_ent, conn_ent, ev)) return;
 
     const allocator = worker.allocator;
     const server = worker.h2;
@@ -1204,7 +1625,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         .continuation => |*cval| cval.deinit(allocator),
         .stream => |*s2| s2.deinit(allocator),
         .held => |*h| worker_mod.dropHeld(worker, h),
-        .no_onheaders, .no_onchunk => {},
+        .no_onheaders, .no_onchunk, .no_onmessage => {},
     }
     if (wrote) {
         const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, .disconnect, rl.method, rl.path, rl.host, chain_ctx.saga_id, p.now_ns, p.exec_seq);

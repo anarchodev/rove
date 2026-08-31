@@ -105,6 +105,13 @@ export default function () {
       addClass("TextDecoder", TextDecoder);
     },
     blob: () => addObj("blob", blob),
+    // held patches the request PROTOTYPE (messages/chunks) — prototype
+    // accessors don't enumerate off the instance, so name them
+    // explicitly or the inventory can't see them.
+    held: () => {
+      out.push("request.messages");
+      out.push("request.chunks");
+    },
     // jwt/oauth/oidc/sessions/cron/retry/email/users/activitypub/segments/browser
     // are no longer ambient globals — they're @rewind/* packages a handler
     // imports, so they have no ambient surface to reflect. `schedule` is the

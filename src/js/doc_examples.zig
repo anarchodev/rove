@@ -505,7 +505,7 @@ test "doc examples: retired spellings (Gate B) + compile (Gate A) + execute (Gat
             },
             .continuation => |*cont| cont.deinit(testing.allocator),
             .stream => |*s| s.deinit(testing.allocator),
-            .no_onheaders, .no_onchunk => {},
+            .no_onheaders, .no_onchunk, .no_onmessage => {},
         }
     }
 

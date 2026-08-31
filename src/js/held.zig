@@ -58,6 +58,19 @@ pub const SettleFetch = struct {
     reject: ?[]const u8 = null,
 };
 
+/// The next connection input for a handler iterating `request.messages`
+/// (`for await`): a WS frame resolves the pull promise with
+/// `{value: {opcode, bytes, text}, done: false}`; end-of-input
+/// (client close) resolves `{done: true}` so the loop exits and the
+/// handler runs on to its terminal return.
+pub const SettleInput = struct {
+    idx: u32,
+    payload: union(enum) {
+        frame: struct { opcode: u8, bytes: []const u8 },
+        eof,
+    },
+};
+
 /// What a resume does to the held handler: which host promises it
 /// settles, and how.
 pub const Settle = union(enum) {
@@ -65,6 +78,8 @@ pub const Settle = union(enum) {
     wakes: []const SettleWake,
     /// A bound fetch completed (or must be refused).
     fetch: SettleFetch,
+    /// The next `request.messages` pull (`held.SettleInput`).
+    input: SettleInput,
 };
 
 /// The dispatcher's answer when the handler is awaiting the host.
@@ -80,6 +95,9 @@ pub const HeldOutcome = struct {
     /// Host promises created THIS activation, in creation order —
     /// `PendingWakeReg.promise_idx` indexes here. Allocator-owned.
     resolvers: []HostPromise,
+    /// The resolver awaiting the next connection input (`request.
+    /// messages` pull) — at most one outstanding per activation.
+    input_promise: ?u32 = null,
     /// `tag(k,v)` set during the activation — survives the hold the
     /// way a continuation's tags survive a `next()`.
     tags: []log_mod.Tag = &.{},
@@ -102,6 +120,10 @@ pub const HeldState = struct {
     outer: c.JSValue,
     resolvers: []const HostPromise,
 };
+
+/// The message a rejected second concurrent `request.messages` pull
+/// carries — the iterator hands out one pending step at a time.
+pub const INPUT_ALREADY_PULLED = "request input is already being awaited (one pull at a time)";
 
 /// The defined failure when a handler parks on nothing the host owns —
 /// a promise the platform can never settle (`docs/handler-shape.md`, a

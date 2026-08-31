@@ -692,6 +692,37 @@ pub const Dispatcher = struct {
                 }
                 c.JS_FreeValue(ctx.raw, rv);
             },
+            .input => |inp| {
+                if (inp.idx >= held.resolvers.len) {
+                    pending.status = 500;
+                    pending.exception = self.allocator.dupe(u8, "resume: no such host promise") catch return DispatchError.OutOfMemory;
+                    return finishResponse(self, &state, &pending, &console_buf, &tags_buf, &host_promises);
+                }
+                // Build the iterator-result object host-side, so the JS
+                // shim's `next()` is nothing but the raw pull promise.
+                const obj = c.JS_NewObject(ctx.raw);
+                switch (inp.payload) {
+                    .frame => |fr| {
+                        const val = c.JS_NewObject(ctx.raw);
+                        _ = c.JS_SetPropertyStr(ctx.raw, val, "opcode", c.JS_NewInt32(ctx.raw, fr.opcode));
+                        _ = c.JS_SetPropertyStr(ctx.raw, val, "bytes", c.JS_NewUint8ArrayCopy(ctx.raw, fr.bytes.ptr, fr.bytes.len));
+                        _ = c.JS_SetPropertyStr(ctx.raw, val, "text", c.JS_NewStringLen(ctx.raw, fr.bytes.ptr, fr.bytes.len));
+                        _ = c.JS_SetPropertyStr(ctx.raw, obj, "value", val);
+                        _ = c.JS_SetPropertyStr(ctx.raw, obj, "done", globals.js_false);
+                    },
+                    .eof => {
+                        _ = c.JS_SetPropertyStr(ctx.raw, obj, "done", globals.js_true);
+                    },
+                }
+                var argv1 = [_]c.JSValue{obj};
+                const rv = c.JS_Call(ctx.raw, held.resolvers[inp.idx].resolve, globals.js_undefined, 1, &argv1);
+                c.JS_FreeValue(ctx.raw, obj);
+                if (c.JS_IsException(rv)) {
+                    pending.exception = ctx.takeExceptionMessage(self.allocator) catch return DispatchError.OutOfMemory;
+                    return finishResponse(self, &state, &pending, &console_buf, &tags_buf, &host_promises);
+                }
+                c.JS_FreeValue(ctx.raw, rv);
+            },
             .fetch => |f| fetch_blk: {
                 if (f.idx >= held.resolvers.len) {
                     pending.status = 500;
@@ -759,6 +790,7 @@ pub const Dispatcher = struct {
         } else {
             // Awaiting nothing the host owns: nothing could ever settle
             // it. Loud, at the park site.
+            std.log.warn("rove-js held: no-wake-source: outer_state={d} resolvers={d} settle={s}", .{ st, held.resolvers.len, @tagName(settle) });
             pending.status = 500;
             pending.exception = self.allocator.dupe(u8, held_mod.NO_WAKE_SOURCE) catch return DispatchError.OutOfMemory;
         }
@@ -822,7 +854,7 @@ pub const Dispatcher = struct {
             // still the entered one and the next reset reclaims it.
             .held => |*h| h.deinit(allocator),
             .stream => |*s| s.deinit(allocator),
-            .no_onheaders, .no_onchunk => {},
+            .no_onheaders, .no_onchunk, .no_onmessage => {},
         }
     }
 
@@ -913,7 +945,7 @@ pub const Dispatcher = struct {
                     .headers = &.{},
                 };
             },
-            .no_onheaders, .no_onchunk => {
+            .no_onheaders, .no_onchunk, .no_onmessage => {
                 // Only `.inbound_headers` / `.inbound_chunk`
                 // activations produce these, and none ride the
                 // back-compat path. Defined error, not a panic — same
@@ -963,6 +995,11 @@ fn finishResponse(
         console_buf.deinit(d.allocator);
         freeTagsBuf(d.allocator, tags_buf);
         return .no_onchunk;
+    }
+    if (pending.no_onmessage) {
+        console_buf.deinit(d.allocator);
+        freeTagsBuf(d.allocator, tags_buf);
+        return .no_onmessage;
     }
 
     if (state.pending_kv_error) |err| {
@@ -1074,7 +1111,7 @@ fn finishResponse(
             d.allocator.free(resolvers);
             return DispatchError.OutOfMemory;
         };
-        return .{ .held = .{ .outer = pending.held_outer, .resolvers = resolvers, .tags = tags } };
+        return .{ .held = .{ .outer = pending.held_outer, .resolvers = resolvers, .input_promise = state.input_promise, .tags = tags } };
     }
 
     // Handler `stream.*` effects (§2.2): a handler that called

@@ -886,6 +886,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "textcodec_js", .path = "src/js/globals/textcodec.js" },
         .{ .name = "handler_shape_md", .path = "docs/handler-shape.md" },
         .{ .name = "request_js", .path = "src/js/globals/request.js" },
+        .{ .name = "held_js", .path = "src/js/globals/held.js" },
         .{ .name = "blob_js", .path = "src/js/globals/blob.js" },
 
         // Built-in handler modules — compiled to bytecode at NodeState

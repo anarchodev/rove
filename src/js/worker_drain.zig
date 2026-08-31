@@ -1685,7 +1685,7 @@ fn releaseHeldRequest(worker: anytype, ent: rove.Entity) void {
 /// The resolver an inbound fetch event settles on a promise-held chain,
 /// consumed settle-once (the id blanks; the slot stays), or null when
 /// the chain is not promise-held / the fetch is not promise-bound.
-fn takeHeldFetchPromise(worker: anytype, ent: rove.Entity, fetch_id: []const u8) ?u32 {
+pub fn takeHeldFetchPromise(worker: anytype, ent: rove.Entity, fetch_id: []const u8) ?u32 {
     const server = worker.h2;
     const hr = server.reg.get(ent, worker.parked_continuations, components_mod.HeldRequest) catch return null;
     if (hr.req == null) return null;
@@ -1742,6 +1742,8 @@ fn resumeHeldChain(
             batch_owned = wb.entries;
             allocator.free(wb.export_name);
         }
+        // A settled promise consumes its arm (one-shot; `held.zig`).
+        sw.consumePromiseArms(allocator, batch_owned);
     } else |_| {}
     var settles: std.ArrayListUnmanaged(held_mod.SettleWake) = .empty;
     defer settles.deinit(allocator);
@@ -1897,6 +1899,7 @@ fn finishContResume(
             if (hr.resolvers.len > 0) allocator.free(hr.resolvers);
             hr.resolvers = h.resolvers;
             h.resolvers = &.{};
+            hr.input_promise = h.input_promise;
         } else |_| {}
         h.req = null; // the entity already owns the arena
         const synth = worker_mod.synthHeldContinuation(allocator, ctx.cont_path, &h) catch {
@@ -2223,7 +2226,7 @@ fn finishContResume(
         // Only `.inbound_headers` / `.inbound_chunk` activations produce
         // these; the probe ran on the FIRST fire. Defined failure.
         .held => unreachable, // converted to a repark above
-        .no_onheaders, .no_onchunk => {
+        .no_onheaders, .no_onchunk, .no_onmessage => {
             ctx.txn.rollback() catch {};
             ctx.txn_done.* = true;
             resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "export probe on a resume path\n") catch {};
@@ -3116,11 +3119,16 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
 
     for (wake_due.items) |e| {
         // A chain parked by promise (`held.zig`) settles the promise its
-        // handler awaits instead of dispatching an export.
+        // handler awaits instead of dispatching an export. A held WS
+        // chain ships its output as frames — route to the WS resume.
         if (isHeldChain(worker, e.ent)) {
-            resumeHeldChain(worker, e.ent, e.sid, e.sess) catch |err| {
-                std.log.warn("rove-js held: timer resume failed ({s})", .{@errorName(err)});
-            };
+            if (worker_ws.wsConnForChain(worker, e.ent)) |conn_ent| {
+                worker_ws.resumeHeldWsWake(worker, e.ent, conn_ent);
+            } else {
+                resumeHeldChain(worker, e.ent, e.sid, e.sess) catch |err| {
+                    std.log.warn("rove-js held: timer resume failed ({s})", .{@errorName(err)});
+                };
+            }
             continue;
         }
         // A held WS chain ships its onWake frames over the socket — route

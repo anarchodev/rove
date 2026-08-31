@@ -127,6 +127,10 @@ pub const HeldRequest = struct {
     /// resolver its terminal event settles. Consumed settle-once by
     /// blanking the id; ids allocator-owned.
     fetch_promises: []FetchPromise = &.{},
+    /// The resolver awaiting the next connection input (the chain's
+    /// `request.messages` pull). Null ⇒ inbound frames queue on the
+    /// connection's input gate until the handler pulls again.
+    input_promise: ?u32 = null,
 
     pub const FetchPromise = struct { id: []u8 = &.{}, idx: u32 = 0 };
 
@@ -298,6 +302,52 @@ pub const StreamWakes = struct {
             if (arm.fired_at_ns != 0) return true;
         }
         return false;
+    }
+
+    /// One-shot consumption for promise-settled arms (`held.zig`): a
+    /// settled promise cannot settle again, so the arm that fed it is
+    /// cleared — the export flow's arms stay armed (recurrence), but a
+    /// promise arm re-fires into a resolver index the NEXT activation's
+    /// resolver set no longer means. Re-arming is the handler's next
+    /// `after.*` call. Consumed kv arms are REMOVED (never blanked — an
+    /// empty prefix would match every write).
+    pub fn consumePromiseArms(self: *StreamWakes, allocator: std.mem.Allocator, batch: []const WakeEntry) void {
+        var kv_consumed: usize = 0;
+        for (batch) |w| {
+            if (w.promise_idx == null) continue;
+            switch (w.tag) {
+                .timer => {
+                    self.interval_ms = 0;
+                    self.next_wake_ns = std.math.maxInt(i64);
+                    self.timer_fired_ns = 0;
+                    if (self.timer_on) |t| allocator.free(t);
+                    self.timer_on = null;
+                    self.timer_promise = null;
+                },
+                .kv => kv_consumed += 1,
+            }
+        }
+        if (kv_consumed == 0) return;
+        var kept: std.ArrayListUnmanaged(KvArm) = .empty;
+        for (self.kv_prefixes) |arm| {
+            var consumed = false;
+            if (arm.promise_idx != null) {
+                for (batch) |w| {
+                    if (w.tag == .kv and w.promise_idx != null and std.mem.eql(u8, w.prefix, arm.prefix)) {
+                        consumed = true;
+                        break;
+                    }
+                }
+            }
+            if (consumed) {
+                allocator.free(arm.prefix);
+                if (arm.on) |t| allocator.free(t);
+            } else {
+                kept.append(allocator, arm) catch return; // OOM: keep the old slice
+            }
+        }
+        if (self.kv_prefixes.len > 0) allocator.free(self.kv_prefixes);
+        self.kv_prefixes = kept.toOwnedSlice(allocator) catch &.{};
     }
 
     /// The next wake batch to dispatch, or null when nothing is due.

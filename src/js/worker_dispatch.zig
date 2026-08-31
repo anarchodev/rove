@@ -2882,6 +2882,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             //     attached; the next walk dispatches it classic.
             // Only the FIRST body-carrying request per (deployment,
             // module) lands here.
+            // `.ws_message` never dispatches through dispatchOnce (frames
+            // ride the WS resume paths), so this probe outcome cannot
+            // occur here.
+            .no_onmessage => unreachable,
             .no_onchunk => {
                 worker_mod.onChunkRemember(worker, dep_id, route.module_base, false);
                 txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
@@ -2918,6 +2922,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                         .req = h.req,
                         .outer = h.outer,
                         .resolvers = h.resolvers,
+                        .input_promise = h.input_promise,
                     }) catch {
                         synth.deinit(allocator);
                         break :blk false;

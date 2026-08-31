@@ -591,6 +591,13 @@ pub const RunOutcome = union(enum) {
     /// miss, and re-dispatches as a classic `.inbound`. Never produced
     /// by any other activation kind.
     no_onchunk,
+    /// A `.ws_message` dispatch found no `onMessage` export — the module
+    /// wants the iterable flow (`request.messages`, `held.zig`): its
+    /// default runs once at connection open and pulls frames. The WS
+    /// dispatch site rolls back, opens the held chain, and replays the
+    /// probing frame into it. Never produced by any other activation
+    /// kind.
+    no_onmessage,
 };
 
 test "Trampolines: one worker context, not one per hook" {
