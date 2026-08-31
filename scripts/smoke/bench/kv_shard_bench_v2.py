@@ -14,8 +14,10 @@ goes through the FRONT door, which is the production path — and the front
 pools at most `proxy.MAX_LEGS` (4) upstream connections per node. Those
 connections are what `SO_REUSEPORT` hashes across workers, so a front-driven
 run can never occupy more than 4 workers per node no matter how high
-`REWIND_WORKERS` goes. `DIRECT=1` points h2load at the node port instead,
-one connection per client, which is what isolates the worker-count variable.
+`REWIND_WORKERS` goes. `DIRECT=1` points h2load at the node ports instead —
+each tenant at the node leading its group — one connection per client, which
+is what isolates the worker-count variable and keeps a multi-node run from
+measuring the forwarding path.
 Read a front-mode number as "what the current edge delivers" and a direct
 number as "what the node can do".
 
@@ -38,14 +40,24 @@ occupancy is bounded by.
 Run:
     zig build -Doptimize=ReleaseFast rewind-worker rewind-cp rewind-front rewind-logs
     set -a; . ./.env; set +a
-    python3 scripts/smoke/bench/kv_shard_bench_v2.py [requests] [clients] [streams]
+    REWIND_SMOKE_NO_BUILD=1 python3 scripts/smoke/bench/kv_shard_bench_v2.py [requests] [clients] [streams]
+
+`REWIND_SMOKE_NO_BUILD=1` is load-bearing: without it the harness's
+freshness pass rebuilds `smoke-bins` DEBUG over the ReleaseFast install,
+and the run silently reads ~10x low (the Debug tell: ~110 MB worker
+binary vs ~33 MB).
 
 Env:
     TENANTS=8         parallel tenants (each its own raft group)
     NODES=3           cluster size; 3 is the production shape
     REWIND_WORKERS=1  worker threads per node (read by the worker itself)
-    DIRECT=0          1 = drive the node port directly, bypassing the front's
-                      4-leg upstream pool (see above)
+    DIRECT=0          1 = drive the node ports directly (each tenant at its
+                      group's leader), bypassing the front's 4-leg upstream
+                      pool (see above)
+    BALANCE=0         1 = rebalance group leadership across nodes before the
+                      load starts (DIRECT multi-node only) — provisioning
+                      births every group on one node, and an unbalanced run
+                      is that node's number wearing a cluster topology
 """
 from __future__ import annotations
 
@@ -59,12 +71,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from smoke_lib_v2 import V2Cluster, metric_counter  # noqa: E402
+from smoke_lib_v2 import V2Cluster, metric_counter, _curl, MOVE_SECRET  # noqa: E402
 
 TENANTS = int(os.environ.get("TENANTS", "8"))
 NODES = int(os.environ.get("NODES", "3"))
 WORKERS = int(os.environ.get("REWIND_WORKERS", "1"))
 DIRECT = os.environ.get("DIRECT", "0") not in ("", "0")
+# Multi-node direct only: rebalance group leadership before the load starts.
+# Provisioning births every group on the same node, so an untouched cluster
+# leads almost everything there and the "cluster" number is one node's. A
+# transfer hands off to the most caught-up follower (not a chosen node), so
+# balance is reached by repeatedly shedding one group from the most-loaded
+# node until no node leads more than ceil(TENANTS/NODES).
+BALANCE = os.environ.get("BALANCE", "0") not in ("", "0")
 REQUESTS = int(sys.argv[1]) if len(sys.argv) > 1 else 20000
 CLIENTS = int(sys.argv[2]) if len(sys.argv) > 2 else 10
 STREAMS = int(sys.argv[3]) if len(sys.argv) > 3 else 10
@@ -133,10 +152,59 @@ def main() -> int:
             c.wait_for_handler(t, "/", want_body="w", timeout_s=60.0)
         print(f"ok  {TENANTS} tenants provisioned, deployed and warm")
 
-        # Direct mode addresses node 0 only, so keep it to NODES=1 when the
-        # question is worker scaling — otherwise the run measures
-        # serve-or-forward as much as it measures workers.
-        url = f"{c.node_url(0)}/" if DIRECT else f"{c.front_url()}/"
+        # Direct mode aims each tenant at the node LEADING its raft group —
+        # aiming everything at node 0 would measure serve-or-forward (fast
+        # 421s for tenants led elsewhere) as much as it measures workers.
+        # Resolved before the clock starts; a leader that moves mid-run
+        # surfaces as non-2xx and fails the gate below. The mapping is
+        # printed because the aggregate is only a cluster number when the
+        # groups actually spread — 8 leaders on one node is a one-node run
+        # wearing a cluster topology.
+        if DIRECT:
+            def resolve() -> dict | None:
+                m = {}
+                for t in tenants:
+                    n = c.leader_node(t)
+                    if n is None:
+                        print(f"FAIL {t}: no node answers as leader")
+                        return None
+                    m[t] = n
+                return m
+
+            target = resolve()
+            if target is None:
+                return 1
+            if BALANCE and NODES > 1:
+                cap = -(-TENANTS // NODES)  # ceil
+                for _ in range(4 * TENANTS):
+                    loads = {n: sum(1 for v in target.values() if v == n)
+                             for n in range(NODES)}
+                    heavy = max(loads, key=lambda n: loads[n])
+                    if loads[heavy] <= cap:
+                        break
+                    shed = next(t for t in tenants if target[t] == heavy)
+                    _curl(f"{c.node_url(heavy)}/_system/v2-transfer-leadership"
+                          f"?tenant={shed}", method="POST",
+                          headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+                    deadline = time.monotonic() + 10.0
+                    while time.monotonic() < deadline:
+                        n = c.leader_node(shed)
+                        if n is not None and n != heavy:
+                            break
+                        time.sleep(0.2)
+                    target = resolve()
+                    if target is None:
+                        return 1
+                else:
+                    print("FAIL leader balancing did not converge")
+                    return 1
+            spread = ", ".join(f"n{n}:{sum(1 for v in target.values() if v == n)}"
+                               for n in sorted(set(target.values())))
+            print(f"ok  leader spread: {spread}")
+
+        def url_for(t: str) -> str:
+            return f"{c.node_url(target[t])}/" if DIRECT else f"{c.front_url()}/"
+
         before_n, _ = batch_occupancy(c)
 
         procs = []
@@ -144,7 +212,7 @@ def main() -> int:
         for t in tenants:
             procs.append(subprocess.Popen(
                 ["h2load", "-n", str(REQUESTS), "-c", str(CLIENTS),
-                 "-m", str(STREAMS), f"--header=host: {c.host_for(t)}", url],
+                 "-m", str(STREAMS), f"--header=host: {c.host_for(t)}", url_for(t)],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             ))
         per, s2, s3, s4, s5 = [], 0, 0, 0, 0
