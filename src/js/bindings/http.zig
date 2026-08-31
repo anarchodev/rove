@@ -454,7 +454,9 @@ pub fn jsOnFetch(
     @memcpy(fid_buf[0..log_mod.FETCH_ID_PREFIX.len], log_mod.FETCH_ID_PREFIX);
     @memcpy(fid_buf[log_mod.FETCH_ID_PREFIX.len..][0..row.id.len], row.id);
     const res = c.JS_NewStringLen(ctx, &fid_buf, log_mod.FETCH_ID_PREFIX.len + row.id.len);
-    const had_on = row.name.len > 0; // append blanks the carrier below
+    // Captured before append blanks the carrier below.
+    const had_on = row.name.len > 0;
+    const streamed = row.stream;
     appendPendingFetch(state, &row) catch |err| {
         c.JS_FreeValue(ctx, res);
         row.deinit(state.allocator);
@@ -462,14 +464,17 @@ pub fn jsOnFetch(
         return js_exception;
     };
     row.deinit(state.allocator);
-    // Promise form (`held.zig`): a bare `after.fetch(url)` on a held
-    // connection resolves once with the whole buffered response
-    // (`{status, bytes, text, headers?, truncated}`); a streamed
-    // response rejects. `{on}` keeps the export flow (transitional —
-    // slated for removal once the apps migrate to `await`). The fetch
-    // id still rides the promise as `.fetchId` for `after.cancel`.
+    // Promise form (`held.zig`): a bare NON-STREAMED `after.fetch(url)`
+    // on a held connection resolves once with the whole buffered
+    // response (`{status, bytes, text, headers?, truncated}`). `{on}`
+    // keeps the export flow (transitional — slated for removal once the
+    // apps migrate to `await`), and so does `stream: true`: a promise
+    // settles once, so a chunked fetch keeps its per-event export
+    // defaults (`onFetchChunk`/`onFetchDone`) and the id return the
+    // spool handlers key their accumulators by. The fetch id still
+    // rides the promise as `.fetchId` for `after.cancel`.
     promise_blk: {
-        if (had_on) break :promise_blk;
+        if (had_on or streamed) break :promise_blk;
         const promises = state.host_promises orelse break :promise_blk;
         const fetches = state.pending_fetches orelse break :promise_blk;
         if (fetches.items.len == 0) break :promise_blk;
