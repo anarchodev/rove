@@ -6514,7 +6514,7 @@ test "held request: `await after.ms()` parks the arena; a timer resume completes
         .path = "/",
         .effects = .{ .pending_wakes = &wakes2 },
         .trace = .{ .request_id = 2 },
-    }, &budget2, .{ .req = req, .outer = held.outer, .resolvers = held.resolvers }, .{ .timer = 0 });
+    }, &budget2, .{ .req = req, .outer = held.outer, .resolvers = held.resolvers }, .{ .wakes = &.{.{ .idx = 0, .kind = .timer, .fired_at_ms = 1_700_000_000_123 }} });
     try testing.expect(oc2 == .terminal);
     defer oc2.terminal.deinit(testing.allocator);
     try testing.expectEqualStrings("", oc2.terminal.exception);
@@ -6588,7 +6588,7 @@ test "held request: a second await re-holds the same arena; a rejection surfaces
         .path = "/",
         .effects = .{ .pending_wakes = &wakes2 },
         .trace = .{ .request_id = 2 },
-    }, &budget2, .{ .req = req, .outer = held.outer, .resolvers = held.resolvers }, .{ .timer = 0 });
+    }, &budget2, .{ .req = req, .outer = held.outer, .resolvers = held.resolvers }, .{ .wakes = &.{.{ .idx = 0, .kind = .timer, .fired_at_ms = 1_700_000_000_123 }} });
     try testing.expect(oc2 == .held);
     var held2 = oc2.held;
     defer held2.deinit(testing.allocator);
@@ -6612,7 +6612,7 @@ test "held request: a second await re-holds the same arena; a rejection surfaces
         .path = "/",
         .effects = .{ .pending_wakes = &wakes3 },
         .trace = .{ .request_id = 3 },
-    }, &budget3, .{ .req = req, .outer = held2.outer, .resolvers = held2.resolvers }, .{ .timer = 0 });
+    }, &budget3, .{ .req = req, .outer = held2.outer, .resolvers = held2.resolvers }, .{ .wakes = &.{.{ .idx = 0, .kind = .timer, .fired_at_ms = 1_700_000_000_123 }} });
     try testing.expect(oc3 == .terminal);
     defer oc3.terminal.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, oc3.terminal.exception, "boom after two waits") != null);

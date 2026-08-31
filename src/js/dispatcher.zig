@@ -662,15 +662,76 @@ pub const Dispatcher = struct {
         var pending: PendingResponse = .{};
         errdefer pending.deinit(self.allocator);
 
-        // Settle the awaited host promise.
+        // Settle the awaited host promises.
         switch (settle) {
-            .timer => |idx| {
-                if (idx >= held.resolvers.len) {
+            .wakes => |fired| for (fired) |sw| {
+                if (sw.idx >= held.resolvers.len) {
                     pending.status = 500;
                     pending.exception = self.allocator.dupe(u8, "resume: no such host promise") catch return DispatchError.OutOfMemory;
                     return finishResponse(self, &state, &pending, &console_buf, &tags_buf, &host_promises);
                 }
-                const rv = c.JS_Call(ctx.raw, held.resolvers[idx].resolve, globals.js_undefined, 0, null);
+                // The resolve value is the arm's wake entry — the same
+                // `{kind, prefix?, firedAt}` shape `request.activation.
+                // wakes[]` carries, derived from the recorded batch, so
+                // the fold reconstructs it from the tape.
+                const obj = c.JS_NewObject(ctx.raw);
+                const kind_str: []const u8 = switch (sw.kind) {
+                    .timer => "timer",
+                    .kv => "kv",
+                };
+                _ = c.JS_SetPropertyStr(ctx.raw, obj, "kind", c.JS_NewStringLen(ctx.raw, kind_str.ptr, kind_str.len));
+                if (sw.kind == .kv)
+                    _ = c.JS_SetPropertyStr(ctx.raw, obj, "prefix", c.JS_NewStringLen(ctx.raw, sw.prefix.ptr, sw.prefix.len));
+                _ = c.JS_SetPropertyStr(ctx.raw, obj, "firedAt", c.JS_NewInt64(ctx.raw, sw.fired_at_ms));
+                var argv1 = [_]c.JSValue{obj};
+                const rv = c.JS_Call(ctx.raw, held.resolvers[sw.idx].resolve, globals.js_undefined, 1, &argv1);
+                c.JS_FreeValue(ctx.raw, obj);
+                if (c.JS_IsException(rv)) {
+                    pending.exception = ctx.takeExceptionMessage(self.allocator) catch return DispatchError.OutOfMemory;
+                    return finishResponse(self, &state, &pending, &console_buf, &tags_buf, &host_promises);
+                }
+                c.JS_FreeValue(ctx.raw, rv);
+            },
+            .fetch => |f| fetch_blk: {
+                if (f.idx >= held.resolvers.len) {
+                    pending.status = 500;
+                    pending.exception = self.allocator.dupe(u8, "resume: no such host promise") catch return DispatchError.OutOfMemory;
+                    return finishResponse(self, &state, &pending, &console_buf, &tags_buf, &host_promises);
+                }
+                if (f.reject) |msg| {
+                    // A response shape the promise cannot carry: reject
+                    // so the handler's own `catch` decides.
+                    const err = c.JS_NewError(ctx.raw);
+                    _ = c.JS_SetPropertyStr(ctx.raw, err, "message", c.JS_NewStringLen(ctx.raw, msg.ptr, msg.len));
+                    var argv1 = [_]c.JSValue{err};
+                    const rv = c.JS_Call(ctx.raw, held.resolvers[f.idx].reject, globals.js_undefined, 1, &argv1);
+                    c.JS_FreeValue(ctx.raw, err);
+                    if (c.JS_IsException(rv)) {
+                        pending.exception = ctx.takeExceptionMessage(self.allocator) catch return DispatchError.OutOfMemory;
+                        return finishResponse(self, &state, &pending, &console_buf, &tags_buf, &host_promises);
+                    }
+                    c.JS_FreeValue(ctx.raw, rv);
+                    break :fetch_blk;
+                }
+                // `{status, bytes, text, headers?, truncated}` — `status`
+                // alone is the success contract (no derived `ok`),
+                // matching the flattened request surface.
+                const obj = c.JS_NewObject(ctx.raw);
+                _ = c.JS_SetPropertyStr(ctx.raw, obj, "status", c.JS_NewInt32(ctx.raw, @intCast(f.status)));
+                _ = c.JS_SetPropertyStr(ctx.raw, obj, "bytes", c.JS_NewUint8ArrayCopy(ctx.raw, f.bytes.ptr, f.bytes.len));
+                _ = c.JS_SetPropertyStr(ctx.raw, obj, "text", c.JS_NewStringLen(ctx.raw, f.bytes.ptr, f.bytes.len));
+                if (f.headers_json.len > 0) {
+                    const h = c.JS_ParseJSON(ctx.raw, f.headers_json.ptr, f.headers_json.len, "headers.json");
+                    if (c.JS_IsException(h)) {
+                        _ = ctx.takeException();
+                    } else {
+                        _ = c.JS_SetPropertyStr(ctx.raw, obj, "headers", h);
+                    }
+                }
+                _ = c.JS_SetPropertyStr(ctx.raw, obj, "truncated", if (f.truncated) globals.js_true else globals.js_false);
+                var argv1 = [_]c.JSValue{obj};
+                const rv = c.JS_Call(ctx.raw, held.resolvers[f.idx].resolve, globals.js_undefined, 1, &argv1);
+                c.JS_FreeValue(ctx.raw, obj);
                 if (c.JS_IsException(rv)) {
                     pending.exception = ctx.takeExceptionMessage(self.allocator) catch return DispatchError.OutOfMemory;
                     return finishResponse(self, &state, &pending, &console_buf, &tags_buf, &host_promises);

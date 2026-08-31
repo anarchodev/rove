@@ -92,12 +92,25 @@ pub fn jsOnTimer(
         _ = c.JS_ThrowInternalError(ctx, "after.ms: out of memory");
         return js_exception;
     };
-    // Promise form (`held.zig`): on a held connection the arm is also a
-    // promise the handler can `await`; the resume settles it. The
-    // capability lives in the request's own memory — Zig keeps the
-    // resolving pair by index, never a JS reference across activations.
-    // A caller that ignores the return value and parks with `next()`
-    // still gets the export-based wake: the arm is registered either way.
+    if (list.items[list.items.len - 1].on != null) return js_undefined;
+    return armPromise(state, ctx, list);
+}
+
+/// The promise form (`held.zig`): an `after.*` arm registered WITHOUT
+/// `{on}` on a held connection is awaitable — the resume settles it
+/// with its wake entry. `{on}` keeps the export flow (transitional:
+/// the export flow for same-connection wakes is slated for removal
+/// once the apps migrate to `await`). The capability lives in the
+/// request's own memory — Zig keeps the resolving pair by index,
+/// never a JS reference across activations. A caller that ignores the
+/// returned promise and parks with `next()` still gets the default
+/// `onWake` wake: the arm is registered either way, and the unused
+/// promise dies with the request.
+fn armPromise(
+    state: *globals.DispatchState,
+    ctx: ?*c.JSContext,
+    list: *std.ArrayListUnmanaged(globals.PendingWakeReg),
+) c.JSValue {
     const promises = state.host_promises orelse return js_undefined;
     var funcs: [2]c.JSValue = undefined;
     const promise = c.JS_NewPromiseCapability(ctx, &funcs);
@@ -106,7 +119,7 @@ pub fn jsOnTimer(
         c.JS_FreeValue(ctx, funcs[0]);
         c.JS_FreeValue(ctx, funcs[1]);
         c.JS_FreeValue(ctx, promise);
-        _ = c.JS_ThrowInternalError(ctx, "after.ms: out of memory");
+        _ = c.JS_ThrowInternalError(ctx, "after: out of memory");
         return js_exception;
     };
     list.items[list.items.len - 1].promise_idx = @intCast(promises.items.len - 1);
@@ -154,5 +167,6 @@ pub fn jsOnKv(
         _ = c.JS_ThrowInternalError(ctx, "after.kv: out of memory");
         return js_exception;
     };
-    return js_undefined;
+    if (list.items[list.items.len - 1].on != null) return js_undefined;
+    return armPromise(state, ctx, list);
 }

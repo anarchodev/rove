@@ -35,7 +35,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
+import concurrent.futures
+import urllib.parse as up
+
+from smoke_lib_v2 import PUBLIC_SUFFIX, V2Cluster, rpc_wrap  # noqa: E402
 
 PROMISE_SRC = """\
 export default async function () {
@@ -63,6 +66,33 @@ export function read() {
     return JSON.stringify({ before: kv.get("before/" + tag), after: kv.get("after/" + tag) });
 }
 """
+WATCH_SRC = """\
+export default async function () {
+    const wake = await after.kv("watch/");
+    const seen = kv.get("watch/flag");
+    response.status = 201;
+    return JSON.stringify({ kind: wake.kind, prefix: wake.prefix, seen: seen });
+}
+"""
+POKE_SRC = """\
+export function poke() {
+    kv.set("watch/flag", "lit");
+    return "poked";
+}
+"""
+FETCHER_SRC = """\
+export default async function () {
+    const m = /(?:^|&)url=([^&]*)/.exec(request.query || "");
+    const url = decodeURIComponent(m ? m[1] : "");
+    const res = await after.fetch(url);
+    response.status = 201;
+    return JSON.stringify({ status: res.status, text: res.text, truncated: res.truncated,
+                            idForm: typeof res === "object" ? "obj" : "str" });
+}
+export function onWake() { return "unused"; }
+"""
+BULK_SRC = 'export function bulk() { return "0123456789".repeat(17); }\n'
+
 READY_SRC = 'export function handler() { return "ready"; }\n'
 
 
@@ -85,6 +115,9 @@ def main() -> int:
                 "index.mjs": rpc_wrap(READY_SRC),
                 "promise/index.mjs": PROMISE_SRC,
                 "promiseread/index.mjs": rpc_wrap(READ_SRC),
+                "watch/index.mjs": WATCH_SRC,
+                "watchpoke/index.mjs": rpc_wrap(POKE_SRC),
+                "fetcher/index.mjs": FETCHER_SRC,
             })
             check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")
         except RuntimeError as e:
@@ -139,7 +172,49 @@ def main() -> int:
               f"got {r.status} {r.body!r} ({elapsed:.2f}s)")
         check("two awaits took ≥ 2 timers", elapsed >= 0.15, f"{elapsed:.3f}s")
 
-        print("step 6: a throw after the await is a loud 500")
+        print("step 6: await after.kv — a concurrent write settles the promise")
+        def held_watch():
+            r2 = c.request("acme", "/watch", method="POST", data="{}", timeout=30.0)
+            return r2.status, r2.body
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(held_watch)
+            time.sleep(1.0)  # let the inbound hop park before writing
+            w = c.request("acme", "/watchpoke?fn=poke", method="GET", timeout=10.0)
+            check("poke → 200", w.status == 200 and "poked" in w.body, f"got {w.status} {w.body!r}")
+            status, body = fut.result(timeout=35.0)
+        try:
+            got = json.loads(body) if status == 201 else {}
+        except ValueError:
+            got = {}
+        check("await after.kv → 201", status == 201, f"got {status} {body!r}")
+        check("promise resolved with the wake entry", got.get("kind") == "kv" and got.get("prefix") == "watch/",
+              f"got {got}")
+        check("handler re-read sees the write", got.get("seen") == "lit", f"got {got}")
+
+        print("step 7: provision 'wb' as the fetch upstream; await after.fetch")
+        r = c.provision("wb")
+        check("provision wb → 200", r.status == 200, f"got {r.status}")
+        try:
+            wb_dep = c.deploy_handlers("wb", {"index.mjs": rpc_wrap(BULK_SRC)})
+        except RuntimeError as e:
+            wb_dep = None
+            check("deploy wb", False, str(e))
+        if wb_dep:
+            ready2 = c.wait_for_handler("wb", "/?fn=bulk", want_body="0123456789")
+            check("wb upstream ready", ready2.status == 200, f"got {ready2.status}")
+            bulk_url = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/?fn=bulk"
+            r = c.request("acme", f"/fetcher?url={up.quote(bulk_url)}", method="POST", data="{}", timeout=30.0)
+            try:
+                got = json.loads(r.body) if r.status == 201 else {}
+            except ValueError:
+                got = {}
+            check("await after.fetch → 201", r.status == 201, f"got {r.status} {r.body!r}")
+            check("resolved with the whole response", got.get("status") == 200 and got.get("text") == "0123456789" * 17,
+                  f"got status={got.get('status')} len={len(got.get('text') or '')}")
+            check("not truncated, object form", got.get("truncated") is False and got.get("idForm") == "obj",
+                  f"got {got}")
+
+        print("step 8: a throw after the await is a loud 500")
         r = c.request("acme", "/promise", method="POST",
                       headers={"content-type": "application/json"},
                       data=json.dumps({"ms": 100, "tag": "z", "throwAfter": True}), timeout=30.0)

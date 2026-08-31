@@ -265,6 +265,11 @@ pub const PendingFetch = struct {
     /// cont's owning worker. Empty for plain (non-webhook) fetches.
     /// Allocator-owned dupe.
     bound_send_id: []u8 = &.{},
+    /// The host promise this fetch settles when its terminal event
+    /// arrives (`held.zig`) — an index into the activation's
+    /// `host_promises`. Null for the export flow (`{on}` given, or no
+    /// held accumulator).
+    promise_idx: ?u32 = null,
     /// Customer-facing `name:` override — see
     /// `bindings/http.zig` BuiltFetch.name. Empty → dispatcher
     /// uses `onFetchChunk` (default). Non-empty → dispatcher

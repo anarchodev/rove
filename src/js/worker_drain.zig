@@ -1627,7 +1627,7 @@ fn installContWakes(
             .kv => if (reg.prefix.len > 0) {
                 const dup = allocator.dupe(u8, reg.prefix) catch continue;
                 const on: ?[]u8 = if (reg.on) |t| allocator.dupe(u8, t) catch null else null;
-                arms.append(allocator, .{ .prefix = dup, .on = on }) catch {
+                arms.append(allocator, .{ .prefix = dup, .on = on, .promise_idx = reg.promise_idx }) catch {
                     allocator.free(dup);
                     if (on) |t| allocator.free(t);
                 };
@@ -1675,7 +1675,28 @@ fn releaseHeldRequest(worker: anytype, ent: rove.Entity) void {
     const hr = server.reg.get(ent, worker.parked_continuations, components_mod.HeldRequest) catch return;
     if (hr.req) |r| worker.dispatcher.snapshot.freeRequest(r) catch {};
     if (hr.resolvers.len > 0) worker.allocator.free(hr.resolvers);
+    for (hr.fetch_promises) |fp| {
+        if (fp.id.len > 0) worker.allocator.free(fp.id);
+    }
+    if (hr.fetch_promises.len > 0) worker.allocator.free(hr.fetch_promises);
     hr.* = .{};
+}
+
+/// The resolver an inbound fetch event settles on a promise-held chain,
+/// consumed settle-once (the id blanks; the slot stays), or null when
+/// the chain is not promise-held / the fetch is not promise-bound.
+fn takeHeldFetchPromise(worker: anytype, ent: rove.Entity, fetch_id: []const u8) ?u32 {
+    const server = worker.h2;
+    const hr = server.reg.get(ent, worker.parked_continuations, components_mod.HeldRequest) catch return null;
+    if (hr.req == null) return null;
+    for (hr.fetch_promises) |*fp| {
+        if (fp.id.len > 0 and std.mem.eql(u8, fp.id, fetch_id)) {
+            worker.allocator.free(fp.id);
+            fp.id = &.{};
+            return fp.idx;
+        }
+    }
+    return null;
 }
 
 /// The held sibling of `resumeContinuation(wake=true)`: a due timer on a
@@ -1707,28 +1728,41 @@ fn resumeHeldChain(
     const inst = dep.inst;
     const tc = dep.tc;
 
-    // Which promise fires. The timer slot's resolver; the fired group is
-    // drained so the sweep does not re-fire it, and rides the activation
-    // as `request.activation.wakes[]` like any wake.
+    // Which promises fire: the drained batch's arms, each carrying its
+    // resolver (`promise_idx`, stamped at drain). The drain also clears
+    // the fired state so the sweep does not re-fire, and the entries
+    // ride the activation as `request.activation.wakes[]` like any wake.
     var batch_owned: []components_mod.WakeEntry = &.{};
     defer if (batch_owned.len > 0) {
         for (batch_owned) |*w| w.deinit(allocator);
         allocator.free(batch_owned);
     };
-    const settle: held_mod.Settle = blk: {
-        const sw = server.reg.get(ent, worker.parked_continuations, components_mod.StreamWakes) catch break :blk .{ .timer = 0 };
+    if (server.reg.get(ent, worker.parked_continuations, components_mod.StreamWakes)) |sw| {
         if (sw.nextWakeBatch(allocator) catch null) |wb| {
             batch_owned = wb.entries;
             allocator.free(wb.export_name);
         }
-        const idx = sw.timer_promise orelse {
-            // A held chain woke on an arm that carries no promise — the
-            // handler's own `await` can never be settled by it. Loud.
-            try resolveParked(worker, ent, sid, sess, 500, "held chain woke on an arm without a promise\n");
+    } else |_| {}
+    var settles: std.ArrayListUnmanaged(held_mod.SettleWake) = .empty;
+    defer settles.deinit(allocator);
+    for (batch_owned) |w| {
+        const pi = w.promise_idx orelse {
+            // An `{on}` arm fired on a promise-held chain: its export
+            // cannot run there and nothing awaits it — a defined author
+            // error (transitional; the export flow for same-connection
+            // wakes is slated for removal).
+            try resolveParked(worker, ent, sid, sess, 500, "held chain woke on an {on} arm — await the arm, or park with next()\n");
             return;
         };
-        break :blk .{ .timer = idx };
-    };
+        settles.append(allocator, .{
+            .idx = pi,
+            .kind = if (w.tag == .kv) .kv else .timer,
+            .prefix = w.prefix,
+            .fired_at_ms = @divFloor(w.fired_at_ns, std.time.ns_per_ms),
+        }) catch return error.ResumeTxnAlloc;
+    }
+    if (settles.items.len == 0) return; // spurious tick — nothing fired
+    const settle: held_mod.Settle = .{ .wakes = settles.items };
 
     const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return error.ResumeTxnAlloc;
     var txn_owned = true;
@@ -2456,6 +2490,184 @@ fn resumeContinuation(
     });
 }
 
+/// The held sibling of `resumeBoundFetchChain` (`held.zig`): a bound
+/// fetch's event on a chain parked by promise. The whole buffered
+/// response settles the awaited promise (`stream: false` — the default
+/// — emits exactly one final event); a streamed event rejects it. The
+/// event is this activation's Msg and rides the fetch tape channel
+/// exactly as the export path's does, so the fold replays it. Owns
+/// `ev`.
+fn resumeHeldFetch(
+    worker: anytype,
+    ent: rove.Entity,
+    ev: *components_mod.UpstreamFetchEvent,
+    promise_idx: u32,
+) void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    defer components_mod.UpstreamFetchEvent.deinitItem(ev, allocator);
+    if (!server.reg.isInCollection(ent, worker.parked_continuations)) return;
+    const desc = server.reg.get(ent, worker.parked_continuations, components_mod.ContDescriptor) catch return;
+    const chain = server.reg.get(ent, worker.parked_continuations, components_mod.ChainContext) catch return;
+    const hr = server.reg.get(ent, worker.parked_continuations, components_mod.HeldRequest) catch return;
+    const req_arena = hr.req orelse return;
+    const c2 = desc.cont orelse return;
+    const tenant_id = chain.tenant_id;
+    const saga_id = chain.saga_id;
+    const cont_path = c2.path;
+    const cont_path_log = allocator.dupe(u8, cont_path) catch &.{};
+    defer if (cont_path_log.len > 0) allocator.free(cont_path_log);
+    const sid_ptr = server.reg.get(ent, worker.parked_continuations, h2.StreamId) catch return;
+    const sess_ptr = server.reg.get(ent, worker.parked_continuations, h2.Session) catch return;
+    const sid = sid_ptr.*;
+    const sess = sess_ptr.*;
+    var dep = resolveDeployment(worker, allocator, tenant_id, cont_path) catch |err| {
+        std.log.warn("rove-js held-fetch: resolveDeployment tenant={s} module={s}: {s}", .{ tenant_id, cont_path, @errorName(err) });
+        return;
+    };
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+
+    // The fetch is over (or refused): its bind no longer counts as a
+    // resume source.
+    if (ev.final) {
+        if (server.reg.get(ent, worker.parked_continuations, components_mod.BoundFetchCount)) |cnt| {
+            if (cnt.pending > 0) cnt.pending -= 1;
+        } else |_| {}
+    }
+
+    const settle: held_mod.Settle = .{ .fetch = if (ev.seq != 0 or !ev.final) .{
+        .idx = promise_idx,
+        .reject = "await after.fetch cannot consume a streamed response — omit {stream:true} or use the {on} export form",
+    } else .{
+        .idx = promise_idx,
+        .status = ev.terminal_status,
+        .bytes = ev.bytes,
+        .headers_json = ev.fetch_headers orelse "",
+        .truncated = ev.body_truncated,
+    } };
+
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
+    defer readset.deinit();
+    const request_id: u64 = worker_mod.mintRequestId(worker, inst);
+    const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
+    var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (pending_wakes.items) |*pw| pw.deinit(allocator);
+        pending_wakes.deinit(allocator);
+    }
+    var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stream_chunks.items) |ch| allocator.free(ch);
+        stream_chunks.deinit(allocator);
+    }
+    const fetches_pending: u32 = blk: {
+        const cnt = server.reg.get(ent, worker.parked_continuations, components_mod.BoundFetchCount) catch break :blk 0;
+        break :blk cnt.pending;
+    };
+    // The event is the activation's Msg (an input) — taped via the fetch
+    // channel below so the fold replays this hop. `export_name` empty:
+    // no export runs; the promise settles.
+    const fetch_ev: worker_mod.FetchEvent = .{
+        .fetch_id = ev.fetch_id,
+        .seq = ev.seq,
+        .byte_offset = ev.byte_offset,
+        .bytes = ev.bytes,
+        .headers = ev.fetch_headers orelse "",
+        .final = ev.final,
+        .terminal_status = ev.terminal_status,
+        .terminal_ok = ev.terminal_ok,
+        .body_truncated = ev.body_truncated,
+        .export_name = "",
+        .content_hash = if (ev.content_hash) |*h| h[0..] else "",
+    };
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{cont_path}) catch return;
+    defer allocator.free(spath);
+    const request: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = "",
+        .fn_override = null,
+        .activation = .{ .fetch_chunk = .{
+            .id = ev.fetch_id,
+            .seq = ev.seq,
+            .byte_offset = ev.byte_offset,
+            .bytes = ev.bytes,
+            .headers = ev.fetch_headers,
+            .final = ev.final,
+            .terminal_status = if (ev.final) ev.terminal_status else 0,
+            .terminal_ok = if (ev.final) ev.terminal_ok else false,
+            .body_truncated = if (ev.final) ev.body_truncated else false,
+        } },
+        .activation_entity = ent,
+        .activation_fetches_pending = fetches_pending,
+        .trace = .{ .readset = &readset, .request_id = request_id, .saga_id = saga_id, .exec_seq = exec_seq },
+        .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .plan_rate = tc.slot.effectivePlan().rate, .plan_gen = tc.slot.plan_gen.load(.acquire), .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
+        .trampolines = worker.trampolines(null),
+        .effects = .{
+            .pending_wakes = &pending_wakes,
+            .pending_stream_chunks = &stream_chunks,
+            .pending_fetches = &pending_fetches,
+        },
+    };
+    std.log.info("rove-js corr: held-fetch resume corr={s} request_id={d} tenant={s}", .{ saga_id orelse "(none)", request_id, inst.id });
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    var oc = worker_mod.runResumeHeld(worker, inst, tc, txn, &ws, request, &budget, .{ .req = req_arena, .outer = hr.outer, .resolvers = hr.resolvers }, settle) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "held handler error\n") catch {};
+        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, saga_id, &.{}, .fetch_chunk, 0, exec_seq);
+        return;
+    };
+    const wrote = ws.ops.items.len > 0;
+    finishContResume(worker, .{
+        .site = "held-fetch",
+        .noun = "held",
+        .cancel_binds = true,
+        .tape = .fetch,
+    }, &oc, .{
+        .ent = ent,
+        .sid = sid,
+        .sess = sess,
+        .ws = &ws,
+        .txn = txn,
+        .tenant_id = tenant_id,
+        .readset = &readset,
+        .cont_path = cont_path,
+        .cont_path_log = cont_path_log,
+        .saga_id = saga_id,
+        .request_id = request_id,
+        .exec_seq = exec_seq,
+        .now_ns = now_ns,
+        .deployment_id = tc.snap.deployment_id,
+        .wrote = wrote,
+        .txn_owned = &txn_owned,
+        .txn_done = &txn_done,
+        .act = .fetch_chunk,
+        .pending_fetches = &pending_fetches,
+        .pending_wakes = &pending_wakes,
+        .tape_body = "",
+        .tape_ev = fetch_ev,
+    });
+}
+
 /// The bound-fetch resume engine (the streaming substrate,
 /// `docs/architecture/routing-and-ingress.md`; handler surface in
 /// `docs/handler-shape.md` §5.5). Sibling of `resumeContinuation`:
@@ -2497,6 +2709,12 @@ pub fn resumeBoundFetchChain(
         deinit_event = false;
         ev.bind = false;
         worker_mod.fireFetchEventActivation(worker, ev, null);
+        return;
+    }
+    // A chain parked by promise settles its awaited fetch (`held.zig`).
+    if (takeHeldFetchPromise(worker, ent, ev.fetch_id)) |pidx| {
+        deinit_event = false; // resumeHeldFetch takes ownership
+        resumeHeldFetch(worker, ent, ev, pidx);
         return;
     }
     const desc = server.reg.get(ent, worker.parked_continuations, components_mod.ContDescriptor) catch return;

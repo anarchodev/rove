@@ -453,7 +453,7 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
                 errdefer allocator.free(pfx);
                 const on: ?[]u8 = if (reg.on) |t| try allocator.dupe(u8, t) else null;
                 errdefer if (on) |t| allocator.free(t);
-                try arms.append(allocator, .{ .prefix = pfx, .on = on });
+                try arms.append(allocator, .{ .prefix = pfx, .on = on, .promise_idx = reg.promise_idx });
             },
         }
     }
@@ -3405,6 +3405,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 pf.bind = pf.connection_scoped and held and pf.bound_send_id.len == 0;
                 if (pf.bind) {
                     _ = @TypeOf(worker.*).registerBoundFetchTrampoline(@ptrCast(worker), pf.id, ent);
+                    // Promise-bound (`held.zig`): remember which resolver
+                    // this fetch's terminal event settles.
+                    if (pf.promise_idx) |pi|
+                        worker_mod.recordFetchPromise(worker, ent, server.coll(.request_out), pf.id, pi);
                 }
                 // Kept (bound or unbound-detached fire) → move to the
                 // batch; dropped connection-scoped fetches were freed

@@ -92,10 +92,16 @@ function _rejectRenamed(verb, opts, renames) {
      * @param {object} [opts]
      * @param {string} [opts.on] - Export to resume into; defaults to
      *   `onWake`.
-     * @returns {void}
+     * @returns {Promise<{kind:string,prefix:string,firedAt:number}>|undefined}
+     *   Without `on`, on a held connection: a promise that settles with
+     *   the fired wake entry (the `wakes[]` shape) — `await` it to
+     *   continue in place; the wake is an edge ("go look"), so re-read
+     *   kv for the values. With `on`, or where the connection cannot be
+     *   held: `undefined`, and the wake lands in the export.
      * @example
-     * after.kv(`rooms/${roomId}/`);             // default onWake
-     * after.kv(`jobs/${id}/`, { on: "onJob" }); // explicit target
+     * after.kv(`jobs/${id}/`, { on: "onJob" }); // export target
+     * @example
+     * export default async () => { await after.kv("rooms/1/"); return JSON.stringify(kv.prefix("rooms/1/")); };
      */
     kv(prefix, opts) {
       return sys.kv(prefix, opts);
@@ -131,14 +137,22 @@ function _rejectRenamed(verb, opts, renames) {
      *   door engages it): intermediate chunks are spliced straight onto
      *   the held stream — `{on}` fires only for the first event and the
      *   terminal. Inert on any other fetch.
-     * @returns {string} The fetch id (`ftch_…`, opaque — compare to
-     *   `request.fetchId`).
+     * @returns {Promise<{status:number,bytes:Uint8Array,text:string,headers:Object,truncated:boolean}>|string}
+     *   Without `on`, on a held connection: a promise that resolves once
+     *   with the whole buffered response — `await` it to continue in
+     *   place (`status` alone is the success contract; a streamed
+     *   response rejects — pass `{on}` to consume chunks). The fetch id
+     *   rides the promise as `.fetchId` (for `after.cancel`). With
+     *   `on`, or where the connection cannot be held: the fetch id
+     *   string (`ftch_…`, opaque — compare to `request.fetchId`).
      * @throws {Error} `code:"rate_limited"` when the per-tenant outbound
      *   rate limit is exhausted (shared with `webhook.send`/`email.send`).
      * @example
      * after.fetch('https://api.example.com/stream',
      *             { stream: true, on: 'onUpstream' });
      * return next();
+     * @example
+     * export default async () => { const res = await after.fetch("https://api.example.com/x"); return String(res.status); };
      */
     fetch(url, opts) {
       opts = opts || {};

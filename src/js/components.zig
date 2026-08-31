@@ -119,15 +119,25 @@ pub const HeldRequest = struct {
     /// dropped with the arena, never freed individually.
     outer: qjs.c.JSValue = undefined,
     /// Host promises the chain's LATEST activation created, indexed by
-    /// `StreamWakes.timer_promise`. Allocator-owned. A re-hold replaces
+    /// the arms' `promise_idx`. Allocator-owned. A re-hold replaces
     /// the slice — the arm set is per activation, and so are the
     /// promises behind it.
     resolvers: []held_mod.HostPromise = &.{},
+    /// Fetches this chain awaits (`held.zig`): bare-hex fetch id → the
+    /// resolver its terminal event settles. Consumed settle-once by
+    /// blanking the id; ids allocator-owned.
+    fetch_promises: []FetchPromise = &.{},
+
+    pub const FetchPromise = struct { id: []u8 = &.{}, idx: u32 = 0 };
 
     pub fn deinit(allocator: std.mem.Allocator, items: []HeldRequest) void {
         for (items) |*item| {
             if (item.req) |r| qjs.c.js_request_arena_free(r);
             if (item.resolvers.len > 0) allocator.free(item.resolvers);
+            for (item.fetch_promises) |fp| {
+                if (fp.id.len > 0) allocator.free(fp.id);
+            }
+            if (item.fetch_promises.len > 0) allocator.free(item.fetch_promises);
             item.* = .{};
         }
     }
@@ -332,17 +342,17 @@ pub const StreamWakes = struct {
         // Gather fired refs (borrowed) in a deterministic order key
         // `(fired_at_ns, order)`: kv arms carry their arm index; the timer
         // sorts last on an exact tie.
-        const Ref = struct { export_name: []const u8, tag: WakeEntry.Tag, prefix: []const u8, fired_at_ns: i64, order: usize };
+        const Ref = struct { export_name: []const u8, tag: WakeEntry.Tag, prefix: []const u8, fired_at_ns: i64, order: usize, promise_idx: ?u32 };
         const refs = try allocator.alloc(Ref, fired_count);
         defer allocator.free(refs);
         var ri: usize = 0;
         for (self.kv_prefixes, 0..) |arm, idx| {
             if (arm.fired_at_ns == 0) continue;
-            refs[ri] = .{ .export_name = armExport(arm.on), .tag = .kv, .prefix = arm.prefix, .fired_at_ns = arm.fired_at_ns, .order = idx };
+            refs[ri] = .{ .export_name = armExport(arm.on), .tag = .kv, .prefix = arm.prefix, .fired_at_ns = arm.fired_at_ns, .order = idx, .promise_idx = arm.promise_idx };
             ri += 1;
         }
         if (self.timer_fired_ns != 0) {
-            refs[ri] = .{ .export_name = armExport(self.timer_on), .tag = .timer, .prefix = "", .fired_at_ns = self.timer_fired_ns, .order = std.math.maxInt(usize) };
+            refs[ri] = .{ .export_name = armExport(self.timer_on), .tag = .timer, .prefix = "", .fired_at_ns = self.timer_fired_ns, .order = std.math.maxInt(usize), .promise_idx = self.timer_promise };
             ri += 1;
         }
         std.mem.sort(Ref, refs, {}, struct {
@@ -384,7 +394,7 @@ pub const StreamWakes = struct {
             errdefer allocator.free(grown);
             @memcpy(grown[0..prev.len], prev);
             const pfx: []u8 = if (ref.tag == .kv) try allocator.dupe(u8, ref.prefix) else &.{};
-            grown[prev.len] = .{ .tag = ref.tag, .prefix = pfx, .fired_at_ns = ref.fired_at_ns };
+            grown[prev.len] = .{ .tag = ref.tag, .prefix = pfx, .fired_at_ns = ref.fired_at_ns, .promise_idx = ref.promise_idx };
             if (prev.len > 0) allocator.free(prev);
             b.entries = grown;
         }
@@ -426,6 +436,10 @@ pub const StreamWakes = struct {
 pub const KvArm = struct {
     prefix: []u8 = &.{},
     fired_at_ns: i64 = 0,
+    /// The host promise this arm settles when it fires (`held.zig`) —
+    /// an index into the held entity's `HeldRequest.resolvers`. Null =
+    /// export flow.
+    promise_idx: ?u32 = null,
     /// This arm's `{on}` resume export — `"module.method"` / a bare
     /// `"method"`, or null → the default `onWake`. Allocator-owned.
     /// Per-arm so a chain arming `after.kv(a,{on:onA})` + `after.kv(b,
@@ -770,6 +784,10 @@ pub const WakeEntry = struct {
     /// match for a kv arm; scheduled fire time for a timer).
     /// Surfaces to the handler as `wakes[i].firedAt` in MILLISECONDS.
     fired_at_ns: i64 = 0,
+    /// The host promise the fired arm settles (`held.zig`), carried
+    /// from the arm at drain time so the batch survives the arms being
+    /// freed + rebuilt. Null = export flow.
+    promise_idx: ?u32 = null,
 
     pub const Tag = enum(u8) { kv, timer };
 

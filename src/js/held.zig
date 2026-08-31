@@ -33,11 +33,38 @@ pub const HostPromise = struct {
     reject: c.JSValue,
 };
 
-/// What a resume does to the held handler: which host promise it
+/// A fired `after.ms`/`after.kv` arm to settle: resolve resolver `idx`
+/// with its wake entry — the same `{kind, prefix?, firedAt}` shape
+/// `request.activation.wakes[]` carries, derived from the recorded
+/// batch, so a replayer reconstructs the value from the tape.
+pub const SettleWake = struct {
+    idx: u32,
+    kind: enum { timer, kv },
+    prefix: []const u8 = "",
+    fired_at_ms: i64,
+};
+
+/// A bound fetch's terminal event to settle. Resolves resolver `idx`
+/// with `{status, bytes, text, headers?, truncated}` — `status` alone
+/// is the success contract, matching the flattened request surface
+/// (there is no derived `ok`). `reject` non-null rejects instead
+/// (a streamed response cannot be awaited).
+pub const SettleFetch = struct {
+    idx: u32,
+    status: u16 = 0,
+    bytes: []const u8 = "",
+    headers_json: []const u8 = "",
+    truncated: bool = false,
+    reject: ?[]const u8 = null,
+};
+
+/// What a resume does to the held handler: which host promises it
 /// settles, and how.
 pub const Settle = union(enum) {
-    /// A timer arm fired: resolve resolver `idx` with `undefined`.
-    timer: u32,
+    /// Fired `after.*` arms, in the batch's deterministic order.
+    wakes: []const SettleWake,
+    /// A bound fetch completed (or must be refused).
+    fetch: SettleFetch,
 };
 
 /// The dispatcher's answer when the handler is awaiting the host.

@@ -4228,6 +4228,30 @@ pub fn synthHeldContinuation(allocator: std.mem.Allocator, module_base: []const 
     return .{ .path = path, .fn_name = null, .ctx_json = ctx_json, .tags = tags };
 }
 
+/// Remember which resolver a promise-bound fetch settles (`held.zig`):
+/// grows the held entity's id→resolver map by one. On OOM the fetch
+/// still fires but nothing awaits it — the chain falls to the hold
+/// deadline; loud in the log rather than silent.
+pub fn recordFetchPromise(worker: anytype, ent: rove.Entity, coll: anytype, fetch_id: []const u8, idx: u32) void {
+    const server = worker.h2;
+    const hr = server.reg.get(ent, coll, components_mod.HeldRequest) catch return;
+    if (hr.req == null) return;
+    const a = worker.allocator;
+    const id = a.dupe(u8, fetch_id) catch {
+        std.log.warn("rove-js held: fetch-promise record OOM (id) — the await will deadline", .{});
+        return;
+    };
+    const grown = a.alloc(components_mod.HeldRequest.FetchPromise, hr.fetch_promises.len + 1) catch {
+        a.free(id);
+        std.log.warn("rove-js held: fetch-promise record OOM (map) — the await will deadline", .{});
+        return;
+    };
+    @memcpy(grown[0..hr.fetch_promises.len], hr.fetch_promises);
+    grown[hr.fetch_promises.len] = .{ .id = id, .idx = idx };
+    if (hr.fetch_promises.len > 0) a.free(hr.fetch_promises);
+    hr.fetch_promises = grown;
+}
+
 /// Release a `.held` outcome on a path that cannot park it: free the
 /// detached arena now (no entity will hold it) and drop the resolvers
 /// and tags. Only for paths where a hold is defined to be impossible —
