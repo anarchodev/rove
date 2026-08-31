@@ -1457,6 +1457,7 @@ pub fn Worker(comptime opts: Options) type {
         components_mod.StreamWakes,
         components_mod.StreamDraining,
         components_mod.BoundFetchCount,
+        components_mod.HeldRequest,
         // Streamed-snapshot dest state (inert {box=null} on every
         // non-snapshot stream entity). In the shared StreamRow so `arm` can set
         // the box in-place in `request_out` and the deferred move to
@@ -4182,6 +4183,51 @@ pub fn runResume(
 /// (`index.js` or `tenant/index.mjs`) catch every sub-path below it,
 /// which is exactly what the admin handler needs — one JS module
 /// does its own path-based dispatch.
+/// `runResume`'s sibling for a held chain (`held.zig`): re-enter the
+/// kept arena and settle the promise the handler awaits, with the same
+/// snapshot-derived args folded.
+pub fn runResumeHeld(
+    worker: anytype,
+    inst: anytype,
+    tc: anytype,
+    txn: *kv_mod.TrackedTxn,
+    ws: *kv_mod.WriteSet,
+    request: dispatcher_mod.Request,
+    budget: *dispatcher_mod.Budget,
+    held: held_mod.HeldState,
+    settle: held_mod.Settle,
+) dispatcher_mod.DispatchError!dispatcher_mod.RunOutcome {
+    return worker.dispatcher.resumeHeld(
+        inst.kv,
+        txn,
+        ws,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        if (tc.snap.resolver) |*r| r else null,
+        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
+        tc.snap.deployment_id,
+        request,
+        budget,
+        held,
+        settle,
+    );
+}
+
+/// The continuation a held park rides: a chain parked by promise is
+/// parked exactly like a `next()` — the module, the deadline, the
+/// `after.*` arms, the raft park on writes — with no export to resume
+/// (`fn_name` null: a deadline expiry is the 504 backstop, never a
+/// re-run of the entry export) and no threaded ctx (the handler's state
+/// is its own heap). Takes the outcome's tags.
+pub fn synthHeldContinuation(allocator: std.mem.Allocator, module_base: []const u8, h: *held_mod.HeldOutcome) !continuation_mod.Continuation {
+    const path = try allocator.dupe(u8, module_base);
+    errdefer allocator.free(path);
+    const ctx_json = try allocator.dupe(u8, "null");
+    const tags = h.tags;
+    h.tags = &.{};
+    return .{ .path = path, .fn_name = null, .ctx_json = ctx_json, .tags = tags };
+}
+
 /// Release a `.held` outcome on a path that cannot park it: free the
 /// detached arena now (no entity will hold it) and drop the resolvers
 /// and tags. Only for paths where a hold is defined to be impossible —

@@ -44,6 +44,7 @@ const dispatcher_mod = @import("dispatcher.zig");
 const globals = @import("globals.zig");
 const Request = dispatcher_mod.Request;
 const continuation_mod = @import("bindings/continuation.zig");
+const held_mod = @import("held.zig");
 const Continuation = continuation_mod.Continuation;
 const components_mod = @import("components.zig");
 const effect_mod = @import("effect/root.zig");
@@ -634,6 +635,8 @@ fn resolveParkedWithHeaders(
         h2.RespHeaders.deinit(allocator, (&hdrs)[0..1]);
         return; // already resolved
     }
+    // The chain is ending: a held arena goes now, not at stream death.
+    releaseHeldRequest(worker, ent);
     const owned = try allocator.dupe(u8, body);
     var owned_taken = false;
     errdefer if (!owned_taken) allocator.free(owned);
@@ -1610,6 +1613,7 @@ fn installContWakes(
 
     var interval_ms: i64 = 0;
     var timer_on: ?[]u8 = null;
+    var timer_promise: ?u32 = null;
     var arms: std.ArrayListUnmanaged(components_mod.KvArm) = .empty;
     for (pending.items) |reg| {
         switch (reg.kind) {
@@ -1618,6 +1622,7 @@ fn installContWakes(
                 interval_ms = reg.interval_ms;
                 if (timer_on) |old_to| allocator.free(old_to);
                 timer_on = if (reg.on) |t| allocator.dupe(u8, t) catch null else null;
+                timer_promise = reg.promise_idx;
             },
             .kv => if (reg.prefix.len > 0) {
                 const dup = allocator.dupe(u8, reg.prefix) catch continue;
@@ -1650,8 +1655,173 @@ fn installContWakes(
         .kv_prefixes = kv_prefixes,
         .read_version = read_version,
         .timer_on = timer_on,
+        .timer_promise = timer_promise,
         .pending_batches = carried,
     }) catch {};
+}
+
+/// True iff the parked chain holds a request arena (`held.zig`) — its
+/// wakes settle a promise instead of dispatching an export.
+fn isHeldChain(worker: anytype, ent: rove.Entity) bool {
+    const server = worker.h2;
+    const hr = server.reg.get(ent, worker.parked_continuations, components_mod.HeldRequest) catch return false;
+    return hr.req != null;
+}
+
+/// Free a resolved chain's held arena now rather than at stream death.
+/// Idempotent; a no-op for a `next()` chain.
+fn releaseHeldRequest(worker: anytype, ent: rove.Entity) void {
+    const server = worker.h2;
+    const hr = server.reg.get(ent, worker.parked_continuations, components_mod.HeldRequest) catch return;
+    if (hr.req) |r| worker.dispatcher.snapshot.freeRequest(r) catch {};
+    if (hr.resolvers.len > 0) worker.allocator.free(hr.resolvers);
+    hr.* = .{};
+}
+
+/// The held sibling of `resumeContinuation(wake=true)`: a due timer on a
+/// chain parked by promise. Drains the fired arm group (so it does not
+/// re-fire), re-enters the kept arena and settles the timer's promise,
+/// then finishes exactly as a `next()` resume would (`finishContResume`
+/// — terminal / re-hold / writes through raft).
+fn resumeHeldChain(
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+) !void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    if (!server.reg.isInCollection(ent, worker.parked_continuations)) return;
+    const desc = server.reg.get(ent, worker.parked_continuations, components_mod.ContDescriptor) catch return;
+    const chain = server.reg.get(ent, worker.parked_continuations, components_mod.ChainContext) catch return;
+    const hr = server.reg.get(ent, worker.parked_continuations, components_mod.HeldRequest) catch return;
+    const req_arena = hr.req orelse return;
+    const c = desc.cont orelse return;
+    const tenant_id = chain.tenant_id;
+    const saga_id = chain.saga_id;
+    const cont_path = c.path;
+    const cont_path_log = allocator.dupe(u8, cont_path) catch &.{};
+    defer if (cont_path_log.len > 0) allocator.free(cont_path_log);
+    var dep = try resolveDeployment(worker, allocator, tenant_id, cont_path);
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+
+    // Which promise fires. The timer slot's resolver; the fired group is
+    // drained so the sweep does not re-fire it, and rides the activation
+    // as `request.activation.wakes[]` like any wake.
+    var batch_owned: []components_mod.WakeEntry = &.{};
+    defer if (batch_owned.len > 0) {
+        for (batch_owned) |*w| w.deinit(allocator);
+        allocator.free(batch_owned);
+    };
+    const settle: held_mod.Settle = blk: {
+        const sw = server.reg.get(ent, worker.parked_continuations, components_mod.StreamWakes) catch break :blk .{ .timer = 0 };
+        if (sw.nextWakeBatch(allocator) catch null) |wb| {
+            batch_owned = wb.entries;
+            allocator.free(wb.export_name);
+        }
+        const idx = sw.timer_promise orelse {
+            // A held chain woke on an arm that carries no promise — the
+            // handler's own `await` can never be settled by it. Loud.
+            try resolveParked(worker, ent, sid, sess, 500, "held chain woke on an arm without a promise\n");
+            return;
+        };
+        break :blk .{ .timer = idx };
+    };
+
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return error.ResumeTxnAlloc;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return error.ResumeTxn;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
+    defer readset.deinit();
+    const request_id: u64 = worker_mod.mintRequestId(worker, inst);
+    const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
+    var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (pending_wakes.items) |*pw| pw.deinit(allocator);
+        pending_wakes.deinit(allocator);
+    }
+    var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stream_chunks.items) |ch| allocator.free(ch);
+        stream_chunks.deinit(allocator);
+    }
+    const spath = try std.fmt.allocPrint(allocator, "/{s}", .{cont_path});
+    defer allocator.free(spath);
+    // No synthesized body and no export: the handler resumes in place,
+    // still holding the activation object it was called with.
+    const request: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = "",
+        .query = null,
+        .fn_override = null,
+        .activation = .{ .wake_batch = .{ .wakes = batch_owned } },
+        .trace = .{ .readset = &readset, .request_id = request_id, .saga_id = saga_id, .exec_seq = exec_seq },
+        .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .plan_rate = tc.slot.effectivePlan().rate, .plan_gen = tc.slot.plan_gen.load(.acquire), .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
+        .effects = .{
+            .pending_wakes = &pending_wakes,
+            .pending_stream_chunks = &stream_chunks,
+            .pending_fetches = &pending_fetches,
+        },
+    };
+    std.log.info("rove-js corr: held-resume corr={s} request_id={d} tenant={s}", .{ saga_id orelse "(none)", request_id, inst.id });
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    var oc = worker_mod.runResumeHeld(worker, inst, tc, txn, &ws, request, &budget, .{ .req = req_arena, .outer = hr.outer, .resolvers = hr.resolvers }, settle) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        try resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "held handler error\n");
+        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, saga_id, &.{}, .wake_batch, 0, exec_seq);
+        return;
+    };
+
+    const wrote = ws.ops.items.len > 0;
+    finishContResume(worker, .{
+        .site = "held-resume",
+        .noun = "held",
+        .cancel_binds = false,
+        .tape = .cont,
+    }, &oc, .{
+        .ent = ent,
+        .sid = sid,
+        .sess = sess,
+        .ws = &ws,
+        .txn = txn,
+        .tenant_id = tenant_id,
+        .readset = &readset,
+        .cont_path = cont_path,
+        .cont_path_log = cont_path_log,
+        .saga_id = saga_id,
+        .request_id = request_id,
+        .exec_seq = exec_seq,
+        .now_ns = now_ns,
+        .deployment_id = tc.snap.deployment_id,
+        .wrote = wrote,
+        .txn_owned = &txn_owned,
+        .txn_done = &txn_done,
+        .act = .wake_batch,
+        .allow_repark = true,
+        .pending_fetches = &pending_fetches,
+        .pending_wakes = &pending_wakes,
+        .tape_body = "",
+        .wakes = batch_owned,
+        .resume_export = "",
+    });
 }
 
 /// §2.2 (refactor-audit): the ONE outcome-finishing switch for the three
@@ -1682,6 +1852,29 @@ fn finishContResume(
     const allocator = worker.allocator;
     const server = worker.h2;
     const dep_id = ctx.deployment_id;
+    // Re-held (`held.zig`): the SAME arena awaits a fresh host promise.
+    // Install this hop's resolvers on the entity, then finish the hop as
+    // the repark of a synthesized continuation — deadline refresh,
+    // `after.*` re-arm, park-time vigilance, the raft park on writes —
+    // exactly as a `next()` from a resume would.
+    if (oc.* == .held) {
+        var h = oc.held;
+        if (server.reg.get(ctx.ent, worker.parked_continuations, components_mod.HeldRequest)) |hr| {
+            if (hr.resolvers.len > 0) allocator.free(hr.resolvers);
+            hr.resolvers = h.resolvers;
+            h.resolvers = &.{};
+        } else |_| {}
+        h.req = null; // the entity already owns the arena
+        const synth = worker_mod.synthHeldContinuation(allocator, ctx.cont_path, &h) catch {
+            h.deinit(allocator);
+            ctx.txn.rollback() catch {};
+            ctx.txn_done.* = true;
+            resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " alloc failed\n") catch {};
+            return;
+        };
+        h.deinit(allocator);
+        oc.* = .{ .continuation = synth };
+    }
     switch (oc.*) {
         .terminal => |*r| {
             defer r.deinit(allocator);
@@ -1995,15 +2188,7 @@ fn finishContResume(
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations produce
         // these; the probe ran on the FIRST fire. Defined failure.
-        .held => |*h| {
-            // Held (`held.zig`) on a path that does not park it yet: the
-            // arena is released and the hop fails as a defined 500.
-            worker_mod.dropHeld(worker, h);
-            ctx.txn.rollback() catch {};
-            ctx.txn_done.* = true;
-            resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "held requests not supported on this path\n") catch {};
-            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, contTapes(worker, spec.tape, &ctx), ctx.saga_id, &.{}, ctx.act, 0, ctx.exec_seq);
-        },
+        .held => unreachable, // converted to a repark above
         .no_onheaders, .no_onchunk => {
             ctx.txn.rollback() catch {};
             ctx.txn_done.* = true;
@@ -2712,6 +2897,14 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
     }
 
     for (wake_due.items) |e| {
+        // A chain parked by promise (`held.zig`) settles the promise its
+        // handler awaits instead of dispatching an export.
+        if (isHeldChain(worker, e.ent)) {
+            resumeHeldChain(worker, e.ent, e.sid, e.sess) catch |err| {
+                std.log.warn("rove-js held: timer resume failed ({s})", .{@errorName(err)});
+            };
+            continue;
+        }
         // A held WS chain ships its onWake frames over the socket — route
         // to the ws-aware resume (shipWsFrames), not the HTTP resolveParked.
         if (worker_ws.wsConnForChain(worker, e.ent)) |conn_ent| {

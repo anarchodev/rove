@@ -427,6 +427,7 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
     if (s.cont_wakes.len == 0) return;
     var interval_ms: i64 = 0;
     var timer_on: ?[]u8 = null;
+    var timer_promise: ?u32 = null;
     var arms: std.ArrayListUnmanaged(components_mod.KvArm) = .empty;
     errdefer {
         for (arms.items) |arm| {
@@ -445,6 +446,7 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
                 interval_ms = reg.interval_ms;
                 if (timer_on) |old| allocator.free(old);
                 timer_on = if (reg.on) |t| try allocator.dupe(u8, t) else null;
+                timer_promise = reg.promise_idx;
             },
             .kv => {
                 const pfx = try allocator.dupe(u8, reg.prefix);
@@ -474,6 +476,7 @@ fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessR
         .kv_prefixes = kv_prefixes,
         .read_version = s.cont_read_version,
         .timer_on = timer_on,
+        .timer_promise = timer_promise,
     });
 }
 
@@ -2900,20 +2903,50 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 continue;
             },
             .terminal => |r| r,
-            // Held (`held.zig`): parking the connection on the detached
-            // arena is the promise-model work; until it lands here the
-            // outcome degrades to a defined 501.
-            .held => |hval| {
+            // Held by promise (`held.zig`): park exactly like a `next()`
+            // — a synthesized continuation carries the chain (module,
+            // deadline, `after.*` arms, the raft park on writes) — and the
+            // entity keeps the detached arena + resolvers on
+            // `HeldRequest`, which the timer sweep resumes through
+            // `resumeHeldChain`. Nothing about durability differs from
+            // the `.continuation` arm below.
+            .held => |hval| hblk: {
                 var h = hval;
-                worker_mod.dropHeld(worker, &h);
-                txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
-                    "dispatchOnce.rollbackTo(held)",
-                    "tenant={s} err={s}",
-                    .{ scope_inst.id, @errorName(re) },
-                );
-                try respb.setSimpleResponse(server, ent, sid, sess, 501, "held requests not supported on this path\n", allocator);
-                processed += 1;
-                continue;
+                const parked = blk: {
+                    var synth = worker_mod.synthHeldContinuation(allocator, route.module_base, &h) catch break :blk false;
+                    server.reg.set(ent, server.coll(.request_out), components_mod.HeldRequest, .{
+                        .req = h.req,
+                        .outer = h.outer,
+                        .resolvers = h.resolvers,
+                    }) catch {
+                        synth.deinit(allocator);
+                        break :blk false;
+                    };
+                    // Arena + resolvers now live on the entity.
+                    h.req = null;
+                    h.resolvers = &.{};
+                    cont_opt = synth;
+                    break :blk true;
+                };
+                if (!parked) {
+                    worker_mod.dropHeld(worker, &h);
+                    txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
+                        "dispatchOnce.rollbackTo(held_park_alloc)",
+                        "tenant={s} err={s}",
+                        .{ scope_inst.id, @errorName(re) },
+                    );
+                    try respb.setSimpleResponse(server, ent, sid, sess, 500, "held park alloc failed\n", allocator);
+                    processed += 1;
+                    continue;
+                }
+                h.deinit(allocator);
+                break :hblk dispatcher_mod.Response{
+                    .body = &.{},
+                    .console = &.{},
+                    .exception = &.{},
+                    .set_cookies = &.{},
+                    .headers = &.{},
+                };
             },
             .continuation => |cval| ctblk: {
                 cont_opt = cval;

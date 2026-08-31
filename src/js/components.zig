@@ -16,6 +16,8 @@
 const std = @import("std");
 const blob_mod = @import("rove-blob");
 const continuation_mod = @import("bindings/continuation.zig");
+const qjs = @import("rove-qjs");
+const held_mod = @import("held.zig");
 const Continuation = continuation_mod.Continuation;
 
 /// Per-chain identity carried by both cont and stream chains. The
@@ -98,6 +100,34 @@ pub const ContDescriptor = struct {
         for (items) |*item| {
             if (item.cont) |*c| c.deinit(allocator);
             if (item.bound_schedule_id) |s| allocator.free(s);
+            item.* = .{};
+        }
+    }
+};
+
+/// A held request (`held.zig`): the connection's handler is mid-`await`
+/// and its request arena is kept. Populated on entities whose chain
+/// parked by promise rather than by `next()`; rides every move
+/// (`parked_continuations` ↔ the raft park ↔ `response_in`) like the
+/// other chain components. `deinit` frees the arena structurally when
+/// the entity releases — the one place a held arena's lifetime ends
+/// outside the dispatcher; `resolveParked` releases it earlier so a
+/// resolved chain does not hold 256 KiB until its stream dies.
+pub const HeldRequest = struct {
+    req: ?qjs.snap.HeldRequest = null,
+    /// The handler's outer promise — a reference in `req`'s memory,
+    /// dropped with the arena, never freed individually.
+    outer: qjs.c.JSValue = undefined,
+    /// Host promises the chain's LATEST activation created, indexed by
+    /// `StreamWakes.timer_promise`. Allocator-owned. A re-hold replaces
+    /// the slice — the arm set is per activation, and so are the
+    /// promises behind it.
+    resolvers: []held_mod.HostPromise = &.{},
+
+    pub fn deinit(allocator: std.mem.Allocator, items: []HeldRequest) void {
+        for (items) |*item| {
+            if (item.req) |r| qjs.c.js_request_arena_free(r);
+            if (item.resolvers.len > 0) allocator.free(item.resolvers);
             item.* = .{};
         }
     }
@@ -236,6 +266,10 @@ pub const StreamWakes = struct {
     /// Allocator-owned. Per-arm routing: the timer resumes into its own
     /// export independent of the kv arms' exports.
     timer_on: ?[]u8 = null,
+    /// The host promise the timer settles when it fires — an index into
+    /// the held entity's `HeldRequest.resolvers` (`held.zig`). Null when
+    /// the arm was registered without a promise (a `next()` park).
+    timer_promise: ?u32 = null,
     /// Fired export groups awaiting dispatch, materialized at drain time
     /// (`drainFiredGroup`). One `wake_batch` activation is dispatched per
     /// batch, one per sweep tick, so a tick that fired several distinct
