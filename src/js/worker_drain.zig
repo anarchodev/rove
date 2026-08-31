@@ -786,13 +786,15 @@ fn proposeAndParkContResume(
     tenant_id: []const u8,
     next: ContResumeNext,
     /// durable-wake-plan P5(a): the resume activation's accumulated
-    /// `http.fetch`es. Non-connection-scoped entries (webhook.send's
-    /// inline fire, blob.put's PUT) are staged as commit-gated
-    /// `Cmd.http_fetch` on the parked unit — released by interpretCmd
-    /// strictly after the writeset commits, the same gate the inbound
-    /// path applies. Connection-scoped (`on.fetch`) entries are LEFT
-    /// on the list (binding to a held entity from a writing resume is
-    /// still unwired — callers warn loudly about leftovers).
+    /// `http.fetch`es, staged as commit-gated `Cmd.http_fetch` on the
+    /// parked unit — released by interpretCmd strictly after the
+    /// writeset commits, the same gate the inbound path applies. On a
+    /// `.repark`, connection-scoped (`after.fetch`) entries are BOUND to
+    /// the held entity first (trampoline registered, bind count bumped,
+    /// promise recorded — the inbound seam's shape) and staged too, so a
+    /// hop that writes and then awaits a fetch works. On a `.terminal`
+    /// the connection is closing: connection-scoped entries are left on
+    /// the list for the caller to drop (the scope rule).
     fetches_opt: ?*std.ArrayListUnmanaged(globals.PendingFetch),
     /// The cont-resume dispatch's readset, serialized
     /// onto the raft envelope's `rs_bytes` section so the resumed
@@ -903,16 +905,34 @@ fn proposeAndParkContResume(
         .source = .raft_pending_cont,
         .dest = respond_dest,
     } });
-    // P5(a): commit-gate the resume's unbound fetches. Compact the
-    // connection-scoped ones (which we can't stage) to the front of
-    // the caller's list; everything else transfers into the unit.
+    // P5(a): commit-gate the resume's fetches. A repark binds its
+    // connection-scoped ones to this (still-held) entity before staging
+    // — the entity is in `parked_continuations` here, so the bind count
+    // is bumped where it lives. A terminal leaves them on the caller's
+    // list (compacted to the front): the connection is closing.
     if (fetches_opt) |fetches| {
         var keep: usize = 0;
-        for (fetches.items) |pf| {
+        for (fetches.items) |pf_const| {
+            var pf = pf_const;
             if (pf.connection_scoped) {
-                fetches.items[keep] = pf;
-                keep += 1;
-                continue;
+                if (next != .repark) {
+                    fetches.items[keep] = pf;
+                    keep += 1;
+                    continue;
+                }
+                pf.bind = true;
+                if (!@TypeOf(worker.*).registerBoundFetchTrampoline(@ptrCast(worker), pf.id, ent)) {
+                    // Registry full: the fetch cannot resume this chain —
+                    // drop it loudly rather than fire it unbound.
+                    std.log.warn("rove-js cont-repark: bound-fetch trampoline registration failed tenant={s}", .{tenant_id});
+                    pf.deinit(allocator);
+                    continue;
+                }
+                if (server.reg.get(ent, worker.parked_continuations, components_mod.BoundFetchCount)) |cnt| {
+                    cnt.pending +%= 1;
+                } else |_| {}
+                if (pf.promise_idx) |pi|
+                    worker_mod.recordFetchPromise(worker, ent, worker.parked_continuations, pf.id, pi);
             }
             // Capacity for these was reserved before the propose
             // (1 + fetch_count), so the append can't fail.
@@ -2011,10 +2031,9 @@ fn finishContResume(
                 ctx.txn_owned.* = false;
                 ctx.txn_done.* = true;
                 captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st, .ok, console_owned, exception_owned, tapes, ctx.saga_id, r.tags, ctx.act, seq, ctx.exec_seq);
-                if (ctx.pending_fetches.items.len > 0) std.log.warn(
-                    "rove-js " ++ spec.site ++ ": {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
-                    .{ ctx.pending_fetches.items.len, ctx.tenant_id },
-                );
+                // Terminal ⇒ the connection is closing: connection-scoped
+                // fetches drop (the scope rule), exactly as on the
+                // read-only terminal path.
                 return;
             }
             // Clean read-only commit cannot fault (mirrors finalizeBatch's
@@ -2165,10 +2184,9 @@ fn finishContResume(
                 ctx.txn_done.* = true;
                 // The repark hop's tape row: status=0, parked.
                 captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 0, .ok, &.{}, &.{}, tapes, ctx.saga_id, &.{}, ctx.act, seq, ctx.exec_seq);
-                if (ctx.pending_fetches.items.len > 0) std.log.warn(
-                    "rove-js " ++ spec.site ++ ": {d} connection-scoped fetch(es) from a WRITING repark dropped (bind-from-writing-resume not wired) tenant={s}",
-                    .{ ctx.pending_fetches.items.len, ctx.tenant_id },
-                );
+                // The repark bound + staged its connection-scoped fetches
+                // (`proposeAndParkContResume`); a leftover here is a
+                // registration failure it already warned about.
                 return;
             }
             ctx.txn.commit() catch |e| panic_mod.invariantViolated(

@@ -587,7 +587,7 @@ fn finishWsResume(
             // (`docs/architecture/deployment-and-logs.md`). Consumed by exactly
             // one capture below.
             const tapes = wsResumeTapes(worker, &p.readset, ws_ctx_body, msg);
-            const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, true) catch |perr| {
+            const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, true, null) catch |perr| {
                 std.log.warn("rove-js {s} (terminal+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
                 captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, chain_ctx.saga_id, &.{}, act, 0, p.exec_seq);
@@ -624,10 +624,11 @@ fn finishWsResume(
             const wrote = p.ws.ops.items.len > 0;
             // Snap the §8.4 read baseline before shipWsFrames may transfer txn.
             const read_version = p.txn.readVersion();
+            if (wrote) bindWsFetches(worker, chain_ent, pending_fetches);
             // Tapes before shipWsFrames' propose — input channels ride the raft
             // readset for the promotion walker (see the terminal arm above).
             const tapes = wsResumeTapes(worker, &p.readset, ws_ctx_body, msg);
-            const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, false) catch |perr| {
+            const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, false, if (wrote) pending_fetches else null) catch |perr| {
                 std.log.warn("rove-js {s} (next+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
                 cval.deinit(allocator);
@@ -667,8 +668,6 @@ fn finishWsResume(
             // resume isn't wired — same limit as the HTTP path).
             if (!wrote) {
                 worker_streaming.flushResumeFetches(worker, chain_ent, pending_fetches, true);
-            } else if (pending_fetches.items.len > 0) {
-                std.log.warn("rove-js {s}: {d} on.fetch from a WRITING resume dropped (issue on.fetch from a read-only frame) tenant={s}", .{ tag, pending_fetches.items.len, chain_ctx.tenant_id });
             }
             // Arm any on.kv/on.timer this frame registered (rides the chain).
             if (pending_wakes.items.len > 0) installWsWakes(worker, chain_ent, pending_wakes, read_version);
@@ -717,8 +716,9 @@ fn finishWsResume(
             const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, act, rl.method, rl.path, rl.host, chain_ctx.saga_id, p.now_ns, p.exec_seq);
             const wrote = p.ws.ops.items.len > 0;
             const read_version = p.txn.readVersion();
+            if (wrote) bindWsFetches(worker, chain_ent, pending_fetches);
             const tapes = wsResumeTapes(worker, &p.readset, ws_ctx_body, msg);
-            const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, false) catch |perr| {
+            const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, false, if (wrote) pending_fetches else null) catch |perr| {
                 std.log.warn("rove-js {s} (held+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
                 captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, tapes, chain_ctx.saga_id, &.{}, act, 0, p.exec_seq);
@@ -734,8 +734,6 @@ fn finishWsResume(
             if (fw_seq != 0) armWsGate(worker, conn_ent, chain_ctx.tenant_id, fw_seq);
             if (!wrote) {
                 worker_streaming.flushResumeFetches(worker, chain_ent, pending_fetches, true);
-            } else if (pending_fetches.items.len > 0) {
-                std.log.warn("rove-js {s}: {d} on.fetch from a WRITING resume dropped (issue on.fetch from a read-only hop) tenant={s}", .{ tag, pending_fetches.items.len, chain_ctx.tenant_id });
             }
             if (pending_wakes.items.len > 0) installWsWakes(worker, chain_ent, pending_wakes, read_version);
         },
@@ -854,6 +852,35 @@ fn fireWsMessage(
         return;
     }
     finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .ws_message, "ws-message", .{ .frame = .{ .opcode = opcode, .data = payload } });
+}
+
+/// Bind a WS hop's connection-scoped fetches to its held chain BEFORE the
+/// writing propose (the inbound seam's shape): trampoline registered,
+/// bind count bumped where the entity lives, promise recorded. The
+/// staged `Cmd.http_fetch` then fires post-commit already routable to
+/// this chain. A registration failure drops the fetch loudly.
+fn bindWsFetches(worker: anytype, chain_ent: rove.Entity, fetches: *std.ArrayListUnmanaged(globals.PendingFetch)) void {
+    const allocator = worker.allocator;
+    var keep: usize = 0;
+    for (fetches.items) |pf_const| {
+        var pf = pf_const;
+        if (pf.connection_scoped) {
+            pf.bind = true;
+            if (!@TypeOf(worker.*).registerBoundFetchTrampoline(@ptrCast(worker), pf.id, chain_ent)) {
+                std.log.warn("rove-js ws: bound-fetch trampoline registration failed — fetch dropped", .{});
+                pf.deinit(allocator);
+                continue;
+            }
+            if (worker.h2.reg.get(chain_ent, worker.parked_continuations, components_mod.BoundFetchCount)) |cnt| {
+                cnt.pending +%= 1;
+            } else |_| {}
+            if (pf.promise_idx) |pi|
+                worker_mod.recordFetchPromise(worker, chain_ent, worker.parked_continuations, pf.id, pi);
+        }
+        fetches.items[keep] = pf;
+        keep += 1;
+    }
+    fetches.items.len = keep;
 }
 
 /// The chain's held-request view (`held.zig`): whether it holds an
@@ -1516,6 +1543,11 @@ fn shipWsFrames(
     readset: *const tape_mod.Readset,
     log_header: log_mod.LogHeader,
     close: bool,
+    /// The hop's `after.fetch`es, PRE-BOUND by the caller
+    /// (`bindWsFetches`) — staged commit-gated alongside the frames on
+    /// the write path. Null when the hop is terminal (closing) or the
+    /// caller flushes them itself on the read-only path.
+    fetches: ?*std.ArrayListUnmanaged(globals.PendingFetch),
 ) !u64 {
     const allocator = worker.allocator;
     if (writeset.ops.items.len == 0) {
@@ -1566,7 +1598,7 @@ fn shipWsFrames(
         stage.chunks.deinit(allocator);
         stage.ws_opcodes.deinit(allocator);
     }
-    const seq = proposeForgetfulWrites(worker, writeset, txn, tenant_id, &stage, null, readset, log_header) catch |err| {
+    const seq = proposeForgetfulWrites(worker, writeset, txn, tenant_id, &stage, fetches, readset, log_header) catch |err| {
         txn_owned.* = false; // helper rolled back + destroyed the txn
         return err;
     };

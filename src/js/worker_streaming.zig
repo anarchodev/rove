@@ -2257,15 +2257,17 @@ pub fn proposeForgetfulWrites(
     var cmds: effect_mod.cmd.BufferedCmds = .{};
     errdefer cmds.deinit(allocator);
 
-    // P5(a): filter the fire's accumulated fetches BEFORE sizing the
-    // Cmd list — connection-scoped (`on.fetch`) registrations are
-    // inert from a fire origin (no held connection to bind to).
+    // P5(a): filter the accumulated fetches BEFORE sizing the Cmd list.
+    // A connection-scoped (`after.fetch`) registration the CALLER has
+    // already bound to its held entity (`bind` set — a writing WS hop)
+    // stages like any other; an unbound one is inert from a fire origin
+    // (no held connection to bind to).
     var fetches_count: usize = 0;
     if (fetches_opt) |fetches| {
         var keep: usize = 0;
         for (fetches.items) |pf_const| {
             var pf = pf_const;
-            if (pf.connection_scoped) {
+            if (pf.connection_scoped and !pf.bind) {
                 pf.deinit(allocator);
                 continue;
             }

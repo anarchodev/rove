@@ -37,7 +37,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
+import urllib.parse as up
+
+from smoke_lib_v2 import PUBLIC_SUFFIX, V2Cluster, rpc_wrap  # noqa: E402
 from ws_worker_smoke_v2 import (  # noqa: E402
     OP_BIN,
     OP_CLOSE,
@@ -63,6 +65,12 @@ export default async function () {
             stream.write("stored:" + n);
             continue;
         }
+        if (m.text.startsWith("putfetch:")) {
+            kv.set("ws/fetched-at", String(n));      // this frame WRITES ...
+            const res = await after.fetch(m.text.slice(9)); // ... then awaits a fetch
+            stream.write("fetched:" + res.status + ":" + res.text.length);
+            continue;
+        }
         if (m.opcode === 2) {
             stream.write(m.bytes);
             continue;
@@ -80,6 +88,7 @@ export function read() {
 }
 """
 READY_SRC = 'export function handler() { return "ready"; }\n'
+BULK_SRC = 'export function bulk() { return "0123456789".repeat(17); }\n'
 
 
 def main() -> int:
@@ -106,6 +115,11 @@ def main() -> int:
             return 1
         ready = c.wait_for_handler("acme", "/?fn=handler", want_body="ready")
         check("deployment loaded", ready.status == 200, f"got {ready.status}")
+        r = c.provision("wb")
+        check("provision wb (fetch upstream) → 200", r.status == 200, f"got {r.status}")
+        c.deploy_handlers("wb", {"index.mjs": rpc_wrap(BULK_SRC)})
+        c.wait_for_handler("wb", "/?fn=bulk", want_body="0123456789")
+        bulk_url = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/?fn=bulk"
 
         print("step 2: open WS /live; echo keeps a JS local across frames")
         sock = ws_connect(c.front_port, c.host_for("acme"), path="/live")
@@ -142,6 +156,11 @@ def main() -> int:
             check("queued frame delivered after, in order",
                   op == OP_TEXT and pl == b"echo:6:during", f"{op} {pl!r}")
 
+            print("step 5b: a frame that writes kv then awaits a fetch (bind from a writing WS hop)")
+            send_frame(sock, OP_TEXT, ("putfetch:" + bulk_url).encode())
+            op, _, pl = recv_frame(sock)
+            check("write-then-await-fetch frame → fetched", op == OP_TEXT and pl == b"fetched:200:170", f"{op} {pl!r}")
+
             print("step 6: close ends the loop; post-loop code runs")
             send_frame(sock, OP_CLOSE, b"")
         finally:
@@ -159,7 +178,7 @@ def main() -> int:
             time.sleep(0.3)
         check("open hop wrote (activation 1)", got.get("opened") == "/live", f"{got}")
         check("per-frame write committed", got.get("last") == "hello-ws", f"{got}")
-        check("post-loop write ran at close (n=6)", got.get("closed") == "6", f"{got}")
+        check("post-loop write ran at close (n=7)", got.get("closed") == "7", f"{got}")
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")

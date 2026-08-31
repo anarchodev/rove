@@ -91,6 +91,17 @@ export default async function () {
 }
 export function onWake() { return "unused"; }
 """
+WRITEFETCH_SRC = """\
+export default async function () {
+    const m = /(?:^|&)url=([^&]*)/.exec(request.query || "");
+    const url = decodeURIComponent(m ? m[1] : "");
+    await after.ms(50);                 // resume hop from here on
+    kv.set("wf/before", "1");           // this hop WRITES ...
+    const res = await after.fetch(url); // ... and then awaits a fetch
+    response.status = 201;
+    return JSON.stringify({ status: res.status, len: res.text.length });
+}
+"""
 BULK_SRC = 'export function bulk() { return "0123456789".repeat(17); }\n'
 
 READY_SRC = 'export function handler() { return "ready"; }\n'
@@ -118,6 +129,7 @@ def main() -> int:
                 "watch/index.mjs": WATCH_SRC,
                 "watchpoke/index.mjs": rpc_wrap(POKE_SRC),
                 "fetcher/index.mjs": FETCHER_SRC,
+                "writefetch/index.mjs": WRITEFETCH_SRC,
             })
             check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")
         except RuntimeError as e:
@@ -212,6 +224,17 @@ def main() -> int:
             check("resolved with the whole response", got.get("status") == 200 and got.get("text") == "0123456789" * 17,
                   f"got status={got.get('status')} len={len(got.get('text') or '')}")
             check("not truncated, object form", got.get("truncated") is False and got.get("idForm") == "obj",
+                  f"got {got}")
+
+        if wb_dep:
+            print("step 7b: a RESUME hop that writes kv then awaits a fetch (bind from a writing resume)")
+            r = c.request("acme", f"/writefetch?url={up.quote(bulk_url)}", method="POST", data="{}", timeout=30.0)
+            try:
+                got = json.loads(r.body) if r.status == 201 else {}
+            except ValueError:
+                got = {}
+            check("write-then-await-fetch in a resume hop → 201", r.status == 201, f"got {r.status} {r.body!r}")
+            check("the fetch resolved after the write committed", got.get("status") == 200 and got.get("len") == 170,
                   f"got {got}")
 
         print("step 8: a throw after the await is a loud 500")
