@@ -73,7 +73,18 @@ pub const Error = error{
     ContextCreateFailed,
     InitFnFailed,
     OutOfMemory,
+    RequestCreateFailed,
+    /// `JS_EnterRequest` / `JS_LeaveRequest` / `JS_FreeRequest` refuse
+    /// with a JS frame live — request switches happen only between
+    /// runs, where the C stack holds no JS.
+    RequestSwitchInsideJs,
 };
+
+/// A request arena that may be held across a return to the host
+/// (arenajs requests-as-objects). Values never cross requests: a
+/// JSValue obtained while one request is entered is dereferenced only
+/// while that same request is entered again.
+pub const HeldRequest = *c.JSRequestArena;
 
 /// Caller-supplied setup. Runs ONCE during Snapshot.create with the
 /// dual arena in BASE mode — every allocation lands in the immortal
@@ -172,6 +183,49 @@ pub const Snapshot = struct {
         };
     }
 
+    // ── requests as objects ──────────────────────────────────────────
+    //
+    // The frozen runtime runs one request at a time but may hold any
+    // number. The worker's hot path never sees this: `restore()` resets
+    // whichever request is entered. A handler that returns to the host
+    // with a promise awaiting a host operation keeps its request — the
+    // dispatcher leaves it, gives the runtime a fresh one, and re-enters
+    // the held one when the operation completes. Enter/leave/free only
+    // between runs (no JS frame live).
+
+    /// The request allocations currently land in — null when none is
+    /// entered (the runtime then accepts no allocation).
+    pub fn currentRequest(self: *const Snapshot) ?HeldRequest {
+        return c.JS_CurrentRequest(self.rt);
+    }
+
+    /// Create a request arena with its own budget (peak live set, the GC
+    /// regime). NOT entered: the entered request, if any, stays entered.
+    pub fn newRequest(self: *Snapshot, request_cap: usize) Error!HeldRequest {
+        return c.JS_NewRequest(self.rt, request_cap, null, c.JS_ARENA_REQ_MODE_GC) orelse
+            Error.RequestCreateFailed;
+    }
+
+    pub fn enterRequest(self: *Snapshot, req: HeldRequest) Error!void {
+        if (c.JS_EnterRequest(self.rt, req) != 0) return Error.RequestSwitchInsideJs;
+    }
+
+    pub fn leaveRequest(self: *Snapshot) Error!void {
+        if (c.JS_LeaveRequest(self.rt) != 0) return Error.RequestSwitchInsideJs;
+    }
+
+    /// Free the request's memory (leaves it first if it is entered).
+    pub fn freeRequest(self: *Snapshot, req: HeldRequest) Error!void {
+        if (c.JS_FreeRequest(self.rt, req) != 0) return Error.RequestSwitchInsideJs;
+    }
+
+    /// Bytes a request holds across a park — every extent it has
+    /// acquired, whether or not its allocator is using them. The
+    /// per-held-connection memory cost.
+    pub fn heldBytes(req: HeldRequest) usize {
+        return c.js_request_arena_held(req);
+    }
+
     /// True iff the request arena refused an allocation THIS request
     /// (cleared by the next reset). The capacity-vs-user-error
     /// discriminator: by the time the OOM propagates, QJS may have
@@ -230,7 +284,7 @@ test "Snapshot.restore round-trips: 1 + 1 still = 2" {
     defer snap.deinit();
 
     const r = snap.restore();
-    var result = try r.context.eval("1 + 1", "snap-test.js", .{});
+    var result = try evalOrReport(r.context, "1 + 1", "snap-test.js");
     defer result.deinit();
     try testing.expectEqual(@as(i32, 2), try result.toI32());
 }
@@ -242,7 +296,7 @@ test "Snapshot.restore repeated N times is stable" {
     var i: usize = 0;
     while (i < 50) : (i += 1) {
         const r = snap.restore();
-        var result = try r.context.eval("2 * 21", "snap-test.js", .{});
+        var result = try evalOrReport(r.context, "2 * 21", "snap-test.js");
         defer result.deinit();
         try testing.expectEqual(@as(i32, 42), try result.toI32());
     }
@@ -377,4 +431,116 @@ test "base-arena exhaustion during install surfaces as a JS exception, not silen
     var snap = try Snapshot.create(.{ .base_size = 2 * 1024 * 1024 }, hungryInit, &threw);
     defer snap.deinit();
     try std.testing.expect(threw);
+}
+
+// `JS_UNDEFINED` is a macro with a struct initializer that translate-c
+// does not carry over; the same construction `globals.zig` uses.
+fn jsUndefined() c.JSValue {
+    return .{ .u = .{ .int32 = 0 }, .tag = c.JS_TAG_UNDEFINED };
+}
+
+fn promiseInit(rt: *c.JSRuntime, ctx: *c.JSContext, ud: ?*anyopaque) Error!void {
+    try minimalInit(rt, ctx, ud);
+    _ = c.JS_AddIntrinsicPromise(ctx);
+}
+
+/// Eval that surfaces the thrown value's text on failure (a bare
+/// `error.JsException` says nothing about a held-request mistake).
+fn evalOrReport(ctx: root.Context, src: [:0]const u8, name: [:0]const u8) !root.Value {
+    return ctx.eval(src, name, .{}) catch |e| {
+        const exc = c.JS_GetException(ctx.raw);
+        defer c.JS_FreeValue(ctx.raw, exc);
+        const cs = c.JS_ToCString(ctx.raw, exc);
+        defer c.JS_FreeCString(ctx.raw, cs);
+        std.debug.print("\n{s}: {s}\n", .{ name, if (cs != null) std.mem.span(cs) else "<no message>" });
+        return e;
+    };
+}
+
+test "held request: a promise awaiting the host survives leave/enter and settles on resume" {
+    var snap = try Snapshot.create(.{}, promiseInit, null);
+    defer snap.deinit();
+    const r = snap.restore();
+    const ctx = snap.ctx;
+
+    // Park the request entered at freeze — the worker's hot-path request.
+    // A park never migrates values: the parked request keeps its memory
+    // and the runtime is handed a fresh one for everything else.
+    const parked = snap.currentRequest() orelse return error.NoCurrentRequest;
+
+    // The host-side promise. The resolver lives in `parked`'s memory; Zig
+    // keeps only the handle and calls it while `parked` is entered again.
+    var funcs: [2]c.JSValue = undefined;
+    const promise = c.JS_NewPromiseCapability(ctx, &funcs);
+    try testing.expect(!c.JS_IsException(promise));
+    {
+        const global = c.JS_GetGlobalObject(ctx);
+        defer c.JS_FreeValue(ctx, global);
+        // A write to the (base) global object shadows it into `parked`.
+        try testing.expect(c.JS_SetPropertyStr(ctx, global, "p", promise) >= 0);
+    }
+    var ev = try evalOrReport(r.context, "globalThis.out = 'pending'; p.then(v => { globalThis.out = 'got:' + v; }); 0", "held-a.js");
+    ev.deinit();
+    r.runtime.pumpJobs();
+    {
+        var v = try evalOrReport(r.context, "globalThis.out", "held-a2.js");
+        defer v.deinit();
+        const sv = try v.toOwnedString(testing.allocator);
+        defer testing.allocator.free(sv);
+        try testing.expectEqualStrings("pending", sv);
+    }
+
+    // Park it. Give the runtime a fresh request and run an unrelated
+    // request to completion on it — the reset-per-request hot path.
+    try snap.leaveRequest();
+    const fresh = try snap.newRequest(4 * 1024 * 1024);
+    try snap.enterRequest(fresh);
+    const r2 = snap.restore();
+    {
+        // Nothing of the parked request is visible: its shadows of the
+        // global are its own, and its promise is not this request's.
+        var v = try evalOrReport(r2.context, "typeof globalThis.out + ':' + typeof globalThis.p", "fresh.js");
+        defer v.deinit();
+        const sv = try v.toOwnedString(testing.allocator);
+        defer testing.allocator.free(sv);
+        try testing.expectEqualStrings("undefined:undefined", sv);
+    }
+    try snap.leaveRequest();
+
+    // Resume: re-enter the parked request. Its heap is exactly as left.
+    try snap.enterRequest(parked);
+    {
+        var v = try evalOrReport(r.context, "globalThis.out", "held-b.js");
+        defer v.deinit();
+        const sv = try v.toOwnedString(testing.allocator);
+        defer testing.allocator.free(sv);
+        try testing.expectEqualStrings("pending", sv);
+    }
+    // The host operation completed: settle the promise from Zig, drain
+    // the request's microtasks, observe the continuation ran.
+    var arg = c.JS_NewInt32(ctx, 42);
+    const rv = c.JS_Call(ctx, funcs[0], jsUndefined(), 1, &arg);
+    try testing.expect(!c.JS_IsException(rv));
+    c.JS_FreeValue(ctx, rv);
+    r.runtime.pumpJobs();
+    {
+        var v = try evalOrReport(r.context, "globalThis.out", "held-c.js");
+        defer v.deinit();
+        const sv = try v.toOwnedString(testing.allocator);
+        defer testing.allocator.free(sv);
+        try testing.expectEqualStrings("got:42", sv);
+    }
+    c.JS_FreeValue(ctx, funcs[0]);
+    c.JS_FreeValue(ctx, funcs[1]);
+
+    // What a parked request costs: its extents, whether used or not. This
+    // is the per-held-connection memory number the budget is set from.
+    const held_parked = Snapshot.heldBytes(parked);
+    const held_fresh = Snapshot.heldBytes(fresh);
+    try testing.expect(held_parked > 0);
+    std.debug.print("\nheld-request bytes: parked={d} fresh(after one run)={d}\n", .{ held_parked, held_fresh });
+
+    try snap.freeRequest(fresh);
+    // `parked` stays entered — it is the runtime's default request and
+    // `deinit` frees every request arena still owned.
 }

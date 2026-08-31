@@ -532,7 +532,11 @@ pub fn build(b: *std.Build) void {
 
     // rove-qjs tests
     const qjs_tests = b.addTest(.{ .root_module = qjs_mod });
-    test_step.dependOn(&b.addRunArtifact(qjs_tests).step);
+    const run_qjs_tests = b.addRunArtifact(qjs_tests);
+    test_step.dependOn(&run_qjs_tests.step);
+    // Focused subset for iterating on the engine wrapper (snapshot, request
+    // arenas); `test` remains the gate.
+    b.step("qjs-test", "Run the rove-qjs unit tests").dependOn(&run_qjs_tests.step);
 
     // rove-files tests
     const files_tests = b.addTest(.{ .root_module = files_mod });
