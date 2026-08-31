@@ -339,9 +339,9 @@ fn runSealed(a: std.mem.Allocator) !void {
 
 /// A handler whose CUMULATIVE allocation (~256 MiB) far exceeds the sim's
 /// 100 MiB request arena while its peak live set stays ~1 MiB — it can only
-/// complete because the GC arena reclaims the dead strings mid-run. Same shape
-/// as prod's own bump/GC discriminator (`snap.zig`), the churn prod's bump→GC
-/// retry absorbs; the sim runs GC always, so it completes offline.
+/// complete because the GC arena reclaims the dead strings mid-run. The same
+/// shape `snap.zig`'s GC-regime test runs against the worker's engine; both
+/// engines run GC, so it completes offline exactly as it does in prod.
 const CHURNY_HANDLER =
     \\export default function () {
     \\  let s = "";
@@ -350,18 +350,16 @@ const CHURNY_HANDLER =
     \\}
 ;
 
-/// GC-always: the churny handler completes under GC whether or
-/// not the world carries the `arena_gc` regime stamp — the stamp no longer
-/// gates the allocator mode — and a normal world afterwards still succeeds
-/// (GC does not wedge or leak across the reactor's per-run resets).
+/// The churny handler completes under the GC regime, and a normal world
+/// afterwards still succeeds (GC does not wedge or leak across the reactor's
+/// per-run resets).
 fn runArenaGc(a: std.mem.Allocator) !void {
-    // Stamped churny world: completes under GC.
     var world = std.ArrayList(u8){};
     var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
     const w = &aw.writer;
     try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",");
     try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/churn\",\"host\":\"ex.test\"},");
-    try w.writeAll("\"seed\":7,\"arena_gc\":true,");
+    try w.writeAll("\"seed\":7,");
     try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
     try std.json.Stringify.value(CHURNY_HANDLER, .{}, w);
     try w.writeAll("}]}");
@@ -369,23 +367,7 @@ fn runArenaGc(a: std.mem.Allocator) !void {
 
     var out = std.ArrayList(u8){};
     try root.runWorld(a, world.items, null, &out);
-    check(out.items, &.{"len=1048579"}, &.{}, "ARENA_GC (stamped churny world completes under GC)");
-
-    // Same execution WITHOUT the stamp: also completes — GC is unconditional,
-    // so an authored (unstamped) churny handler is no longer a false OOM.
-    var world2 = std.ArrayList(u8){};
-    var aw2 = std.Io.Writer.Allocating.fromArrayList(a, &world2);
-    const w2 = &aw2.writer;
-    try w2.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",");
-    try w2.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/churn\",\"host\":\"ex.test\"},");
-    try w2.writeAll("\"seed\":7,");
-    try w2.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
-    try std.json.Stringify.value(CHURNY_HANDLER, .{}, w2);
-    try w2.writeAll("}]}");
-    world2 = aw2.toArrayList();
-    var out2 = std.ArrayList(u8){};
-    try root.runWorld(a, world2.items, null, &out2);
-    check(out2.items, &.{"len=1048579"}, &.{}, "ARENA_GC (unstamped churny world also completes under GC)");
+    check(out.items, &.{"len=1048579"}, &.{}, "ARENA_GC (churny world completes under GC)");
 
     // And a normal world afterwards proves GC neither wedges nor leaks across runs.
     try runInboundUser(a, "eve", &.{}, "ARENA_GC (normal run after churn)");

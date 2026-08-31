@@ -164,9 +164,8 @@ pub const Engine = struct {
         // from a shared frozen base (one install, not per-request).
         // The request arena runs in GC mode (set below), so its size is a
         // PEAK-LIVE-SET ceiling, not a cumulative one — the allocator reclaims
-        // mid-run. This mirrors the worker's effective behavior: prod never
-        // surfaces a bump-arena OOM to a churny-but-legal handler, it
-        // re-executes under GC first (`dispatcher.zig` bump→GC retry). Sized to
+        // mid-run. This is the worker's regime too (`snap.zig`; GC is the only
+        // regime any engine runs, `decisions.md` §4.12). Sized to
         // prod's request arena (`snap.zig` DEFAULT_REQUEST_SIZE = 100 MiB): the
         // sim can't match prod's OOM boundary exactly (the sim's own bookkeeping
         // shares the arena, and there's no CPU budget), but the same 100 MiB
@@ -186,10 +185,10 @@ pub const Engine = struct {
         budget.* = .{};
         arena_set_interrupt_r(s, &simInterruptHandler, budget);
         arena_reactor_freeze(s);
-        // GC mode always: the sim cannot model a bump OOM faithfully (different
-        // arena size, no CPU budget) and prod's effective ceiling is the GC
-        // one, so predicting prod means running GC. Sticky on the reactor; the
-        // per-run set in `simulate` reaffirms it (see the note there).
+        // GC mode always — the same regime the worker runs, so the sim's
+        // memory ceiling has prod's shape (peak live set). Sticky on the
+        // reactor; the per-run set in `simulate` reaffirms it (see the note
+        // there).
         arena_set_request_mode_r(s, 0);
         return .{ .sim = s, .mod_ctx = mc, .budget = budget };
     }
@@ -482,13 +481,11 @@ pub const Engine = struct {
         host.install();
         hostmod.active_config_scope = wv.deployment_id;
 
-        // GC mode, every run. Set on each run because the mode
-        // binds at the entry reset. Forward sim and replay both run GC: the sim
-        // can't model a bump OOM faithfully, and GC is transparent to a pure
-        // handler, so replaying a bump-recorded request under GC reproduces its
-        // output while a GC-recorded (churny) one needs GC not to OOM. The
-        // recorded `wv.arena_gc` regime bit is retained through the tape as a
-        // diagnostic of prod's actual regime; it no longer selects the mode.
+        // GC mode, every run. Set on each run because the mode binds at the
+        // entry reset. Every engine runs GC (`decisions.md` §4.12); a record
+        // from before the regime was fixed ran under bump, and GC is
+        // transparent to a pure handler, so replaying it under GC reproduces
+        // its output.
         arena_set_request_mode_r(self.sim, 0);
         arena_set_random_seed_r(self.sim, wv.seed);
         // Reinterpret the u64 ms bit-pattern as the i64 the API takes; a plain

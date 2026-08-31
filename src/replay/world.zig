@@ -113,11 +113,6 @@ pub const World = struct {
     /// `body` holds the raw bytes and the driver delivers them base64 so
     /// `request.bytes` is byte-exact. Set when the world carries `bodyB64`.
     body_is_binary: bool = false,
-    /// The live request completed under the GC arena regime (the
-    /// churny-handler fallback) — the driver must replay under it
-    /// (under bump the same execution would OOM). Carried from the
-    /// record's engine word by export_fixture; absent = bump.
-    arena_gc: bool = false,
     /// The world was TRANSCODED FROM A CAPTURE (`export_fixture` stamps it),
     /// not authored. Captured worlds replay pinned deployments, so they keep
     /// the strict read-your-tape posture (a read the original run never made
@@ -202,7 +197,7 @@ pub const Error = error{BadWorld} || std.mem.Allocator.Error;
 /// spelling; world.zig reads `now_ms`) instead of silently running at epoch 0.
 const TOP_KEYS = [_][]const u8{
     "entry",   "activation", "export",  "source_dir", "ctx",     "seed",
-    "now_ms",  "arena_gc",   "captured", "deployment_id", "request", "kv", "expected",
+    "now_ms",  "captured", "deployment_id", "request", "kv", "expected",
     "sources", "app_imports", "packages", "triggers", "kv_refusals",
     "kv_elided",
 };
@@ -301,7 +296,6 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
     }
     w.seed = jU64(obj, "seed") orelse 0;
     w.now_ms = jU64(obj, "now_ms") orelse 0;
-    if (obj.get("arena_gc")) |gv| w.arena_gc = (gv == .bool and gv.bool);
     if (obj.get("captured")) |cv| w.captured = (cv == .bool and cv.bool);
     if (jStr(obj, "deployment_id")) |dh|
         w.deployment_id = std.fmt.parseInt(u64, dh, 16) catch return Error.BadWorld;
