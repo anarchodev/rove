@@ -1910,8 +1910,8 @@ pub fn build(b: *std.Build) void {
         "Build + install every binary the smoke suite executes (run_all.py builds this before running)",
     );
     for ([_]*std.Build.Step.Compile{
-        rewind_exe, cp_exe,   front_exe,      ls_standalone, ops_exe,
-        cli_exe,    echo_server, h2_echo_server, ws_echo_exe,
+        rewind_exe, cp_exe,      front_exe,      ls_standalone, ops_exe,
+        cli_exe,    echo_server, h2_echo_server, ws_echo_exe,   s3_blob_smoke,
     }) |exe| {
         smoke_bins_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }

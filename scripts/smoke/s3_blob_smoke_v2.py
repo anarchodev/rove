@@ -15,7 +15,7 @@ It is therefore identical to the V1 smoke; this `_v2.py` exists only so the
 V2 suite is name-complete. Reads `.env` at repo root for AWS / S3_* env
 vars (`set -a; . ./.env; set +a` first, or rely on the in-script loader).
 
-Build: `zig build s3-blob-smoke` (binary at zig-out/bin/s3-blob-smoke).
+Build: `zig build smoke-bins` (binary at zig-out/bin/s3-blob-smoke).
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def main() -> int:
 
     bin_path = BIN_DIR / "s3-blob-smoke"
     if not bin_path.exists():
-        sys.exit(f"error: {bin_path} missing — run `zig build s3-blob-smoke`")
+        sys.exit(f"error: {bin_path} missing — run `zig build smoke-bins`")
 
     print(f"targeting {os.environ['S3_ENDPOINT']} (region {os.environ['S3_REGION']}) "
           f"bucket {os.environ['S3_BUCKET']}")
