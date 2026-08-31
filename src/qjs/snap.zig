@@ -51,14 +51,16 @@ pub const DEFAULT_BASE_SIZE: usize = 10 * 1024 * 1024;
 /// Handler authors who exceed this see JS OOM on the offending alloc.
 ///
 /// Sizing notes:
-/// - This bounds ALLOCATION VOLUME per activation, not live-set —
-///   a bump arena never reclaims within a request, so transient
-///   garbage counts in full. A few MiB is too tight for handlers
-///   touching ~100 KB+ payloads once any allocation-amplifying
-///   code runs over them.
-/// - The arena is lazily-committed anonymous mmap (qjs-arena.c), so
-///   the per-worker cost is virtual until touched; RSS grows to
-///   each worker's high-water mark, not worker_count × 100 MiB.
+/// - This bounds the PEAK LIVE SET per activation: the request
+///   allocator is arenajs's GC regime (dlmalloc mspace + refcount /
+///   cycle GC), so garbage is reclaimed mid-run and only what a
+///   handler holds at once counts. A few MiB is still too tight for
+///   handlers touching ~100 KB+ payloads once any allocation-
+///   amplifying code runs over them.
+/// - Request memory is provider-backed extents acquired on demand
+///   (qjs-arena.h `js_dual_arena_new2`), so this is a budget, not a
+///   reservation: RSS grows to each worker's high-water mark, not
+///   worker_count × 100 MiB.
 pub const DEFAULT_REQUEST_SIZE: usize = 100 * 1024 * 1024;
 
 pub const Sizes = struct {
@@ -72,13 +74,6 @@ pub const Error = error{
     InitFnFailed,
     OutOfMemory,
 };
-
-/// Per-request allocator regime (arenajs 0.3 `JSArenaReqMode`).
-/// `.bump`: ~3-instruction allocs, O(1) reset, ceiling = CUMULATIVE
-/// allocation. `.gc`: dlmalloc mspace + refcount/cycle GC, ~20-30%
-/// slower, costlier reset, ceiling = PEAK live set — the churny-
-/// handler fallback.
-pub const ReqMode = enum { bump, gc };
 
 /// Caller-supplied setup. Runs ONCE during Snapshot.create with the
 /// dual arena in BASE mode — every allocation lands in the immortal
@@ -129,13 +124,17 @@ pub const Snapshot = struct {
         // sweep at vendor/arenajs/arena-test262.c).
         c.JS_FreezeRuntime(rt);
 
-        // arenajs 0.3.0 defaults the request allocator to GC mode
-        // (dlmalloc mspace + refcount/cycle GC). Rove runs handlers on
-        // the BUMP regime — ~3-instruction allocs, O(1) reset — and
-        // will opt churny handlers into GC per-request later (the
-        // header's intended oom→retry pattern). Selection takes effect
-        // at the next reset; restore() runs one before every request.
-        c.js_dual_arena_set_request_mode(c.JS_GetDualArena(rt), c.JS_ARENA_REQ_MODE_BUMP);
+        // The request allocator is the GC regime (dlmalloc mspace +
+        // refcount/cycle GC) — the ONLY regime rove runs, on every
+        // engine (worker, offline sim, browser replay). Its ceiling is
+        // the peak live set, so an activation's transient garbage never
+        // counts against the budget and there is no bump-mode OOM to
+        // retry from; an OOM here is a genuinely too-large live set and
+        // fails loud (`decisions.md` §4.12). arenajs already defaults
+        // to GC; set it explicitly so the invariant is stated in code,
+        // not inherited. Selection binds at the next reset; restore()
+        // runs one before every request.
+        c.js_dual_arena_set_request_mode(c.JS_GetDualArena(rt), c.JS_ARENA_REQ_MODE_GC);
 
         return .{ .rt = rt, .ctx = ctx, .version = version_mod.JS_ENGINE_VERSION };
     }
@@ -154,20 +153,6 @@ pub const Snapshot = struct {
     /// request arena in a clean state, and the reseed gets the
     /// per-request state to a sensible value.
     pub fn restore(self: *Snapshot) Restored {
-        return self.restoreMode(.bump);
-    }
-
-    /// `restore` with an explicit allocator regime for THIS request.
-    /// Mode selection binds at the reset (arenajs contract: a request
-    /// runs entirely under one regime), so set-then-reset. The mode
-    /// persists on the arena until the next restoreMode — which is why
-    /// the plain `restore()` pins `.bump` instead of inheriting
-    /// whatever the previous request chose.
-    pub fn restoreMode(self: *Snapshot, mode: ReqMode) Restored {
-        c.js_dual_arena_set_request_mode(c.JS_GetDualArena(self.rt), switch (mode) {
-            .bump => c.JS_ARENA_REQ_MODE_BUMP,
-            .gc => c.JS_ARENA_REQ_MODE_GC,
-        });
         c.JS_ResetRequestArena(self.rt);
 
         // performance.timeOrigin is a getter reading whatever we set
@@ -191,7 +176,8 @@ pub const Snapshot = struct {
     /// (cleared by the next reset). The capacity-vs-user-error
     /// discriminator: by the time the OOM propagates, QJS may have
     /// mangled it into a bare `null` exception — this record is the
-    /// source of truth (and the bump→GC retry trigger).
+    /// source of truth (and what turns a mangled OOM outcome into a
+    /// loud 500 instead of a plausible success).
     pub fn oomHit(self: *const Snapshot) bool {
         return c.js_dual_arena_oom_hit(c.JS_GetDualArena(self.rt));
     }
@@ -295,10 +281,16 @@ test "Snapshot.restore: performance.now and Math.random work after restore" {
     try testing.expect(rv2 != rv);
 }
 
-test "GC mode: the churny loop SUCCEEDS (ceiling = peak live set)" {
+test "request allocator runs in GC mode: the churny loop succeeds (ceiling = peak live set)" {
     var snap = try Snapshot.create(.{}, minimalInit, null);
     defer snap.deinit();
-    const r = snap.restoreMode(.gc);
+    const r = snap.restore();
+    try testing.expectEqual(
+        @as(c_uint, c.JS_ARENA_REQ_MODE_GC),
+        c.js_dual_arena_request_mode(c.JS_GetDualArena(snap.rt)),
+    );
+    // Cumulative allocation (256 MiB) far exceeds the arena; the peak
+    // live set (~1 MiB) does not. Only a reclaiming allocator completes it.
     var result = try r.context.eval(
         \\let s = "";
         \\for (let i = 0; i < 256; i++) { s = "x".repeat(1 << 20) + i; }
@@ -309,46 +301,24 @@ test "GC mode: the churny loop SUCCEEDS (ceiling = peak live set)" {
     );
     defer result.deinit();
     try testing.expect(!c.js_dual_arena_oom_hit(c.JS_GetDualArena(snap.rt)));
-    // A later plain restore() must pin the arena back to BUMP.
-    _ = snap.restore();
-    try testing.expectEqual(
-        @as(c_uint, c.JS_ARENA_REQ_MODE_BUMP),
-        c.js_dual_arena_request_mode(c.JS_GetDualArena(snap.rt)),
-    );
 }
 
-test "request allocator runs in BUMP mode (arenajs 0.3 defaults to GC)" {
-    var snap = try Snapshot.create(.{}, minimalInit, null);
-    defer snap.deinit();
-    const r = snap.restore();
-    _ = r;
-    try testing.expectEqual(
-        @as(c_uint, c.JS_ARENA_REQ_MODE_BUMP),
-        c.js_dual_arena_request_mode(c.JS_GetDualArena(snap.rt)),
-    );
-}
-
-test "BUMP semantics canary: cumulative allocation OOMs even when garbage" {
-    // The bump/GC discriminator: this loop's PEAK live set is ~1 MiB
-    // (each iteration drops the last string) but its CUMULATIVE
-    // allocation far exceeds the request arena. Under BUMP (ceiling =
-    // cumulative) it MUST OOM with oom_hit set; under GC (ceiling =
-    // peak) it would succeed — so this test failing "successfully"
-    // means the mode selection silently regressed to GC.
-    var snap = try Snapshot.create(.{}, minimalInit, null);
+test "GC canary: a live set past the arena budget OOMs with oom_hit set" {
+    // The budget is the PEAK live set: hold every string at once (16 MiB
+    // against an 8 MiB arena) and the request must be refused with the
+    // arena's exhaustion record set — that record is what separates
+    // capacity from a JS throw once QJS has mangled the exception.
+    var snap = try Snapshot.create(.{ .request_size = 8 * 1024 * 1024 }, minimalInit, null);
     defer snap.deinit();
     const r = snap.restore();
     var result = r.context.eval(
-        \\let s = "";
-        \\for (let i = 0; i < 256; i++) { s = "x".repeat(1 << 20) + i; }
-        \\s.length
+        \\const a = [];
+        \\for (let i = 0; i < 32; i++) a.push("x".repeat(1 << 19) + i);
+        \\a.length
     ,
-        "churny.js",
+        "live-set.js",
         .{},
     ) catch {
-        // Eval failed — the OOM propagated as an exception. The arena's
-        // exhaustion record must confirm this was capacity, not a JS
-        // throw.
         try testing.expect(c.js_dual_arena_oom_hit(c.JS_GetDualArena(snap.rt)));
         return;
     };

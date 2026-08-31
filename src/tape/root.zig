@@ -1263,22 +1263,20 @@ pub const Readset = struct {
         self.activation.deinit();
     }
 
-    /// Clear everything a dispatch ATTEMPT records — the arena-OOM
-    /// retry path. kv/module/request-surface tapes and the body-read
-    /// flag are per-attempt (the GC rerun re-records them); the
-    /// identity scalars (timestamp/seed/engine) and the WORKER-owned
-    /// tapes (trigger_payload — the pre-dispatch body ref;
-    /// fetch_responses — the activation's chunk capture; activation —
-    /// the wake/WS Msg, written once at capture, after the last
-    /// attempt) survive, so the retried attempt replays against the
-    /// same inputs.
+    /// Discard the tapes a doomed run recorded — the per-run channels
+    /// (kv, module, request_reads, the body-read flag, the write keys) —
+    /// so a run the dispatcher refuses (arena OOM → loud 500) leaves no
+    /// partial record behind. The identity scalars (timestamp/seed/
+    /// engine) and the WORKER-owned tapes (trigger_payload — the
+    /// pre-dispatch body ref; fetch_responses — the activation's chunk
+    /// capture; activation — the wake/WS Msg, written once at capture)
+    /// survive: they are the run's inputs, not its output.
     pub fn resetAttempt(self: *Readset) void {
         self.kv.reset();
         self.module.reset();
         self.request_reads.reset();
         self.body_read = false;
-        // Per-attempt like the kv tape: the GC rerun re-records the
-        // retried attempt's writes.
+        // Per-run like the kv tape: a doomed run's writes are not its record.
         self.clearWriteKeys();
     }
 

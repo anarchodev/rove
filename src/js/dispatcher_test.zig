@@ -1198,15 +1198,7 @@ test "kv subscriptions: watched-prefix writes inject ONE durable dirty marker (c
     try testing.expectEqual(@as(usize, 1), marker_puts);
 }
 
-test "arena-oom retry: churny handler succeeds under GC re-execution" {
-    // This test provokes arena exhaustion on purpose; the retry path warns by
-    // design. The test runner captures warnings and reports them as failures,
-    // so an expected-failure test would fail for doing its job. Errors still
-    // surface.
-    const prev_log = std.testing.log_level;
-    std.testing.log_level = .err;
-    defer std.testing.log_level = prev_log;
-
+test "arena: a churny handler completes — GC reclaims garbage mid-run" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1216,9 +1208,8 @@ test "arena-oom retry: churny handler succeeds under GC re-execution" {
     var d = try Dispatcher.initWithSizes(testing.allocator, .{ .request_size = 8 * 1024 * 1024 });
     defer d.deinit();
 
-    // Seed a counter the handler increments BEFORE churning: proves the
-    // GC rerun reads the ORIGINAL value (savepoint dropped attempt 1's
-    // staged write — read-your-writes across attempts would yield 7).
+    // A counter the handler increments before churning: the run reads it
+    // exactly once and commits exactly one increment — one run, one record.
     {
         var txn = try kv.beginTrackedImmediate();
         try txn.put(uk("n"), "5");
@@ -1229,6 +1220,8 @@ test "arena-oom retry: churny handler succeeds under GC re-execution" {
     defer rs.deinit();
     rs.js_engine_version = qjs.JS_ENGINE_VERSION;
 
+    // Cumulative allocation (32 × 512 KiB = 16 MiB) exceeds the 8 MiB
+    // arena; the peak live set (~1 MiB) does not.
     var resp = try runOne(&d, kv,
         \\const n = parseInt(kv.get("n") ?? "0", 10) + 1;
         \\kv.set("n", String(n));
@@ -1240,11 +1233,8 @@ test "arena-oom retry: churny handler succeeds under GC re-execution" {
 
     try testing.expectEqualStrings("", resp.exception);
     try testing.expectEqualStrings("n=6 len=524290", resp.body);
-    try testing.expect(d.last_arena_gc_retry);
-    try testing.expectEqual(qjs.snap.ReqMode.gc, d.last_arena_mode);
-    // The engine word carries the regime for replay (high bit); the
-    // version bits stay intact. The doomed attempt's kv-tape entries
-    // were discarded: exactly ONE recorded read of "n" (the retry's).
+    // The engine word carries the GC regime for replay (high bit); the
+    // version bits stay intact. Exactly ONE recorded read of "n".
     try testing.expect(rs.js_engine_version & qjs.ENGINE_ARENA_GC_BIT != 0);
     try testing.expectEqual(qjs.JS_ENGINE_VERSION, rs.js_engine_version & qjs.ENGINE_VERSION_MASK);
     var n_reads: usize = 0;
@@ -1252,13 +1242,12 @@ test "arena-oom retry: churny handler succeeds under GC re-execution" {
         if (std.mem.eql(u8, e.kv.key, "_user/n")) n_reads += 1;
     }
     try testing.expectEqual(@as(usize, 1), n_reads);
-    // The committed value is the retry's single increment.
     const v = try kv.get(uk("n"));
     defer testing.allocator.free(v);
     try testing.expectEqualStrings("6", v);
 }
 
-test "arena-oom: loud 500 when even GC can't fit the request (no silent empty body)" {
+test "arena-oom: loud 500 when the live set exceeds the budget (no silent empty body)" {
     // Provokes arena exhaustion on purpose; that path warns by design and the
     // runner reports captured warnings as failures. Errors still surface.
     const prev_log = std.testing.log_level;
@@ -1275,10 +1264,10 @@ test "arena-oom: loud 500 when even GC can't fit the request (no silent empty bo
     defer d.deinit();
 
     // Peak LIVE set (all 32 × 512 KiB strings held at once) = 16 MiB >
-    // the 8 MiB arena — the churny reassign trick wouldn't help (GC's
-    // ceiling is peak live). Bump OOMs → GC retry OOMs too → must fail
-    // LOUD (a 500 with an exception), never the silent empty 200 a
-    // mangled OOM outcome would otherwise yield.
+    // the 8 MiB arena — GC's ceiling is the peak live set, so this
+    // genuinely does not fit. It must fail LOUD (a 500 with an
+    // exception), never the silent empty 200 a mangled OOM outcome would
+    // otherwise yield.
     var resp = try runOne(&d, kv,
         \\const a = [];
         \\for (let i = 0; i < 32; i++) a.push("x".repeat(1 << 19));
@@ -1290,8 +1279,6 @@ test "arena-oom: loud 500 when even GC can't fit the request (no silent empty bo
     try testing.expect(resp.exception.len > 0);
     try testing.expect(std.mem.indexOf(u8, resp.exception, "exhausted") != null);
     try testing.expectEqualStrings("", resp.body); // not a silent partial
-    // The GC retry was attempted (and also OOM'd).
-    try testing.expect(d.last_arena_gc_retry);
 }
 
 test "static onChunk: a failed upstream read fails loud (502), never a silent 200" {
@@ -1346,66 +1333,6 @@ test "static onChunk: a failed upstream read fails loud (502), never a silent 20
     try testing.expectEqual(@as(i32, 502), resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "read failed") != null);
     try testing.expectEqualStrings("", resp.exception);
-}
-
-test "arena-oom retry: the worker's churny hint skips the doomed bump attempt" {
-    // This test provokes arena exhaustion on purpose; the retry path warns by
-    // design. The test runner captures warnings and reports them as failures,
-    // so an expected-failure test would fail for doing its job. Errors still
-    // surface.
-    const prev_log = std.testing.log_level;
-    std.testing.log_level = .err;
-    defer std.testing.log_level = prev_log;
-
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-    var d = try Dispatcher.initWithSizes(testing.allocator, .{ .request_size = 8 * 1024 * 1024 });
-    defer d.deinit();
-    var resp = try runOne(&d, kv,
-        \\let s = "";
-        \\for (let i = 0; i < 32; i++) { s = "x".repeat(1 << 19) + i; }
-        \\return "len=" + s.length;
-    , .{ .method = "POST", .path = "/", .arena_mode = .gc });
-    defer resp.deinit(testing.allocator);
-    try testing.expectEqualStrings("", resp.exception);
-    try testing.expectEqualStrings("len=524290", resp.body);
-    try testing.expect(!d.last_arena_gc_retry);
-    try testing.expectEqual(qjs.snap.ReqMode.gc, d.last_arena_mode);
-}
-
-test "arena-oom retry: an immediate side effect vetoes re-execution" {
-    // Provokes arena exhaustion on purpose; that path warns by design and the
-    // runner reports captured warnings as failures. Errors still surface.
-    const prev_log = std.testing.log_level;
-    std.testing.log_level = .err;
-    defer std.testing.log_level = prev_log;
-
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-    var d = try Dispatcher.initWithSizes(testing.allocator, .{ .request_size = 8 * 1024 * 1024 });
-    defer d.deinit();
-    // after.cancel fires the cancel_fetch trampoline path — an
-    // immediate worker-side effect (raises side_effects_flag even when
-    // the test harness wires no trampoline). The subsequent OOM must
-    // NOT retry: re-execution would double the effect.
-    var resp = try runOne(&d, kv,
-        \\after.cancel("ftch_00aabb");
-        \\let s = "";
-        \\for (let i = 0; i < 32; i++) { s = "x".repeat(1 << 19) + i; }
-        \\return "unreachable " + s.length;
-    , .{ .method = "POST", .path = "/" });
-    defer resp.deinit(testing.allocator);
-    try testing.expect(resp.exception.len > 0);
-    try testing.expect(!d.last_arena_gc_retry);
-    try testing.expectEqual(qjs.snap.ReqMode.bump, d.last_arena_mode);
 }
 
 test "dispatch: console quartet lands level-prefixed lines in the request log" {

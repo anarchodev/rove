@@ -712,7 +712,6 @@ fn fireWsMessage(
     }
 
     const request: Request = .{
-        .arena_mode = worker_mod.arenaModeFor(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -730,7 +729,7 @@ fn fireWsMessage(
         },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
+    const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget) catch {
         p.txn.rollback() catch {};
         // The disconnect handler died mid-run (CPU budget, kv failure): its
         // digest is a prefix, not a verdict.
@@ -916,7 +915,6 @@ pub fn resumeBoundFetchChainWs(
         .export_name = ev.resolvedExport(), // record the resolved export ({on}) — G3
     };
     const request: Request = .{
-        .arena_mode = worker_mod.arenaModeFor(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -947,7 +945,7 @@ pub fn resumeBoundFetchChainWs(
     };
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
+    const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
         captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &p.readset, body, fetch_ev), chain_ctx.saga_id, &.{}, .fetch_chunk, 0, p.exec_seq);
@@ -1037,7 +1035,6 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     }
 
     const request: Request = .{
-        .arena_mode = worker_mod.arenaModeFor(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -1056,7 +1053,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     };
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
+    const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
         captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.saga_id, &.{}, .wake_batch, 0, p.exec_seq);
@@ -1171,7 +1168,6 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
     defer allocator.free(spath);
 
     const request: Request = .{
-        .arena_mode = worker_mod.arenaModeFor(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -1182,7 +1178,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         .admin = .{ .platform = p.dep.inst.platform },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
+    const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
         captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.saga_id, &.{}, .disconnect, 0, p.exec_seq);

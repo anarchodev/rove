@@ -669,17 +669,15 @@ facing; the 64 KiB internal chunk size is implementation detail.
 
 ### 4.1 Memory: the per-activation allocation budget
 
-Each activation runs against a fixed-size request arena (100 MiB). The
-default allocator is a bump arena: **the budget is cumulative
-allocation, not live memory** — transient garbage counts in full, which
-is what buys the platform its per-request reset cost of one cursor
-write. A handler that exhausts it is transparently re-executed once
-under a reclaiming GC allocator (budget = peak live set, ~20-30%
-slower), and the platform remembers — subsequent activations of that
-handler skip straight to the GC regime until its next deploy. You never
-opt in or out; the visible effect of a "churny" handler is latency, not
-failure. Replays reproduce whichever regime the live request completed
-under.
+Each activation runs against a request arena with a 100 MiB budget.
+The allocator reclaims garbage as you go, so **the budget is your peak
+live set, not your cumulative allocation** — a loop that builds and
+drops a string a thousand times costs one string, not a thousand. A
+handler whose live set exceeds the budget fails loud with a 500 (never
+a silent empty response); there is no mode to pick and nothing to tune.
+Every engine — the worker, the offline sim, the browser replay — runs
+the same allocator, so a replay's memory behavior is the live
+request's.
 
 ## 5. Worked examples
 
