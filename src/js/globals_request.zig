@@ -77,13 +77,12 @@ fn liftThreadedCtx(ctx: *c.JSContext, req_obj: c.JSValue, body: []const u8, allo
 ///
 /// The returned value is owned by the caller — free it after the
 /// activation.
-pub fn installRequest(
-    ctx: *c.JSContext,
-    state: *DispatchState,
-    request: anytype,
-) c.JSValue {
-    c.JS_SetContextOpaque(ctx, state);
-
+/// The per-activation determinism pins (`docs/architecture/replay-and-sim.md`):
+/// seed and clock. Called by `installRequest` for a fresh activation and
+/// by a held-request resume (`Dispatcher.resumeHeld`), which re-pins
+/// without reinstalling the activation object — the handler is mid-await
+/// and still holds its original `request`/`response`.
+pub fn installActivationPins(ctx: *c.JSContext, state: *DispatchState) void {
     // Within-activation non-determinism replay
     // (`docs/architecture/replay-and-sim.md`): seed arenajs's per-request
     // xorshift64star with this dispatch's seed. Math.random and
@@ -108,6 +107,16 @@ pub fn installRequest(
     else
         -1;
     c.JS_SetDateNow(ctx, date_now_ms);
+}
+
+pub fn installRequest(
+    ctx: *c.JSContext,
+    state: *DispatchState,
+    request: anytype,
+) c.JSValue {
+    c.JS_SetContextOpaque(ctx, state);
+
+    installActivationPins(ctx, state);
 
     const global = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, global);

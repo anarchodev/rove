@@ -36,6 +36,7 @@ const limiter_mod = @import("limiter.zig");
 const continuation_mod = @import("bindings/continuation.zig");
 const stream_mod = @import("bindings/stream.zig");
 const components_mod = @import("components.zig");
+const held_mod = @import("held.zig");
 const c = qjs.c;
 
 /// The JS engine version every `Dispatcher`'s snapshot embodies
@@ -48,6 +49,11 @@ pub const JS_ENGINE_VERSION = qjs.JS_ENGINE_VERSION;
 
 pub const DispatchError = error{
     JsException,
+    /// A request-arena enter/leave was refused (`qjs.snap`): a held
+    /// request could not be detached or re-entered. Only possible with a
+    /// JS frame live, which no dispatch path has at that point — an
+    /// infallibility violation surfaced as a loud error, not a panic.
+    RequestSwitch,
     /// A `kv.*` call raised an error that wasn't a plain NotFound. The
     /// underlying `KvError` is available on the dispatcher.
     KvFailed,
@@ -205,6 +211,96 @@ pub const Dispatcher = struct {
     /// (`*BlobBytes` from `worker.BytecodeCache`) used by the module
     /// loader to resolve `import` statements the entry module pulls
     /// in. `null` is valid if the entry has no imports.
+    /// The per-activation binding state, built the same way for a fresh
+    /// activation (`runOutcomeOnce`) and a held-request resume
+    /// (`resumeHeldOnce`) — one construction, so a field added for one
+    /// path cannot be forgotten by the other. The cells are the caller's
+    /// locals (they belong to one activation).
+    fn makeState(
+        self: *Dispatcher,
+        kv: *kv_mod.KvStore,
+        txn: *kv_mod.TrackedTxn,
+        writeset: *kv_mod.WriteSet,
+        bytecodes: ?*const std.StringHashMapUnmanaged(*BlobBytes),
+        hooks: ?*const globals.DeployHooks,
+        deployment_id: u64,
+        request: Request,
+        console_buf: *std.ArrayList(u8),
+        tags_buf: *std.ArrayList(log_mod.Tag),
+        shred_key_cell: *?[]u8,
+        shred_slot_cell: *?u64,
+        shred_destroys_cell: *usize,
+        host_promises: *std.ArrayListUnmanaged(held_mod.HostPromise),
+    ) globals.DispatchState {
+        return .{
+            .allocator = self.allocator,
+            .kv = kv,
+            .txn = txn,
+            .writeset = writeset,
+            // The writesets are batch-scoped; the read-your-write tape
+            // elision is activation-scoped (see `ws_base`). Captured here —
+            // after a failed attempt's rollback truncates the writeset, a
+            // retry recaptures the same baseline.
+            .ws_base = writeset.ops.items.len,
+            .deployment_id = deployment_id,
+            .root_ws_base = if (request.admin.root_writeset) |rws| rws.ops.items.len else 0,
+            .console = console_buf,
+            .tags = tags_buf,
+            .shred_key = shred_key_cell,
+            .shred_slot = shred_slot_cell,
+            .shred_destroys = shred_destroys_cell,
+            .shred = request.shred,
+            .shred_instance_id = request.shred_instance_id,
+            .readset = request.trace.readset,
+            // Deterministic replay (`docs/architecture/replay-and-sim.md`): arenajs's per-request
+            // xorshift64star state is the single PRNG (no Zig-side
+            // PRNG); seeded by `installRequest` from
+            // `state.readset.?.seed`.
+            .request_id = request.trace.request_id,
+            .session_id = request.session_id,
+            .platform = request.admin.platform,
+            .root_writeset = request.admin.root_writeset,
+            .triggers = if (hooks) |h| h.triggers else null,
+            .subscriptions = if (hooks) |h| h.subscriptions else &.{},
+            .bytecodes = bytecodes,
+            .limiter = request.plan.limiter,
+            .instance_id = if (request.plan.storage) |st| st.id else "",
+            .storage = request.plan.storage,
+            .plan_rate = request.plan.plan_rate,
+            .plan_gen = request.plan.plan_gen,
+            .blob_cfg = request.plan.blob_cfg,
+            .saga_id = request.trace.saga_id orelse "",
+            .platform_caps = request.admin.platform_caps,
+            .resume_if_bound = request.trampolines.resume_if_bound,
+            .cancel_fetch = request.trampolines.cancel_fetch,
+            .set_wake = request.trampolines.set_wake,
+            .worker_ctx = request.trampolines.worker_ctx,
+            .platform_dispatch = request.trampolines.platform_dispatch,
+            .set_wake_ctx = request.trampolines.set_wake_ctx,
+            .fire_wake = request.trampolines.fire_wake,
+            .blob_write = request.trampolines.blob_write,
+            .blob_seal = request.trampolines.blob_seal,
+            .activation_entity = request.activation_entity,
+            .activation_fetches_pending = request.activation_fetches_pending,
+            .allow_blob_receive = request.activation == .inbound_headers,
+            .pending_fetches = request.effects.pending_fetches,
+            .pending_wakes = request.effects.pending_wakes,
+            .host_promises = host_promises,
+            .pending_stream_chunks = request.effects.pending_stream_chunks,
+            .pending_stream_chunk_opcodes = request.effects.pending_stream_chunk_opcodes,
+            // `stream.write` means a WS frame (→ .continuation, not the
+            // HTTP cont→stream transition) whenever output goes to a WS
+            // socket: a `ws_message` activation, OR a bound-fetch resume on
+            // a held WS chain (which wires the WS opcode accumulator —
+            // `resumeBoundFetchChainWs`). HTTP fetch resumes leave the
+            // opcodes null and keep the `.stream` transition.
+            .ws_frame_output = request.activation == .ws_message or
+                request.effects.pending_stream_chunk_opcodes != null,
+            .is_system_module = request.is_system_module,
+            .parent_saga = request.trace.parent_saga,
+        };
+    }
+
     /// The dispatch core — one run of the handler. `runOutcome` wraps
     /// it with the arena-OOM fail-loud check; `run` (returns `Response`,
     /// collapsing `.continuation`→501) wraps that; the continuation-aware
@@ -247,72 +343,14 @@ pub const Dispatcher = struct {
         var shred_slot_cell: ?u64 = null;
         var shred_destroys_cell: usize = 0;
 
-        var state = globals.DispatchState{
-            .allocator = self.allocator,
-            .kv = kv,
-            .txn = txn,
-            .writeset = writeset,
-            // The writesets are batch-scoped; the read-your-write tape
-            // elision is activation-scoped (see `ws_base`). Captured here —
-            // after a failed attempt's rollback truncates the writeset, a
-            // retry recaptures the same baseline.
-            .ws_base = writeset.ops.items.len,
-            .deployment_id = deployment_id,
-            .root_ws_base = if (request.admin.root_writeset) |rws| rws.ops.items.len else 0,
-            .console = &console_buf,
-            .tags = &tags_buf,
-            .shred_key = &shred_key_cell,
-            .shred_slot = &shred_slot_cell,
-            .shred_destroys = &shred_destroys_cell,
-            .shred = request.shred,
-            .shred_instance_id = request.shred_instance_id,
-            .readset = request.trace.readset,
-            // Deterministic replay (`docs/architecture/replay-and-sim.md`): arenajs's per-request
-            // xorshift64star state is the single PRNG (no Zig-side
-            // PRNG); seeded by `installRequest` from
-            // `state.readset.?.seed`.
-            .request_id = request.trace.request_id,
-            .session_id = request.session_id,
-            .platform = request.admin.platform,
-            .root_writeset = request.admin.root_writeset,
-            .triggers = if (hooks) |h| h.triggers else null,
-            .subscriptions = if (hooks) |h| h.subscriptions else &.{},
-            .bytecodes = bytecodes,
-            .limiter = request.plan.limiter,
-            .instance_id = if (request.plan.storage) |st| st.id else "",
-            .storage = request.plan.storage,
-            .plan_rate = request.plan.plan_rate,
-            .plan_gen = request.plan.plan_gen,
-            .blob_cfg = request.plan.blob_cfg,
-            .saga_id = request.trace.saga_id orelse "",
-            .platform_caps = request.admin.platform_caps,
-            .resume_if_bound = request.trampolines.resume_if_bound,
-            .cancel_fetch = request.trampolines.cancel_fetch,
-            .set_wake = request.trampolines.set_wake,
-            .worker_ctx = request.trampolines.worker_ctx,
-            .platform_dispatch = request.trampolines.platform_dispatch,
-            .set_wake_ctx = request.trampolines.set_wake_ctx,
-            .fire_wake = request.trampolines.fire_wake,
-            .blob_write = request.trampolines.blob_write,
-            .blob_seal = request.trampolines.blob_seal,
-            .activation_entity = request.activation_entity,
-            .activation_fetches_pending = request.activation_fetches_pending,
-            .allow_blob_receive = request.activation == .inbound_headers,
-            .pending_fetches = request.effects.pending_fetches,
-            .pending_wakes = request.effects.pending_wakes,
-            .pending_stream_chunks = request.effects.pending_stream_chunks,
-            .pending_stream_chunk_opcodes = request.effects.pending_stream_chunk_opcodes,
-            // `stream.write` means a WS frame (→ .continuation, not the
-            // HTTP cont→stream transition) whenever output goes to a WS
-            // socket: a `ws_message` activation, OR a bound-fetch resume on
-            // a held WS chain (which wires the WS opcode accumulator —
-            // `resumeBoundFetchChainWs`). HTTP fetch resumes leave the
-            // opcodes null and keep the `.stream` transition.
-            .ws_frame_output = request.activation == .ws_message or
-                request.effects.pending_stream_chunk_opcodes != null,
-            .is_system_module = request.is_system_module,
-            .parent_saga = request.trace.parent_saga,
-        };
+        // Host promises this activation creates (`held.zig`) — an
+        // `after.*` arm on a held connection is also awaitable. The
+        // values are arena references: nothing to free on a completed
+        // run (the reset reclaims them); a held run moves them up.
+        var host_promises: std.ArrayListUnmanaged(held_mod.HostPromise) = .empty;
+        defer host_promises.deinit(self.allocator);
+
+        var state = self.makeState(kv, txn, writeset, bytecodes, hooks, deployment_id, request, &console_buf, &tags_buf, &shred_key_cell, &shred_slot_cell, &shred_destroys_cell, &host_promises);
 
         // Reset the per-request arena and reseed time/random. The base
         // arena (runtime, intrinsics, globals) is shared in place across
@@ -388,7 +426,7 @@ pub const Dispatcher = struct {
         };
         if (mw_bytecode_opt) |mw_bc| {
             const mw_fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, mw_bc, &pending, "_middlewares/index.mjs is not an ES module")) orelse
-                return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
+                return finishResponse(self, &state, &pending, &console_buf, &tags_buf, &host_promises);
             module_execution.runMiddleware(self, &rt, &ctx, mw_fun_val, activation, budget, &pending) catch |err| switch (err) {
                 error.Interrupted => return DispatchError.Interrupted,
                 error.OutOfMemory => return DispatchError.OutOfMemory,
@@ -397,11 +435,11 @@ pub const Dispatcher = struct {
         }
 
         if (pending.short_circuit) {
-            return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
+            return finishResponse(self, &state, &pending, &console_buf, &tags_buf, &host_promises);
         }
 
         const fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, bytecode, &pending, "handler bytecode is not an ES module (.mjs)")) orelse
-            return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
+            return finishResponse(self, &state, &pending, &console_buf, &tags_buf, &host_promises);
 
         module_execution.runModule(self, &rt, &ctx, fun_val, request, activation, budget, &pending) catch |err| switch (err) {
             error.Interrupted => return DispatchError.Interrupted,
@@ -409,7 +447,7 @@ pub const Dispatcher = struct {
             error.JsException => {}, // pending.exception already populated
         };
 
-        return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
+        return finishResponse(self, &state, &pending, &console_buf, &tags_buf, &host_promises);
     }
 
     /// Run one activation. The request allocator is the GC regime
@@ -446,7 +484,31 @@ pub const Dispatcher = struct {
         const ws_owned_start = writeset.owned.items.len;
 
         const outcome = self.runOutcomeOnce(kv, txn, writeset, bytecode, bytecodes, source_hashes, resolver, hooks, deployment_id, request, budget);
+        return self.guardOutcome(outcome, request, writeset, ws_ops_start, ws_owned_start, .detach);
+    }
 
+    /// What happens to the entered request when a run holds.
+    const HeldArena = enum {
+        /// A fresh activation ran on the hot-path request: detach it
+        /// (the handler's heap stays as it is) and give the runtime a
+        /// new one.
+        detach,
+        /// A resume ran on an already-held request, which the once-path
+        /// left again on exit: nothing to detach.
+        keep,
+    };
+
+    /// The tail every run shares: the arena-OOM fail-loud check, the
+    /// held-request detach, the regime stamp.
+    fn guardOutcome(
+        self: *Dispatcher,
+        outcome: DispatchError!RunOutcome,
+        request: Request,
+        writeset: *kv_mod.WriteSet,
+        ws_ops_start: usize,
+        ws_owned_start: usize,
+        held_arena: HeldArena,
+    ) DispatchError!RunOutcome {
         // The arena's exhaustion record is the capacity-vs-user-error
         // discriminator; it survives until the NEXT reset, so read it
         // here, before any further restore. A run that hit it produced
@@ -462,7 +524,184 @@ pub const Dispatcher = struct {
             return self.oomFailureOutcome();
         }
         stampArenaRegime(request);
-        return outcome;
+        var oc = try outcome;
+        if (oc == .held and held_arena == .detach) {
+            // Detach the hot-path request: the handler's arena is kept
+            // exactly as it is, and the runtime is handed a fresh one
+            // for everything else. Values never migrate. Only safe here
+            // — the once-path's state and activation object are already
+            // released, so nothing on the C side points into the arena.
+            const req = self.snapshot.currentRequest() orelse {
+                discardOutcome(self.allocator, &oc);
+                return DispatchError.RequestSwitch;
+            };
+            self.snapshot.leaveRequest() catch {
+                discardOutcome(self.allocator, &oc);
+                return DispatchError.RequestSwitch;
+            };
+            const fresh = self.snapshot.newRequest() catch {
+                self.snapshot.enterRequest(req) catch {};
+                discardOutcome(self.allocator, &oc);
+                return DispatchError.OutOfMemory;
+            };
+            self.snapshot.enterRequest(fresh) catch {
+                discardOutcome(self.allocator, &oc);
+                return DispatchError.RequestSwitch;
+            };
+            oc.held.req = req;
+        }
+        return oc;
+    }
+
+    /// Resume a held request (`held.zig`): re-enter its arena, settle
+    /// the host promise the handler awaits, drain its jobs, and read
+    /// where the handler got to — a terminal (its outer promise
+    /// fulfilled; the head comes from the arena's own `response`
+    /// shadow), an exception (rejected), or held again (still pending,
+    /// with a fresh host promise to wait on). Every exit leaves the held
+    /// request and re-enters the hot-path one. The arena's lifetime is
+    /// the caller's: a terminal means the worker frees it.
+    pub fn resumeHeld(
+        self: *Dispatcher,
+        kv: *kv_mod.KvStore,
+        txn: *kv_mod.TrackedTxn,
+        writeset: *kv_mod.WriteSet,
+        bytecodes: ?*const std.StringHashMapUnmanaged(*BlobBytes),
+        source_hashes: ?*const std.StringHashMapUnmanaged([64]u8),
+        resolver: ?*const module_execution.PackageResolver,
+        hooks: ?*const globals.DeployHooks,
+        deployment_id: u64,
+        request: Request,
+        budget: *Budget,
+        held: held_mod.HeldState,
+        settle: held_mod.Settle,
+    ) DispatchError!RunOutcome {
+        const ws_ops_start = writeset.ops.items.len;
+        const ws_owned_start = writeset.owned.items.len;
+        const outcome = self.resumeHeldOnce(kv, txn, writeset, bytecodes, source_hashes, resolver, hooks, deployment_id, request, budget, held, settle);
+        // A re-held outcome names the SAME arena; the once-path already
+        // left it.
+        var oc = try self.guardOutcome(outcome, request, writeset, ws_ops_start, ws_owned_start, .keep);
+        if (oc == .held) oc.held.req = held.req;
+        return oc;
+    }
+
+    fn resumeHeldOnce(
+        self: *Dispatcher,
+        kv: *kv_mod.KvStore,
+        txn: *kv_mod.TrackedTxn,
+        writeset: *kv_mod.WriteSet,
+        bytecodes: ?*const std.StringHashMapUnmanaged(*BlobBytes),
+        source_hashes: ?*const std.StringHashMapUnmanaged([64]u8),
+        resolver: ?*const module_execution.PackageResolver,
+        hooks: ?*const globals.DeployHooks,
+        deployment_id: u64,
+        request: Request,
+        budget: *Budget,
+        held: held_mod.HeldState,
+        settle: held_mod.Settle,
+    ) DispatchError!RunOutcome {
+        self.last_kv_error = null;
+
+        // Swap the runtime onto the held arena for this activation.
+        // Whatever happens below, the hot-path request is entered again
+        // on the way out — a dispatcher never leaves a held request
+        // entered between runs.
+        const hot = self.snapshot.currentRequest() orelse return DispatchError.RequestSwitch;
+        self.snapshot.leaveRequest() catch return DispatchError.RequestSwitch;
+        self.snapshot.enterRequest(held.req) catch {
+            self.snapshot.enterRequest(hot) catch {};
+            return DispatchError.RequestSwitch;
+        };
+        defer {
+            self.snapshot.leaveRequest() catch {};
+            self.snapshot.enterRequest(hot) catch {};
+        }
+
+        var console_buf: std.ArrayList(u8) = .empty;
+        errdefer console_buf.deinit(self.allocator);
+        var tags_buf: std.ArrayList(log_mod.Tag) = .empty;
+        errdefer freeTagsBuf(self.allocator, &tags_buf);
+        var shred_key_cell: ?[]u8 = null;
+        defer if (shred_key_cell) |k| self.allocator.free(k);
+        var shred_slot_cell: ?u64 = null;
+        var shred_destroys_cell: usize = 0;
+        var host_promises: std.ArrayListUnmanaged(held_mod.HostPromise) = .empty;
+        defer host_promises.deinit(self.allocator);
+
+        var state = self.makeState(kv, txn, writeset, bytecodes, hooks, deployment_id, request, &console_buf, &tags_buf, &shred_key_cell, &shred_slot_cell, &shred_destroys_cell, &host_promises);
+        var rt: qjs.Runtime = .{ .raw = self.snapshot.rt };
+        var ctx: qjs.Context = .{ .raw = self.snapshot.ctx };
+        defer state.deinit(ctx.raw);
+        c.JS_SetContextOpaque(ctx.raw, &state);
+        rt.setInterruptHandler(interruptHandler, budget);
+
+        // The module loader is per-run state (its ctx is this frame):
+        // a continuation that imports still resolves against ITS
+        // deployment's bytecodes.
+        var loader_ctx = module_execution.module_loader.Ctx{
+            .allocator = self.allocator,
+            .bytecodes = bytecodes,
+            .source_hashes = source_hashes,
+            .module_tape = if (request.trace.readset) |rs| &rs.module else null,
+            .resolver = resolver,
+        };
+        c.JS_SetModuleLoaderFunc(
+            rt.raw,
+            module_execution.module_loader.normalize,
+            module_execution.module_loader.load,
+            &loader_ctx,
+        );
+
+        // A resume is its own activation for replay: its seed and clock
+        // are pinned afresh (the tape records them per activation). The
+        // activation OBJECT is not reinstalled — the handler is mid-await
+        // and still holds the one it was called with.
+        globals.installActivationPins(ctx.raw, &state);
+
+        var pending: PendingResponse = .{};
+        errdefer pending.deinit(self.allocator);
+
+        // Settle the awaited host promise.
+        switch (settle) {
+            .timer => |idx| {
+                if (idx >= held.resolvers.len) {
+                    pending.status = 500;
+                    pending.exception = self.allocator.dupe(u8, "resume: no such host promise") catch return DispatchError.OutOfMemory;
+                    return finishResponse(self, &state, &pending, &console_buf, &tags_buf, &host_promises);
+                }
+                const rv = c.JS_Call(ctx.raw, held.resolvers[idx].resolve, globals.js_undefined, 0, null);
+                if (c.JS_IsException(rv)) {
+                    pending.exception = ctx.takeExceptionMessage(self.allocator) catch return DispatchError.OutOfMemory;
+                    return finishResponse(self, &state, &pending, &console_buf, &tags_buf, &host_promises);
+                }
+                c.JS_FreeValue(ctx.raw, rv);
+            },
+        }
+        rt.pumpJobs();
+        if (module_execution.budgetExpired(budget)) return DispatchError.Interrupted;
+
+        // Where did the handler get to?
+        const st = c.JS_PromiseState(ctx.raw, held.outer);
+        if (st == c.JS_PROMISE_FULFILLED) {
+            const val = c.JS_PromiseResult(ctx.raw, held.outer);
+            defer c.JS_FreeValue(ctx.raw, val);
+            module_execution.extractBodyAndMeta(self, &ctx, val, &pending) catch return DispatchError.OutOfMemory;
+        } else if (st == c.JS_PROMISE_REJECTED) {
+            const reason = c.JS_PromiseResult(ctx.raw, held.outer);
+            defer c.JS_FreeValue(ctx.raw, reason);
+            pending.exception = response_building.jsValueToOwned(self.allocator, ctx.raw, reason) catch return DispatchError.OutOfMemory;
+        } else if (host_promises.items.len > 0) {
+            // Still awaiting the host, on a promise created this hop.
+            pending.held = true;
+            pending.held_outer = held.outer;
+        } else {
+            // Awaiting nothing the host owns: nothing could ever settle
+            // it. Loud, at the park site.
+            pending.status = 500;
+            pending.exception = self.allocator.dupe(u8, held_mod.NO_WAKE_SOURCE) catch return DispatchError.OutOfMemory;
+        }
+        return finishResponse(self, &state, &pending, &console_buf, &tags_buf, &host_promises);
     }
 
     /// The loud terminal returned when the request arena is exhausted
@@ -518,6 +757,9 @@ pub const Dispatcher = struct {
         switch (outcome.*) {
             .terminal => |*r| r.deinit(allocator),
             .continuation => |*cont| cont.deinit(allocator),
+            // A doomed held run is discarded before detach: the arena is
+            // still the entered one and the next reset reclaims it.
+            .held => |*h| h.deinit(allocator),
             .stream => |*s| s.deinit(allocator),
             .no_onheaders, .no_onchunk => {},
         }
@@ -578,6 +820,22 @@ pub const Dispatcher = struct {
                     .headers = &.{},
                 };
             },
+            .held => |*h| {
+                // The arena was detached; nothing on this path can
+                // resume it, so release it now rather than at entity
+                // death (this path has no entity).
+                if (h.req) |r| self.snapshot.freeRequest(r) catch {};
+                h.deinit(self.allocator);
+                return .{
+                    .status = 501,
+                    .body = try self.allocator.dupe(u8, "held requests not supported on this path\n"),
+                    .body_is_json = false,
+                    .console = try self.allocator.dupe(u8, ""),
+                    .exception = try self.allocator.dupe(u8, ""),
+                    .set_cookies = &.{},
+                    .headers = &.{},
+                };
+            },
             .stream => |*s| {
                 // Paths that don't support streams on this back-compat
                 // path degrade to a defined 501 — mirrors the
@@ -630,6 +888,7 @@ fn finishResponse(
     pending: *PendingResponse,
     console_buf: *std.ArrayList(u8),
     tags_buf: *std.ArrayList(log_mod.Tag),
+    host_promises: *std.ArrayListUnmanaged(held_mod.HostPromise),
 ) DispatchError!RunOutcome {
     // Headers-first / chunk probe miss — before everything else:
     // nothing ran, so there is no kv error / stream / continuation to
@@ -740,6 +999,21 @@ fn finishResponse(
             if (!std.mem.startsWith(u8, key, reserved.USER_KEY_ROOT)) continue;
             rs.appendWriteKey(key) catch break;
         }
+    }
+
+    // Held: the handler is awaiting the host (`held.zig`). Hand the
+    // outer promise + this activation's resolvers up; the arena itself is
+    // detached by `runOutcome` once nothing here points into it. Console
+    // output is dropped like a continuation's; tags survive the hold.
+    if (pending.held) {
+        pending.held = false;
+        console_buf.deinit(d.allocator);
+        const resolvers = host_promises.toOwnedSlice(d.allocator) catch return DispatchError.OutOfMemory;
+        const tags = tags_buf.toOwnedSlice(d.allocator) catch {
+            d.allocator.free(resolvers);
+            return DispatchError.OutOfMemory;
+        };
+        return .{ .held = .{ .outer = pending.held_outer, .resolvers = resolvers, .tags = tags } };
     }
 
     // Handler `stream.*` effects (§2.2): a handler that called

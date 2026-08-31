@@ -499,6 +499,10 @@ test "doc examples: retired spellings (Gate B) + compile (Gate A) + execute (Gat
                     failures += 1;
                 }
             },
+            .held => |*h| {
+                if (h.req) |arena| d.snapshot.freeRequest(arena) catch {};
+                h.deinit(testing.allocator);
+            },
             .continuation => |*cont| cont.deinit(testing.allocator),
             .stream => |*s| s.deinit(testing.allocator),
             .no_onheaders, .no_onchunk => {},

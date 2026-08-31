@@ -1029,6 +1029,15 @@ fn finishStreamResume(
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations produce
         // these; stream resumes never dispatch as one. Defined failure.
+        .held => |*h| {
+            // Held (`held.zig`) on a path that does not park it yet: the
+            // arena is released and the hop fails as a defined 500.
+            worker_mod.dropHeld(worker, h);
+            ctx.txn.rollback() catch {};
+            ctx.txn_done.* = true;
+            markStreamDrainingAnywhere(server, ctx.ent);
+            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0, ctx.exec_seq);
+        },
         .no_onheaders, .no_onchunk => {
             ctx.txn.rollback() catch {};
             ctx.txn_done.* = true;
@@ -1856,6 +1865,19 @@ pub fn runFire(
             p.completed_ok = true;
             r.console = &.{};
             r.exception = &.{};
+        },
+        .held => |*hval| {
+            // A connectionless activation has no connection to hold: an
+            // `await after.*` there is the promise form of the inert arm
+            // — nothing will ever settle it. Defined: drop the run.
+            std.log.warn(
+                "rove-js " ++ spec.site ++ " ({s}): a connectionless activation awaited a connection wake — nothing can settle it; the run is dropped",
+                .{label},
+            );
+            worker_mod.dropHeld(worker, hval);
+            p.txn.rollback() catch {};
+            p.txn_done = true;
+            return;
         },
         .continuation => |*cval| {
             defer cval.deinit(allocator);

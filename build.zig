@@ -952,7 +952,11 @@ pub fn build(b: *std.Build) void {
     js_mod.linkSystemLibrary("z", .{});
 
     const js_tests = b.addTest(.{ .root_module = js_mod });
-    test_step.dependOn(&b.addRunArtifact(js_tests).step);
+    const run_js_tests = b.addRunArtifact(js_tests);
+    test_step.dependOn(&run_js_tests.step);
+    // Focused subset for iterating on the dispatcher / bindings / worker
+    // unit tests; `test` remains the gate.
+    b.step("js-test", "Run the rove-js unit tests").dependOn(&run_js_tests.step);
 
     // V1→V2 cutover: `rove-snapshot` (src/loop46/snapshot.zig, willemt
     // RaftNode) and the `loop46` product binary (src/loop46/, V1 cluster +

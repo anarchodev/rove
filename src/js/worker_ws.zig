@@ -639,6 +639,16 @@ fn finishWsResume(
         },
         // Only `.inbound_headers`/`.inbound_chunk` activations produce these;
         // a WS resume never dispatches as one. Defined failure: close + tear down.
+        .held => |*h| {
+            // Held (`held.zig`) on a path that does not park it yet: the
+            // arena is released and the hop fails as a defined 500.
+            worker_mod.dropHeld(worker, h);
+            p.txn.rollback() catch {};
+            p.txn_done = true;
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.saga_id, &.{}, act, 0, p.exec_seq);
+            effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+            tearDownWsChain(worker, conn_ent);
+        },
         .no_onheaders, .no_onchunk => {
             p.txn.rollback() catch {};
             p.txn_done = true;
@@ -1193,6 +1203,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         .terminal => |*r| r.deinit(allocator),
         .continuation => |*cval| cval.deinit(allocator),
         .stream => |*s2| s2.deinit(allocator),
+        .held => |*h| worker_mod.dropHeld(worker, h),
         .no_onheaders, .no_onchunk => {},
     }
     if (wrote) {

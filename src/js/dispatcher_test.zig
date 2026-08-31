@@ -237,6 +237,11 @@ fn runOne(
     var outcome = try runOneOutcome(d, kv, body, request_in);
     switch (outcome) {
         .terminal => |r| return r,
+        .held => |*h| {
+            if (h.req) |arena| d.snapshot.freeRequest(arena) catch {};
+            h.deinit(testing.allocator);
+            @panic("runOne: handler held the request; use runOutcome + resumeHeld");
+        },
         .continuation => |*cont| {
             cont.deinit(testing.allocator);
             @panic("runOne: handler returned a continuation; use runOneOutcome");
@@ -279,6 +284,11 @@ test "dispatch: next(...) return is classified as a continuation" {
     );
     switch (outcome) {
         .terminal => return error.TestExpectedContinuation,
+        .held => |*h| {
+            if (h.req) |arena| d.snapshot.freeRequest(arena) catch {};
+            h.deinit(testing.allocator);
+            return error.TestExpectedContinuation;
+        },
         .stream => |*s| {
             s.deinit(testing.allocator);
             return error.TestExpectedContinuation;
@@ -326,6 +336,11 @@ test "dispatch: ordinary return stays terminal (trampoline does not engage)" {
         .terminal => return error.TestExpectedContinuation,
         .stream => |*s| {
             s.deinit(testing.allocator);
+            return error.TestExpectedContinuation;
+        },
+        .held => |*h| {
+            if (h.req) |arena| d.snapshot.freeRequest(arena) catch {};
+            h.deinit(testing.allocator);
             return error.TestExpectedContinuation;
         },
         .continuation => |*cont| cont.deinit(testing.allocator),
@@ -966,6 +981,11 @@ test "dispatch: ws_message frame payload on request.bytes/.text (§2.2)" {
             defer r.deinit(testing.allocator);
             try testing.expectEqualStrings("", r.exception);
             try testing.expectEqualStrings("ok", r.body);
+        },
+        .held => |*h| {
+            if (h.req) |arena| d.snapshot.freeRequest(arena) catch {};
+            h.deinit(testing.allocator);
+            return error.TestExpectedTerminal;
         },
         .continuation => |*cont| {
             cont.deinit(testing.allocator);
@@ -6386,4 +6406,214 @@ test "interaction digest: effects move it, and a same-response handler is not mi
 
     try testing.expect(d1.interaction_digest != d2.interaction_digest); // arming an effect shows
     try testing.expect(d2.interaction_digest != d3.interaction_digest); // its ARGUMENTS show too
+}
+
+// ── held requests (`held.zig`) ─────────────────────────────────────────
+
+fn compileModule(src: [:0]const u8) ![]u8 {
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    return ctx.compileToBytecode(src, "held.mjs", testing.allocator, .{ .kind = .module });
+}
+
+fn writesetHasKeySuffix(ws: *const kv_mod.WriteSet, suffix: []const u8) bool {
+    for (ws.ops.items) |op| {
+        const key = switch (op) {
+            .put => |pp| pp.key,
+            .delete => |dd| dd.key,
+        };
+        if (std.mem.endsWith(u8, key, suffix)) return true;
+    }
+    return false;
+}
+
+test "held request: `await after.ms()` parks the arena; a timer resume completes the response" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    const bytecode = try compileModule(
+        \\export default async function () {
+        \\  kv.set("before", "1");
+        \\  const t = after.ms(10);
+        \\  if (!(t instanceof Promise)) throw new Error("after.ms did not return a promise");
+        \\  await t;
+        \\  kv.set("after", "1");
+        \\  response.status = 201;
+        \\  return "woke:" + typeof request.path;
+        \\}
+    );
+    defer testing.allocator.free(bytecode);
+
+    // Activation 1: the inbound request. The wake accumulator is what
+    // makes the connection holdable (a connectionless activation has
+    // none, and there `after.ms` stays inert).
+    var wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (wakes.items) |*w| w.deinit(testing.allocator);
+        wakes.deinit(testing.allocator);
+    }
+    var txn1 = try kv.beginTrackedImmediate();
+    var txn1_open = true;
+    defer if (txn1_open) txn1.rollback() catch {};
+    var ws1 = kv_mod.WriteSet.init(testing.allocator);
+    defer ws1.deinit();
+    var budget1 = Budget.fromNow(Budget.default_duration_ns);
+    const oc1 = d.runOutcome(kv, &txn1, &ws1, bytecode, null, null, null, null, 0, .{
+        .method = "GET",
+        .path = "/",
+        .effects = .{ .pending_wakes = &wakes },
+        .trace = .{ .request_id = 1 },
+    }, &budget1) catch |err| {
+        std.debug.print("\nheld test: runOutcome failed: {s} (kv: {s})\n", .{ @errorName(err), if (d.last_kv_error) |e| @errorName(e) else "none" });
+        return err;
+    };
+    try testing.expect(oc1 == .held);
+    var held = oc1.held;
+    defer held.deinit(testing.allocator);
+    const req = held.req orelse return error.HeldWithoutArena;
+    defer d.snapshot.freeRequest(req) catch {};
+    // The timer arm was registered AND is a promise the resume settles.
+    try testing.expectEqual(@as(usize, 1), wakes.items.len);
+    try testing.expectEqual(@as(u32, 0), wakes.items[0].promise_idx.?);
+    try testing.expectEqual(@as(usize, 1), held.resolvers.len);
+    // The write before the await is activation 1's.
+    try testing.expect(writesetHasKeySuffix(&ws1, "before"));
+    try testing.expect(!writesetHasKeySuffix(&ws1, "after"));
+    // The park left the runtime on a fresh request.
+    try testing.expect(d.snapshot.currentRequest().? != req);
+    // Activation 1 is over: its txn commits (the worker does this at
+    // park), so the next activation's txn is the only writer.
+    try txn1.commit();
+    txn1_open = false;
+
+    // Meanwhile: an unrelated activation runs to completion on the
+    // hot-path request, untouched by the park.
+    var plain = try runOne(&d, kv, "return 'plain';", .{ .method = "GET", .path = "/" });
+    defer plain.deinit(testing.allocator);
+    try testing.expectEqualStrings("plain", plain.body);
+
+    // Activation 2: the timer fired. Its own txn/writeset — the write
+    // after the await is THIS activation's.
+    var wakes2: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer wakes2.deinit(testing.allocator);
+    var txn2 = try kv.beginTrackedImmediate();
+    defer txn2.rollback() catch {};
+    var ws2 = kv_mod.WriteSet.init(testing.allocator);
+    defer ws2.deinit();
+    var budget2 = Budget.fromNow(Budget.default_duration_ns);
+    var oc2 = try d.resumeHeld(kv, &txn2, &ws2, null, null, null, null, 0, .{
+        .method = "POST",
+        .path = "/",
+        .effects = .{ .pending_wakes = &wakes2 },
+        .trace = .{ .request_id = 2 },
+    }, &budget2, .{ .req = req, .outer = held.outer, .resolvers = held.resolvers }, .{ .timer = 0 });
+    try testing.expect(oc2 == .terminal);
+    defer oc2.terminal.deinit(testing.allocator);
+    try testing.expectEqualStrings("", oc2.terminal.exception);
+    try testing.expectEqual(@as(i32, 201), oc2.terminal.status);
+    try testing.expectEqualStrings("woke:string", oc2.terminal.body);
+    try testing.expect(writesetHasKeySuffix(&ws2, "after"));
+    try testing.expect(!writesetHasKeySuffix(&ws2, "before"));
+    // The hot-path request is back.
+    try testing.expect(d.snapshot.currentRequest().? != req);
+}
+
+test "held request: a second await re-holds the same arena; a rejection surfaces as the exception" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    const bytecode = try compileModule(
+        \\export default async function () {
+        \\  await after.ms(10);
+        \\  await after.ms(10);
+        \\  throw new Error("boom after two waits");
+        \\}
+    );
+    defer testing.allocator.free(bytecode);
+
+    var wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (wakes.items) |*w| w.deinit(testing.allocator);
+        wakes.deinit(testing.allocator);
+    }
+    var txn1 = try kv.beginTrackedImmediate();
+    var txn1_open = true;
+    defer if (txn1_open) txn1.rollback() catch {};
+    var ws1 = kv_mod.WriteSet.init(testing.allocator);
+    defer ws1.deinit();
+    var budget1 = Budget.fromNow(Budget.default_duration_ns);
+    const oc1 = try d.runOutcome(kv, &txn1, &ws1, bytecode, null, null, null, null, 0, .{
+        .method = "GET",
+        .path = "/",
+        .effects = .{ .pending_wakes = &wakes },
+        .trace = .{ .request_id = 1 },
+    }, &budget1);
+    try testing.expect(oc1 == .held);
+    var held = oc1.held;
+    defer held.deinit(testing.allocator);
+    const req = held.req orelse return error.HeldWithoutArena;
+    defer d.snapshot.freeRequest(req) catch {};
+    try txn1.commit();
+    txn1_open = false;
+
+    // First resume: the handler awaits again → held again, SAME arena,
+    // a fresh resolver for the new arm.
+    var wakes2: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (wakes2.items) |*w| w.deinit(testing.allocator);
+        wakes2.deinit(testing.allocator);
+    }
+    var txn2 = try kv.beginTrackedImmediate();
+    var txn2_open = true;
+    defer if (txn2_open) txn2.rollback() catch {};
+    var ws2 = kv_mod.WriteSet.init(testing.allocator);
+    defer ws2.deinit();
+    var budget2 = Budget.fromNow(Budget.default_duration_ns);
+    const oc2 = try d.resumeHeld(kv, &txn2, &ws2, null, null, null, null, 0, .{
+        .method = "POST",
+        .path = "/",
+        .effects = .{ .pending_wakes = &wakes2 },
+        .trace = .{ .request_id = 2 },
+    }, &budget2, .{ .req = req, .outer = held.outer, .resolvers = held.resolvers }, .{ .timer = 0 });
+    try testing.expect(oc2 == .held);
+    var held2 = oc2.held;
+    defer held2.deinit(testing.allocator);
+    try testing.expect(held2.req.? == req);
+    try testing.expectEqual(@as(usize, 1), wakes2.items.len);
+    try testing.expectEqual(@as(usize, 1), held2.resolvers.len);
+    try txn2.commit();
+    txn2_open = false;
+
+    // Second resume: the handler throws → a terminal carrying the
+    // exception (the worker turns it into a 500), never a silent body.
+    var wakes3: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer wakes3.deinit(testing.allocator);
+    var txn3 = try kv.beginTrackedImmediate();
+    defer txn3.rollback() catch {};
+    var ws3 = kv_mod.WriteSet.init(testing.allocator);
+    defer ws3.deinit();
+    var budget3 = Budget.fromNow(Budget.default_duration_ns);
+    var oc3 = try d.resumeHeld(kv, &txn3, &ws3, null, null, null, null, 0, .{
+        .method = "POST",
+        .path = "/",
+        .effects = .{ .pending_wakes = &wakes3 },
+        .trace = .{ .request_id = 3 },
+    }, &budget3, .{ .req = req, .outer = held2.outer, .resolvers = held2.resolvers }, .{ .timer = 0 });
+    try testing.expect(oc3 == .terminal);
+    defer oc3.terminal.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, oc3.terminal.exception, "boom after two waits") != null);
 }

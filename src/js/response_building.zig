@@ -49,6 +49,9 @@ pub const Unwrapped = struct {
     /// Caller is responsible for freeing `val` iff this is true (the
     /// promise-fulfilled path gives us a new reference).
     owns: bool,
+    /// `val` is a promise still pending after the job queue drained —
+    /// the handler is awaiting something the host must settle.
+    pending: bool = false,
 };
 
 pub fn unwrapPromise(ctx: *c.JSContext, v: c.JSValue) Unwrapped {
@@ -61,8 +64,9 @@ pub fn unwrapPromise(ctx: *c.JSContext, v: c.JSValue) Unwrapped {
         const r = c.JS_PromiseResult(ctx, v);
         return .{ .val = r, .rejected = true, .owns = true };
     }
-    // Not a promise, or still pending (shouldn't happen after pumpJobs).
-    return .{ .val = v, .rejected = false, .owns = false };
+    // Not a promise, or still pending — the latter is a handler awaiting
+    // the host (`held.zig`); the caller decides whether it may.
+    return .{ .val = v, .rejected = false, .owns = false, .pending = st == c.JS_PROMISE_PENDING };
 }
 
 /// Convert the handler's return value to bytes:

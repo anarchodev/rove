@@ -92,7 +92,25 @@ pub fn jsOnTimer(
         _ = c.JS_ThrowInternalError(ctx, "after.ms: out of memory");
         return js_exception;
     };
-    return js_undefined;
+    // Promise form (`held.zig`): on a held connection the arm is also a
+    // promise the handler can `await`; the resume settles it. The
+    // capability lives in the request's own memory — Zig keeps the
+    // resolving pair by index, never a JS reference across activations.
+    // A caller that ignores the return value and parks with `next()`
+    // still gets the export-based wake: the arm is registered either way.
+    const promises = state.host_promises orelse return js_undefined;
+    var funcs: [2]c.JSValue = undefined;
+    const promise = c.JS_NewPromiseCapability(ctx, &funcs);
+    if (c.JS_IsException(promise)) return promise;
+    promises.append(state.allocator, .{ .resolve = funcs[0], .reject = funcs[1] }) catch {
+        c.JS_FreeValue(ctx, funcs[0]);
+        c.JS_FreeValue(ctx, funcs[1]);
+        c.JS_FreeValue(ctx, promise);
+        _ = c.JS_ThrowInternalError(ctx, "after.ms: out of memory");
+        return js_exception;
+    };
+    list.items[list.items.len - 1].promise_idx = @intCast(promises.items.len - 1);
+    return promise;
 }
 
 /// `after.kv(prefix, opts?)` — wake the held connection when any key

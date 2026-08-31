@@ -141,6 +141,7 @@ const bytecode_cache_mod = @import("bytecode_cache.zig");
 pub const BlobBytes = bytecode_cache_mod.BlobBytes;
 pub const BytecodeCache = bytecode_cache_mod.BytecodeCache;
 const continuation_mod = @import("bindings/continuation.zig");
+const held_mod = @import("held.zig");
 const Continuation = continuation_mod.Continuation;
 const components_mod = @import("components.zig");
 const chunk_spool_mod = @import("chunk_spool.zig");
@@ -4181,6 +4182,15 @@ pub fn runResume(
 /// (`index.js` or `tenant/index.mjs`) catch every sub-path below it,
 /// which is exactly what the admin handler needs — one JS module
 /// does its own path-based dispatch.
+/// Release a `.held` outcome on a path that cannot park it: free the
+/// detached arena now (no entity will hold it) and drop the resolvers
+/// and tags. Only for paths where a hold is defined to be impossible —
+/// a held connection's park lives on the entity's `HeldRequest`.
+pub fn dropHeld(worker: anytype, h: *held_mod.HeldOutcome) void {
+    if (h.req) |r| worker.dispatcher.snapshot.freeRequest(r) catch {};
+    h.deinit(worker.allocator);
+}
+
 pub fn findBytecode(
     tc: TenantFiles,
     module_base: []const u8,

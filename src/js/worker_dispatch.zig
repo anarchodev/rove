@@ -2900,6 +2900,21 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 continue;
             },
             .terminal => |r| r,
+            // Held (`held.zig`): parking the connection on the detached
+            // arena is the promise-model work; until it lands here the
+            // outcome degrades to a defined 501.
+            .held => |hval| {
+                var h = hval;
+                worker_mod.dropHeld(worker, &h);
+                txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
+                    "dispatchOnce.rollbackTo(held)",
+                    "tenant={s} err={s}",
+                    .{ scope_inst.id, @errorName(re) },
+                );
+                try respb.setSimpleResponse(server, ent, sid, sess, 501, "held requests not supported on this path\n", allocator);
+                processed += 1;
+                continue;
+            },
             .continuation => |cval| ctblk: {
                 cont_opt = cval;
                 // The ambient `next(ctx)` verb

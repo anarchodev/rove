@@ -110,6 +110,10 @@ pub const Snapshot = struct {
     /// engine. Set from the compile-time constant at create; one engine
     /// per binary today (selection is a no-op until the first bump).
     version: u16 = version_mod.JS_ENGINE_VERSION,
+    /// The per-request memory budget every request arena is created
+    /// with (`Sizes.request_size`) — `newRequest` uses it so a detached
+    /// hot-path request and its replacement have the same ceiling.
+    request_cap: usize = DEFAULT_REQUEST_SIZE,
 
     pub const Restored = struct {
         runtime: root.Runtime,
@@ -147,7 +151,7 @@ pub const Snapshot = struct {
         // runs one before every request.
         c.js_dual_arena_set_request_mode(c.JS_GetDualArena(rt), c.JS_ARENA_REQ_MODE_GC);
 
-        return .{ .rt = rt, .ctx = ctx, .version = version_mod.JS_ENGINE_VERSION };
+        return .{ .rt = rt, .ctx = ctx, .version = version_mod.JS_ENGINE_VERSION, .request_cap = sizes.request_size };
     }
 
     pub fn deinit(self: *Snapshot) void {
@@ -199,10 +203,11 @@ pub const Snapshot = struct {
         return c.JS_CurrentRequest(self.rt);
     }
 
-    /// Create a request arena with its own budget (peak live set, the GC
-    /// regime). NOT entered: the entered request, if any, stays entered.
-    pub fn newRequest(self: *Snapshot, request_cap: usize) Error!HeldRequest {
-        return c.JS_NewRequest(self.rt, request_cap, null, c.JS_ARENA_REQ_MODE_GC) orelse
+    /// Create a request arena with the snapshot's per-request budget
+    /// (peak live set, the GC regime). NOT entered: the entered request,
+    /// if any, stays entered.
+    pub fn newRequest(self: *Snapshot) Error!HeldRequest {
+        return c.JS_NewRequest(self.rt, self.request_cap, null, c.JS_ARENA_REQ_MODE_GC) orelse
             Error.RequestCreateFailed;
     }
 
@@ -493,7 +498,7 @@ test "held request: a promise awaiting the host survives leave/enter and settles
     // Park it. Give the runtime a fresh request and run an unrelated
     // request to completion on it — the reset-per-request hot path.
     try snap.leaveRequest();
-    const fresh = try snap.newRequest(4 * 1024 * 1024);
+    const fresh = try snap.newRequest();
     try snap.enterRequest(fresh);
     const r2 = snap.restore();
     {

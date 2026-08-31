@@ -1995,6 +1995,15 @@ fn finishContResume(
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations produce
         // these; the probe ran on the FIRST fire. Defined failure.
+        .held => |*h| {
+            // Held (`held.zig`) on a path that does not park it yet: the
+            // arena is released and the hop fails as a defined 500.
+            worker_mod.dropHeld(worker, h);
+            ctx.txn.rollback() catch {};
+            ctx.txn_done.* = true;
+            resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "held requests not supported on this path\n") catch {};
+            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, contTapes(worker, spec.tape, &ctx), ctx.saga_id, &.{}, ctx.act, 0, ctx.exec_seq);
+        },
         .no_onheaders, .no_onchunk => {
             ctx.txn.rollback() catch {};
             ctx.txn_done.* = true;

@@ -27,6 +27,7 @@ const log_mod = @import("rove-log");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
 const rove = @import("rove");
+const held_mod = @import("held.zig");
 const limiter_mod = @import("limiter.zig");
 const crypto_b = @import("bindings/crypto.zig");
 const crypto_jose_b = @import("bindings/crypto_jose.zig");
@@ -67,6 +68,7 @@ pub fn digestCommit(state: *DispatchState, d: tape_mod.interaction_digest.Digest
 }
 
 pub const installRequest = request_bindings.installRequest;
+pub const installActivationPins = request_bindings.installActivationPins;
 const platform_bindings = @import("globals_platform.zig");
 const kv_bindings = @import("globals_kv.zig");
 
@@ -458,6 +460,12 @@ pub const PendingWakeReg = struct {
     /// null → the default `onWake` export. Allocator-owned. Mirrors the
     /// `{on}` opts key — one spelling from customer surface to here.
     on: ?[]u8 = null,
+    /// The host promise this arm settles when it fires — an index into
+    /// the activation's `DispatchState.host_promises` (`held.zig`).
+    /// Null when the arm was registered without a promise (no held
+    /// accumulator, or a caller that ignores the return value and
+    /// parks with `next()` instead).
+    promise_idx: ?u32 = null,
 
     pub fn deinit(self: *PendingWakeReg, allocator: std.mem.Allocator) void {
         if (self.prefix.len > 0) allocator.free(self.prefix);
@@ -605,6 +613,11 @@ pub const DispatchState = struct {
     /// park time and frees the list. Null on connectionless / test
     /// paths — `on.*` is then inert (the model: connection-only wakes).
     pending_wakes: ?*std.ArrayListUnmanaged(PendingWakeReg) = null,
+    /// Host promises the bindings created this activation (`held.zig`):
+    /// an `after.*` arm on a held connection is also a promise the
+    /// handler can `await`. Null ⇒ the arms are not awaitable here
+    /// (connectionless, or a path without the promise model).
+    host_promises: ?*std.ArrayListUnmanaged(held_mod.HostPromise) = null,
     /// `stream.*` effects (`docs/handler-shape.md`
     /// §2.2): true once the handler called `stream.start()` or the first
     /// `stream.write()` — the activation opens/continues a streamed

@@ -72,6 +72,12 @@ pub const PendingResponse = struct {
     /// `RunOutcome.no_onchunk` — the dispatch site falls back to the
     /// classic `.inbound` dispatch instead of a 404.
     no_onchunk: bool = false,
+    /// Set by `runModule` when the handler returned a promise still
+    /// pending on a host promise (`held.zig`). `finishResponse` maps it
+    /// to `RunOutcome.held`; `held_outer` is the handler's outer promise
+    /// (one reference the host keeps for the arena's life).
+    held: bool = false,
+    held_outer: c.JSValue = undefined,
     pub fn deinit(self: *PendingResponse, allocator: std.mem.Allocator) void {
         if (self.continuation) |*cont| cont.deinit(allocator);
         allocator.free(self.body);
@@ -169,6 +175,8 @@ const UnwrappedCall = struct {
     /// Caller must `JS_FreeValue` iff true (promise-fulfilled path
     /// returns a fresh ref; the not-a-promise path returns a borrow).
     owns: bool,
+    /// `val` is a promise still pending after the drain.
+    pending: bool,
 };
 
 /// Steps shared by middleware-call and handler-call: check the call's
@@ -200,13 +208,13 @@ fn awaitAndUnwrap(
         c.JS_FreeValue(ctx.raw, final.val);
         return error.JsException;
     }
-    return .{ .val = final.val, .owns = final.owns };
+    return .{ .val = final.val, .owns = final.owns, .pending = final.pending };
 }
 
 /// Populate `pending.body`/`body_is_json` from the handler's return
 /// value, then read `pending.status`/`cookies`/`headers` from the
 /// ambient `response` global.
-fn extractBodyAndMeta(
+pub fn extractBodyAndMeta(
     d: *Dispatcher,
     ctx: *qjs.Context,
     val: c.JSValue,
@@ -381,6 +389,25 @@ pub fn runModule(
     const result = try awaitAndUnwrap(d, rt, ctx, ret_val, budget, pending);
     defer if (result.owns) c.JS_FreeValue(ctx.raw, result.val);
 
+    // The handler is awaiting the host: its return is a promise still
+    // pending after the drain, and a host promise it can be waiting on
+    // exists (`after.ms(...)` on a held connection). Hold the request —
+    // the arena stays alive and the resume settles the promise
+    // (`held.zig`). A pending promise with NO host promise is left to
+    // the body path below (it stringifies to `{}`) — the same defined
+    // outcome as before promises existed; the park-must-be-resumable
+    // rule is enforced where the hold would be armed.
+    if (result.pending) {
+        const st = globals.getState(ctx.raw);
+        if (st.host_promises) |hp| {
+            if (hp.items.len > 0) {
+                pending.held = true;
+                pending.held_outer = c.JS_DupValue(ctx.raw, result.val);
+                return;
+            }
+        }
+    }
+
     // Trampoline classification — handler path ONLY (middleware may
     // not return a continuation in v1, plan §3b B6, so this is not in
     // the shared `extractBodyAndMeta`). A branded `next(...)` return
@@ -414,7 +441,7 @@ pub fn runModule(
         return error.OutOfMemory;
 }
 
-fn budgetExpired(budget: *Budget) bool {
+pub fn budgetExpired(budget: *Budget) bool {
     const now: i64 = @intCast(std.time.nanoTimestamp());
     return now >= budget.deadline_ns;
 }

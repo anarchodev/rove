@@ -28,6 +28,7 @@ const limiter_mod = @import("limiter.zig");
 const blob_mod = @import("rove-blob");
 const blob_sessions_mod = @import("blob_sessions.zig");
 const continuation_mod = @import("bindings/continuation.zig");
+const held_mod = @import("held.zig");
 const stream_mod = @import("bindings/stream.zig");
 const components_mod = @import("components.zig");
 
@@ -567,6 +568,10 @@ pub const Response = struct {
 pub const RunOutcome = union(enum) {
     terminal: Response,
     continuation: continuation_mod.Continuation,
+    /// The handler is awaiting the host (`held.zig`): its request arena
+    /// is detached and kept; the worker parks the connection and a
+    /// later `Dispatcher.resumeHeld` settles the promise it awaits.
+    held: held_mod.HeldOutcome,
     /// Iterative streaming descriptor (streaming handlers, `docs/architecture/effects-and-handlers.md`).
     /// The handler returned `__rove_stream(...)`. The worker's success
     /// path drives the held h2 entity through the chunked-write lifecycle.

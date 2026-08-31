@@ -211,6 +211,12 @@ fn runSurfaceModule(
             defer cont.deinit(testing.allocator);
             break :blk try a.dupe(u8, cont.ctx_json);
         },
+        .held => |*h| {
+            if (h.req) |arena| d.snapshot.freeRequest(arena) catch {};
+            h.deinit(testing.allocator);
+            std.debug.print("\nsurface-tests [{s}]: ended held on a promise — return done() or next({{ctx: report}})\n", .{name});
+            return error.SurfaceModuleBadEnding;
+        },
         .stream => |*s| {
             s.deinit(testing.allocator);
             std.debug.print("\nsurface-tests [{s}]: ended as a stream — return done() or next({{ctx: report}})\n", .{name});

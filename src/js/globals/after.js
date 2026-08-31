@@ -69,9 +69,14 @@ function _rejectRenamed(verb, opts, renames) {
      * @param {object} [opts]
      * @param {string} [opts.on] - Export to resume into
      *   (`"module.method"` or a bare `"method"`); defaults to `onWake`.
-     * @returns {void}
+     * @returns {Promise<void>|undefined} On a held connection, a promise
+     *   that settles when the timer fires — `await` it to continue in
+     *   place instead of parking with `next()` and resuming in `onWake`.
+     *   `undefined` where the connection cannot be held.
      * @example
      * after.ms(30_000, { on: "onTimeout" }); // deadline for a join
+     * @example
+     * export default async () => { await after.ms(500); return "later"; };
      */
     ms(ms, opts) {
       return sys.timer(ms, opts);
