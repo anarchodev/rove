@@ -691,7 +691,10 @@ pub const Engine = struct {
 
             const settle_json = std.json.Stringify.valueAlloc(a, settle_v, .{}) catch return Error.OutOfMemory;
             const label = settleLabel(settle_v);
-            const script = std.fmt.allocPrintSentinel(a, ";__rove_runSettle({{\"settle\":{s}}});", .{settle_json}, 0) catch return Error.OutOfMemory;
+            // Trailing `""`: arena_request_eval prints the script's completion
+            // value (arena_run semantics), so end on an empty string — a blank
+            // line instead of one literal "undefined" per settle hop.
+            const script = std.fmt.allocPrintSentinel(a, ";__rove_runSettle({{\"settle\":{s}}});\"\";", .{settle_json}, 0) catch return Error.OutOfMemory;
             var rc = arena_request_eval_r(self.sim, script.ptr);
             const rc_pump = arena_request_pump_r(self.sim);
             if (rc == 0) rc = rc_pump;

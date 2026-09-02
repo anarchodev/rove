@@ -2034,6 +2034,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/subscription", // http.subscribe recorder bag + detached onSubscription (subscription_fire) activation
         "src/replay/testdata/kvtriggers", // _triggers/<prefix>/index before/after chains run offline: mutate value / reject as trigger_rejected
         "src/replay/testdata/manifestpkg", // `rewind test` auto-resolves an app's manifest.json @rewind/* deps offline (P4a enabler) — direct jwt/oidc + transitive oidc→jwt, no inline scenario packages
+        "src/replay/testdata/promisewakes", // the promise flow's chain fold: await after.ms/kv/fetch + for-await request.messages, settle verbs (rove#929)
         "src/replay/testdata/retrypkg", // @rewind/retry wraps webhook.send (maxAttempts→1 + ctx._retry chain state) + shouldRetry/ctx result logic — the package-model replacement for the retired ambient-retry dispatcher tests
     };
     for (test_dirs) |dir| {

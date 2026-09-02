@@ -41,6 +41,7 @@ pub const LIB_SPECIFIER = "rewind:test";
 // ── the magic-kv bridge protocol (host ⇄ harness JS) ──
 const WORLD_KEY = "\x00rt/world"; // set: stash the world to run next
 const RUN_KEY = "\x00rt/run"; // get: run the stashed world → bundle JSON
+const RUN_CHAIN_KEY = "\x00rt/chain"; // get: fold the stashed CHAIN → {"hops":[…]} JSON
 const ASSERT_KEY = "\x00rt/assert"; // set: append one assertion outcome
 const DONE_KEY = "\x00rt/done"; // set: the test file evaluated to completion
 /// `DONE_KEY` as a JS string *literal* (the `\x00` escape, not a raw NUL) — the
@@ -181,6 +182,30 @@ fn kvGet(
             // so the test sees a structured result rather than a thrown host op.
             out.clearRetainingCapacity();
             const msg = std.fmt.allocPrint(sa, "{{\"ok\":false,\"error\":{{\"message\":\"simulate failed: {s}\"}},\"effects\":[],\"response\":null}}", .{@errorName(e)}) catch "{\"ok\":false}";
+            out.appendSlice(sa, msg) catch {};
+        };
+        h.install(); // re-take the host from the nested sim run
+        out_val.* = dupC(out.items, false) orelse return -1;
+        out_val_len.* = @intCast(out.items.len);
+        out_outcome.* = @intFromEnum(decode.KvOutcome.ok);
+        _ = h.sim_arena.reset(.retain_capacity);
+        h.world_stash = null;
+        return 0;
+    }
+
+    if (std.mem.eql(u8, k, RUN_CHAIN_KEY)) {
+        // Fold the stashed held CHAIN (`{"chain":[world0, hop1, …]}`) on the
+        // sim reactor — root.zig runChain — and return its `{"hops":[…]}`.
+        // Same nesting/host discipline as RUN_KEY above.
+        const chain_json = h.world_stash orelse {
+            out_outcome.* = @intFromEnum(decode.KvOutcome.err);
+            return 0;
+        };
+        var out = std.ArrayList(u8){};
+        const sa = h.sim_arena.allocator();
+        h.eng.runChain(sa, chain_json, h.source_dir, h.base_dir, h.first_party, &out) catch |e| {
+            out.clearRetainingCapacity();
+            const msg = std.fmt.allocPrint(sa, "{{\"hops\":[{{\"ok\":false,\"error\":{{\"message\":\"runChain failed: {s}\"}},\"effects\":[],\"response\":null}}]}}", .{@errorName(e)}) catch "{\"hops\":[]}";
             out.appendSlice(sa, msg) catch {};
         };
         h.install(); // re-take the host from the nested sim run

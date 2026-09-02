@@ -34,6 +34,20 @@ function simulate(world) {
   return JSON.parse(raw);
 }
 
+const RUN_CHAIN_KEY = "\x00rt/chain";
+
+/** Fold one held CHAIN on the sim reactor (root.zig runChain): world0 plus a
+ *  settle hop per resume, ONE parked request arena across the whole fold.
+ *  Returns the per-hop bundle array. Settle consumes — a fork re-folds its
+ *  prefix (rove#929's fork rule), which this bridge does implicitly: every
+ *  ChainNode.force() sends its FULL chain. */
+function simulateChain(chain) {
+  kv.set(WORLD_KEY, JSON.stringify({ chain }));
+  const raw = kv.get(RUN_CHAIN_KEY);
+  const parsed = JSON.parse(raw);
+  return Array.isArray(parsed.hops) ? parsed.hops : [];
+}
+
 /** Stream one assertion outcome to the host (never throws — fails locally). */
 function record(name, pass, detail) {
   kv.set(ASSERT_KEY, JSON.stringify({ name, pass, detail: detail === undefined ? null : detail }));
@@ -533,6 +547,18 @@ class Scenario {
     // specific export directly instead of the kind's default).
     if (req.export !== undefined) partial.export = req.export;
     return new Node(this, this._base(partial));
+  }
+
+  /** An inbound activation driven through the CHAIN FOLD — the promise flow
+   *  (`await after.ms/kv/fetch`; rove#929). Same request surface as
+   *  `inbound`, but the engine runs it HOLDABLE: a bare `after.*` arm or
+   *  input pull returns a promise, a handler awaiting one parks, and the
+   *  returned node's settle verbs (`.timer()`, `.kvWrite()`,
+   *  `.fetch(m).resolve()`, `.frame()`, `.close()`) drive the resumes. A
+   *  handler that returns without holding is simply a one-hop chain. */
+  hold(req = {}) {
+    const n = this.inbound(req);
+    return new ChainNode(this, [n.world]);
   }
 
   /** A headers-first inbound activation → the root node at `onHeaders`. The
@@ -1115,6 +1141,10 @@ function heldEntry(node) {
  *  finite-batch shape), which the fold already models as the chain ending. */
 function enforceWakeSource(node, b) {
   if (b.disposition !== "held") return b;
+  // The promise flow's hold: the bundle lists its outstanding host promises
+  // (`pending`) — each one IS a settleable wake source by construction (the
+  // engine refuses a resume awaiting nothing, the no-wake-source rule).
+  if (Array.isArray(b.pending) && b.pending.length) return b;
   if (node instanceof WsNode) return b; // the socket is the source (next frame)
   const kind = node.world.activation;
   // The request body's remaining chunks resume a headers-first hold; a
@@ -1183,6 +1213,170 @@ function parseDuration(s) {
   if (!m) throw new Error(`clock.advance: unrecognized duration ${JSON.stringify(s)} (use e.g. 500, "1500ms", "1.5s", "2m", "1h", "3d")`);
   const n = Number(m[1]);
   return n * ({ ms: 1, s: 1000, m: 60000, h: 3600000, d: 86400000 }[m[2] || "ms"]);
+}
+
+// ── the promise flow (await after.* / for await request.messages) ─────────
+// A ChainNode is one hop of a held CHAIN — the saga fold (rove#929). Its
+// verbs settle the hop's outstanding host promises (`bundle.pending`, the
+// settle address book) instead of building resume worlds: `.timer()`,
+// `.kvWrite()`, `.fetch(m).resolve()/.reject()`, `.frame()`, `.close()`.
+// Each returns the NEXT hop's node; forcing any node re-folds its whole
+// chain on a fresh request (settle consumes; forks re-fold their prefix).
+// The export-flow verbs on `Node` keep working for `next()`-held chains
+// until S5 removes that flow.
+
+/** A settle verb needs the hop held ON A PROMISE (`pending` non-empty). */
+function requirePending(node, verb) {
+  const b = node.force();
+  if (b.disposition !== "held")
+    throw new Error(`${verb}: this hop returned a terminal response — nothing is awaiting the host`);
+  if (!Array.isArray(b.pending) || !b.pending.length)
+    throw new Error(`${verb}: this hop holds via next() (no awaited host promise) — use the export-flow verbs (clock/wakeKv/fetch().resolve()) instead`);
+}
+
+class ChainNode extends Node {
+  constructor(scn, chain, parent = null) {
+    super(scn, chain[0], parent);
+    this._chain = chain;
+    this._hops = null;
+  }
+  /** Every hop's bundle, in order (memoized — one fold per forced node). */
+  get hops() {
+    if (this._hops === null) this._hops = simulateChain(this._chain);
+    return this._hops;
+  }
+  force() {
+    if (this._b === null) {
+      const hops = this.hops;
+      this._b = enforceWakeSource(this, hops[hops.length - 1] ||
+        { disposition: "terminal", effects: [], response: null, ok: false, error: { message: "empty chain result" } });
+    }
+    return this._b;
+  }
+  /** The hop's outstanding host promises — the settle address book. */
+  get pending() { const b = this.force(); return Array.isArray(b.pending) ? b.pending : []; }
+  /** Effective kv after the WHOLE chain: base kv → each hop's authored kv
+   *  changes → that hop's surviving writes, in order. */
+  kv(key) {
+    const hops = this.hops;
+    let kv = Object.assign({}, this.world.kv || {});
+    for (let i = 0; i < hops.length; i++) {
+      if (i > 0) {
+        const ch = this._chain[i].kv || {};
+        for (const k of Object.keys(ch)) {
+          if (ch[k] === null) delete kv[k];
+          else kv[k] = typeof ch[k] === "string" ? ch[k] : JSON.stringify(ch[k]);
+        }
+      }
+      kv = foldKv(kv, hops[i].effects);
+    }
+    return key in kv ? tryParse(kv[key]) : null;
+  }
+  _seedNow() {
+    const last = this._chain[this._chain.length - 1];
+    return {
+      seed: last.seed != null ? last.seed : (this.world.seed || 0),
+      now: last.now_ms != null ? last.now_ms : (this.world.now_ms || 0),
+    };
+  }
+  _settleHop(settle, opts = {}) {
+    const sn = this._seedNow();
+    const hop = {
+      settle,
+      seed: sn.seed + 1,
+      now_ms: opts.now_ms != null ? opts.now_ms : sn.now + 1,
+    };
+    if (opts.kv) hop.kv = opts.kv;
+    return new ChainNode(this.scenario, this._chain.concat([hop]), this);
+  }
+  /** Settle a pending `await after.ms(...)` with its wake entry, the clock
+   *  advanced to the armed interval (prod never fires early). `{ms}` selects
+   *  among several pending timers; default is the first. */
+  timer(opts = {}) {
+    requirePending(this, "timer()");
+    const cells = this.pending.filter((c) => c.kind === "timer");
+    if (!cells.length) throw new Error("timer(): no pending after.ms promise on this hop");
+    const c = opts.ms != null ? cells.find((x) => x.ms === opts.ms) : cells[0];
+    if (!c) throw new Error(`timer({ms:${opts.ms}}): no pending after.ms matched (pending: ${cells.map((x) => x.ms).join(", ")})`);
+    const at = this._seedNow().now + c.ms;
+    return this._settleHop({ kind: "wakes", entries: [{ id: c.id, firedAtMs: at }] }, { now_ms: at });
+  }
+  /** Apply kv changes and settle every pending `await after.kv(prefix)` a
+   *  change key falls under — the fired-prefix contract: the wake names the
+   *  PREFIX ("go look"), the handler re-reads kv, which the fold updated
+   *  BEFORE the settle. */
+  kvWrite(changes = {}, opts = {}) {
+    requirePending(this, "kvWrite()");
+    const cells = this.pending.filter((x) => x.kind === "kv");
+    if (!cells.length) throw new Error("kvWrite(): no pending after.kv promise on this hop");
+    const keys = Object.keys(changes);
+    const fired = cells.filter((x) => keys.some((k) => k.startsWith(x.prefix)));
+    if (!fired.length)
+      throw new Error(`kvWrite(): no change key falls under a pending after.kv prefix (pending: ${cells.map((x) => JSON.stringify(x.prefix)).join(", ")})`);
+    const at = this._seedNow().now + 1;
+    const kvNorm = {};
+    for (const k of keys) kvNorm[k] = changes[k] === null ? null : (typeof changes[k] === "string" ? changes[k] : JSON.stringify(changes[k]));
+    return this._settleHop(
+      { kind: "wakes", entries: fired.map((x) => ({ id: x.id, firedAtMs: at })) },
+      { now_ms: at, kv: kvNorm },
+    );
+  }
+  /** Locate a pending `await after.fetch(url)` by url matcher → a handle
+   *  that resolves (or rejects) the promise. Shadows the export-flow
+   *  `Node.fetch` on chain nodes — a promise fetch settles, never re-worlds. */
+  fetch(matcher) {
+    requirePending(this, "fetch()");
+    const cells = this.pending.filter((x) => x.kind === "fetch");
+    const hit = cells.find((x) => matchUrl(x.url, matcher));
+    if (!hit)
+      throw new Error(`fetch(${matcher}): no pending after.fetch promise matched (pending: ${cells.map((x) => x.url).join(", ") || "none"})`);
+    return new PromiseFetchHandle(this, hit);
+  }
+  /** Deliver the next inbound frame to a handler awaiting
+   *  `request.messages` (`{binary:true}` for a binary frame). */
+  frame(data, opts = {}) {
+    requirePending(this, "frame()");
+    if (!this.pending.some((x) => x.kind === "input"))
+      throw new Error("frame(): the handler is not awaiting request.messages on this hop");
+    const f = opts && opts.binary
+      ? { opcode: 2, bytesB64: b64(data) }
+      : { opcode: 1, text: String(data) };
+    return this._settleHop({ kind: "input", frame: f });
+  }
+  /** Client close: the pending input pull resolves `{done:true}`, the
+   *  for-await loop ends, and the handler runs on to its terminal return. */
+  close() {
+    requirePending(this, "close()");
+    if (!this.pending.some((x) => x.kind === "input"))
+      throw new Error("close(): the handler is not awaiting request.messages on this hop");
+    return this._settleHop({ kind: "input", eof: true });
+  }
+}
+
+/** A located pending fetch promise → resolve it with the upstream's whole
+ *  buffered response (`{status, body, headers?, truncated?, latencyMs?}`), or
+ *  reject it (a response shape the promise cannot carry). */
+class PromiseFetchHandle {
+  constructor(node, cell) { this.node = node; this.cell = cell; }
+  resolve(response = {}) {
+    requireProdReachable("resolve()", { url: this.cell.url, stream: false }, response);
+    const st = {
+      kind: "fetch",
+      id: this.cell.id,
+      status: response.status != null ? response.status : (response.timeout ? 0 : 200),
+    };
+    if (response.body != null) {
+      if (response.body instanceof Uint8Array) st.bodyB64 = b64(response.body);
+      else st.body = typeof response.body === "string" ? response.body : JSON.stringify(response.body);
+    }
+    if (response.headers) st.headers = response.headers;
+    if (response.truncated != null) st.truncated = !!response.truncated;
+    const now = this.node._seedNow().now + (response.latencyMs || 1);
+    return this.node._settleHop(st, { now_ms: now });
+  }
+  reject(message = "fetch failed") {
+    return this.node._settleHop({ kind: "fetch", id: this.cell.id, reject: String(message) });
+  }
 }
 
 class Clock {
@@ -1765,6 +1959,26 @@ class WsConnection {
    *  DOES run onDisconnect (WsNode.disconnect). */
   disconnect() {
     return new ClosedWsNode(this.scenario);
+  }
+
+  /** Open the connection under the ITERABLE flow (a module with NO
+   *  `onMessage` export): the default export runs once at connection open —
+   *  the upgrade request — and consumes frames via `for await (const m of
+   *  request.messages)`. Returns a chain node holding on the first input
+   *  pull; `.frame(data)` / `.close()` settle the pulls. The export flow's
+   *  `.receive()` (onMessage per frame) stays beside it until S5. */
+  open(req = {}) {
+    const world = this.scenario._base({
+      activation: "inbound",
+      request: {
+        method: req.method || "GET",
+        path: this.path,
+        host: this.host,
+        headers: req.headers || {},
+        body: "",
+      },
+    });
+    return new ChainNode(this.scenario, [world]);
   }
 
   // Build one ws_message world. `ctx` is the connection ctx this frame runs
