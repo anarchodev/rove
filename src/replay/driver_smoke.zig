@@ -709,6 +709,11 @@ fn runLeafPkgs(a: std.mem.Allocator) !void {
 fn runCronPkg(a: std.mem.Allocator) !void {
     const CRON_HASH = "3" ** 64;
     const CRON_SRC = @embedFile("pkg_cron");
+    // cron composes on @rewind/schedule (`cron()` lowers to a recurring
+    // durable schedule), so the world must carry the nested package —
+    // cron's own `imports` pin, like oidc→jwt in `runPackages`.
+    const SCHED_HASH = "4" ** 64;
+    const SCHED_SRC = @embedFile("pkg_schedule");
     const CRON_HANDLER =
         \\import cron from '@rewind/cron';
         \\export default function () {
@@ -733,7 +738,10 @@ fn runCronPkg(a: std.mem.Allocator) !void {
     try w.writeAll("}],");
     try w.print("\"app_imports\":{{\"@rewind/cron\":\"{s}\"}},", .{CRON_HASH});
     try w.writeAll("\"packages\":[");
-    try w.print("{{\"spec\":\"@rewind/cron\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{CRON_HASH});
+    try w.print("{{\"spec\":\"@rewind/schedule\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{SCHED_HASH});
+    try std.json.Stringify.value(SCHED_SRC, .{}, w);
+    try w.writeAll("}},");
+    try w.print("{{\"spec\":\"@rewind/cron\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"imports\":{{\"@rewind/schedule\":\"{s}\"}},\"files\":{{\"index.mjs\":", .{ CRON_HASH, SCHED_HASH });
     try std.json.Stringify.value(CRON_SRC, .{}, w);
     try w.writeAll("}}]}");
     world = aw.toArrayList();
