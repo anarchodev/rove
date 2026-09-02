@@ -39,6 +39,7 @@ import concurrent.futures
 import urllib.parse as up
 
 from smoke_lib_v2 import PUBLIC_SUFFIX, V2Cluster, rpc_wrap  # noqa: E402
+from saga_fold import check_fold, fetch_saga, fold_saga  # noqa: E402
 
 PROMISE_SRC = """\
 export default async function () {
@@ -242,6 +243,42 @@ def main() -> int:
                       headers={"content-type": "application/json"},
                       data=json.dumps({"ms": 100, "tag": "z", "throwAfter": True}), timeout=30.0)
         check("throw after await → 500", r.status == 500, f"got {r.status} {r.body!r}")
+
+        print("step 8: the saga fold — prod is the source of truth (rove#929)")
+        # Re-drive the kv-wake and fetch chains with PINNED saga ids, then
+        # pull each saga from the log-server, fold it offline, and compare
+        # per hop. The recording pins the settle values and choices, so the
+        # fold is a closed function of the record.
+        c.spawn_log_server()
+        watch_saga = "fold-watch-1"
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(lambda: c.request(
+                "acme", "/watch", method="POST", data="{}",
+                headers={"x-rove-correlation-id": watch_saga}, timeout=30.0))
+            time.sleep(1.0)
+            c.request("acme", "/watchpoke?fn=poke", method="GET", timeout=10.0)
+            wstatus, _ = (lambda r: (r.status, r.body))(fut.result(timeout=35.0))
+        check("fold-watch chain drove → 201", wstatus == 201, f"got {wstatus}")
+        recs = fetch_saga(c, "acme", watch_saga, want_hops=2)
+        check("fold-watch saga recorded (2 hops)", bool(recs), "saga not indexed in time")
+        if recs:
+            hops = fold_saga(recs, "acme", {"index.mjs": WATCH_SRC})
+            check_fold(check, "fold-watch", recs, hops)
+
+        if wb_dep:
+            fetch_saga_id = "fold-fetch-1"
+            r = c.request("acme", f"/fetcher?url={up.quote(bulk_url)}", method="POST",
+                          data="{}", headers={"x-rove-correlation-id": fetch_saga_id},
+                          timeout=30.0)
+            check("fold-fetch chain drove → 201", r.status == 201, f"got {r.status}")
+            recs = fetch_saga(c, "acme", fetch_saga_id, want_hops=2)
+            check("fold-fetch saga recorded (2 hops)", bool(recs), "saga not indexed in time")
+            if recs:
+                check("fetch resume carries _settled",
+                      (recs[-1].get("tags") or {}).get("_settled") is not None,
+                      f"tags={recs[-1].get('tags')}")
+                hops = fold_saga(recs, "acme", {"index.mjs": FETCHER_SRC})
+                check_fold(check, "fold-fetch", recs, hops)
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")

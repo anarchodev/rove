@@ -129,16 +129,21 @@ def recv_frame(sock):
     return opcode, fin, payload
 
 
-def ws_connect(port: int, host_header: str, path: str = "/") -> socket.socket:
-    """TCP connect to the node + RFC 6455 upgrade with a tenant Host header."""
+def ws_connect(port: int, host_header: str, path: str = "/",
+               extra_headers: dict | None = None) -> socket.socket:
+    """TCP connect to the node + RFC 6455 upgrade with a tenant Host header.
+    `extra_headers` ride the upgrade request (e.g. X-Rove-Correlation-Id, so
+    a smoke can pin the WS chain's saga id for a later saga-fold pull)."""
     sock = socket.create_connection(("127.0.0.1", port), timeout=10)
     sock.settimeout(10)
     key = base64.b64encode(os.urandom(16)).decode()
+    extras = "".join(f"{k}: {v}\r\n" for k, v in (extra_headers or {}).items())
     req = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {host_header}\r\n"
         f"Upgrade: websocket\r\n"
         f"Connection: Upgrade\r\n"
+        f"{extras}"
         f"Sec-WebSocket-Key: {key}\r\n"
         f"Sec-WebSocket-Version: 13\r\n\r\n"
     )

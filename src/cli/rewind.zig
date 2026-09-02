@@ -1195,7 +1195,10 @@ fn cmdPullSaga(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, saga_i
     while (true) {
         pages += 1;
         if (pages > 64) c.fatal("pull --saga: {s} exceeds 64 pages of hops — not a foldable chain", .{saga_id});
-        const url = std.fmt.allocPrint(a, "{s}/v1/{s}/saga/{s}?limit=500&after_seq={s}", .{ cfg.admin_url, tenant, saga_id, after_seq }) catch c.oom();
+        // Through the admin door's log proxy (`/v1/logs/{tenant}/…` →
+        // the log-server's `/v1/{tenant}/…` — web/admin handleLogQuery),
+        // the same spelling `logs`/`pull` use.
+        const url = std.fmt.allocPrint(a, "{s}/v1/logs/{s}/saga/{s}?limit=500&after_seq={s}", .{ cfg.admin_url, tenant, saga_id, after_seq }) catch c.oom();
         const r = httpCall(a, cfg, "GET", url, &.{}, null, true, 60);
         if (r.code == 401) c.fatal("not signed in — run `rewind login`", .{});
         if (r.code == 403) c.fatal("operator-only — log read needs an operator (is_root) session", .{});
@@ -1390,6 +1393,32 @@ fn doOutput(a: std.mem.Allocator, verb: []const u8, world_path: []const u8, bund
     }
     // A failed `expected` assertion → non-zero exit (CI-usable).
     if (std.mem.indexOf(u8, bundle, "\"verify\":{\"pass\":false") != null) std.process.exit(1);
+}
+
+/// `rewind assemble-chain <world.json>… [-o chain.json]` — assemble
+/// transcoded per-record worlds (exec_seq order) into ONE chain world the
+/// fold replays (`{"chain":[…]}` → `rewind replay`). Offline. The online
+/// twin is `pull --saga`, which pulls + transcodes + assembles in one verb;
+/// this one serves harnesses that already hold the per-hop worlds (the
+/// smoke tails compose fixtures from direct log-server reads).
+fn cmdAssembleChain(a: std.mem.Allocator, world_paths: []const []const u8, out_file: ?[]const u8) void {
+    if (world_paths.len == 0) c.fatal("assemble-chain: no worlds given", .{});
+    var worlds = std.ArrayList([]const u8){};
+    for (world_paths) |wp| {
+        const bytes = std.fs.cwd().readFileAlloc(a, wp, 64 << 20) catch |e|
+            c.fatal("assemble-chain: read {s}: {s}", .{ wp, @errorName(e) });
+        worlds.append(a, bytes) catch c.oom();
+    }
+    var chain = std.ArrayList(u8){};
+    replay.assembleChain(a, worlds.items, &chain) catch |e|
+        c.fatal("assemble-chain: {s} (see warnings above — an export-flow hop cannot fold)", .{@errorName(e)});
+    if (out_file) |path| {
+        std.fs.cwd().writeFile(.{ .sub_path = path, .data = chain.items }) catch |e|
+            c.fatal("assemble-chain: write {s}: {s}", .{ path, @errorName(e) });
+        std.debug.print("wrote chain world → {s}  ({d} hops)\n", .{ path, world_paths.len });
+    } else {
+        std.debug.print("{s}\n", .{chain.items});
+    }
 }
 
 /// `rewind export-fixture <pulled-fixture.json> [-o world.json]` — transcode a
@@ -1687,11 +1716,12 @@ const USAGE =
     \\  rewind [--env <file>] rollback <tenant> <dep_id-hex>
     \\  rewind [--env <file>] deployments <tenant>
     \\  rewind [--env <file>] logs <tenant> [--limit N] [--after CURSOR]
-    \\  rewind [--env <file>] pull <tenant> <req_id> [-o FILE]
+    \\  rewind [--env <file>] pull <tenant> <req_id | --saga <saga_id>> [-o FILE]
     \\  rewind [--env <file>] replay <world.json> [--source-dir DIR] [--update] [-o FILE]
     \\  rewind sim <world.json> [--source-dir DIR] [--update] [-o FILE]
     \\  rewind test [dir] [--source-dir DIR] [--update]
     \\  rewind export-fixture <base64-record.json> [-o world.json]
+    \\  rewind assemble-chain <world.json>… [-o chain.json]
     \\  rewind [--env <file>] publish [--apps-dir D] [--only t1,t2] [--include-examples] [--no-release] [--frozen|--update]
     \\  rewind [--env <file>] provision <tenant> [--cluster C] [--host H]
     \\  rewind [--env <file>] host add <host> <tenant>
@@ -1774,7 +1804,8 @@ pub fn main() void {
         std.mem.eql(u8, verb, "move") or std.mem.eql(u8, verb, "route") or
         std.mem.eql(u8, verb, "logs") or std.mem.eql(u8, verb, "pull") or
         std.mem.eql(u8, verb, "replay") or std.mem.eql(u8, verb, "sim") or
-        std.mem.eql(u8, verb, "test") or std.mem.eql(u8, verb, "export-fixture");
+        std.mem.eql(u8, verb, "test") or std.mem.eql(u8, verb, "export-fixture") or
+        std.mem.eql(u8, verb, "assemble-chain");
     if (!known) {
         std.debug.print("rewind: unknown command '{s}'\n\n{s}", .{ verb, USAGE });
         std.process.exit(2);
@@ -1863,6 +1894,23 @@ pub fn main() void {
             } else c.fatal("test: unexpected argument '{s}'", .{rest[j]});
         }
         cmdTest(a, dir, source_dir, update);
+        return;
+    }
+
+    // `assemble-chain` is offline — worlds in, one chain world out.
+    if (std.mem.eql(u8, verb, "assemble-chain")) {
+        if (rest.len < 2) c.fatal("assemble-chain needs <world.json> <world.json>… [-o chain.json]", .{});
+        var out_file: ?[]const u8 = null;
+        var paths = std.ArrayList([]const u8){};
+        var j: usize = 0;
+        while (j < rest.len) : (j += 1) {
+            if (std.mem.eql(u8, rest[j], "-o")) {
+                if (j + 1 >= rest.len) c.fatal("-o needs a path", .{});
+                out_file = rest[j + 1];
+                j += 1;
+            } else paths.append(a, rest[j]) catch c.oom();
+        }
+        cmdAssembleChain(a, paths.items, out_file);
         return;
     }
 

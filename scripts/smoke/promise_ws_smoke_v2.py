@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import urllib.parse as up
 
 from smoke_lib_v2 import PUBLIC_SUFFIX, V2Cluster, rpc_wrap  # noqa: E402
+from saga_fold import check_fold, fetch_saga, fold_saga  # noqa: E402
 from ws_worker_smoke_v2 import (  # noqa: E402
     OP_BIN,
     OP_CLOSE,
@@ -122,7 +123,9 @@ def main() -> int:
         bulk_url = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/?fn=bulk"
 
         print("step 2: open WS /live; echo keeps a JS local across frames")
-        sock = ws_connect(c.front_port, c.host_for("acme"), path="/live")
+        ws_saga = "fold-ws-1"
+        sock = ws_connect(c.front_port, c.host_for("acme"), path="/live",
+                          extra_headers={"X-Rove-Correlation-Id": ws_saga})
         try:
             send_frame(sock, OP_TEXT, b"alpha")
             op, _, pl = recv_frame(sock)
@@ -179,6 +182,22 @@ def main() -> int:
         check("open hop wrote (activation 1)", got.get("opened") == "/live", f"{got}")
         check("per-frame write committed", got.get("last") == "hello-ws", f"{got}")
         check("post-loop write ran at close (n=7)", got.get("closed") == "7", f"{got}")
+
+        print("step 7: the saga fold — prod is the source of truth (rove#929)")
+        # The whole conversation above — open, 7 frames (echo, binary, put,
+        # sleep+queued, write-then-fetch), close — is ONE saga under the
+        # pinned id. Pull it, fold it offline, compare per hop: the frames,
+        # the mid-loop timer settle, the fetch settle (via _settled), and
+        # the close all replay from the record alone.
+        c.spawn_log_server()
+        # open + 7 frame settles + the mid-loop timer hop + the fetch hop
+        # + close(eof) = 10 hops.
+        recs = fetch_saga(c, "acme", ws_saga, want_hops=10)
+        check("ws saga recorded (10 hops)", bool(recs) and len(recs) >= 10,
+              f"got {len(recs) if recs else 0} hops")
+        if recs:
+            hops = fold_saga(recs, "acme", {"index.mjs": ITER_SRC})
+            check_fold(check, "fold-ws", recs, hops)
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")

@@ -551,9 +551,11 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         try w.writeAll("\n  ]");
     }
     // The recorded status becomes an `expected` assertion — replay verifies the
-    // re-run reproduces it.
+    // re-run reproduces it. Status 0 is "never terminal": a HELD hop's record
+    // (the activation parked on a promise) — a status assertion there can
+    // only fail against a hold, so it stays off.
     if (recorded) |r| {
-        if (r.get("status")) |sv| if (sv == .integer) {
+        if (r.get("status")) |sv| if (sv == .integer and sv.integer != 0) {
             try w.print(",\n  \"expected\": {{ \"response\": {{ \"status\": {d} }} }}", .{sv.integer});
         };
     }
