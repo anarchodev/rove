@@ -7,6 +7,7 @@
 //! below mirror dispatcher.zig's own so the moved tests read unchanged.
 
 const std = @import("std");
+const log_mod = @import("rove-log");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
 const tape_mod = @import("rove-tape");
@@ -6523,8 +6524,86 @@ test "held request: `await after.ms()` parks the arena; a timer resume completes
     try testing.expectEqualStrings("woke:string", oc2.terminal.body);
     try testing.expect(writesetHasKeySuffix(&ws2, "after"));
     try testing.expect(!writesetHasKeySuffix(&ws2, "before"));
+    // A WAKE settle stamps no `_settled` tag — a batch can settle several
+    // promises, so its choices ride the batch JSON (wakesToJson promiseIdx),
+    // never the single-valued record tag.
+    for (oc2.terminal.tags) |t| try testing.expect(!std.mem.eql(u8, t.key, log_mod.SETTLED_TAG));
     // The hot-path request is back.
     try testing.expect(d.snapshot.currentRequest().? != req);
+}
+
+
+test "held request: an input settle stamps the `_settled` record tag (the settle choice)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    const bytecode = try compileModule(
+        \\export default async function () {
+        \\  for await (const m of request.messages) { kv.set("m", m.text); break; }
+        \\  return "done";
+        \\}
+    );
+    defer testing.allocator.free(bytecode);
+
+    var wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (wakes.items) |*w| w.deinit(testing.allocator);
+        wakes.deinit(testing.allocator);
+    }
+    var txn1 = try kv.beginTrackedImmediate();
+    var txn1_open = true;
+    defer if (txn1_open) txn1.rollback() catch {};
+    var ws1 = kv_mod.WriteSet.init(testing.allocator);
+    defer ws1.deinit();
+    var budget1 = Budget.fromNow(Budget.default_duration_ns);
+    const oc1 = try d.runOutcome(kv, &txn1, &ws1, bytecode, null, null, null, null, 0, .{
+        .method = "GET",
+        .path = "/",
+        .effects = .{ .pending_wakes = &wakes },
+        .trace = .{ .request_id = 1 },
+    }, &budget1);
+    try testing.expect(oc1 == .held);
+    var held = oc1.held;
+    defer held.deinit(testing.allocator);
+    const req = held.req orelse return error.HeldWithoutArena;
+    defer d.snapshot.freeRequest(req) catch {};
+    try testing.expectEqual(@as(?u32, 0), held.input_promise);
+    try txn1.commit();
+    txn1_open = false;
+
+    var wakes2: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer wakes2.deinit(testing.allocator);
+    var txn2 = try kv.beginTrackedImmediate();
+    defer txn2.rollback() catch {};
+    var ws2 = kv_mod.WriteSet.init(testing.allocator);
+    defer ws2.deinit();
+    var budget2 = Budget.fromNow(Budget.default_duration_ns);
+    var oc2 = try d.resumeHeld(kv, &txn2, &ws2, null, null, null, null, 0, .{
+        .method = "POST",
+        .path = "/",
+        .effects = .{ .pending_wakes = &wakes2 },
+        .trace = .{ .request_id = 2 },
+    }, &budget2, .{ .req = req, .outer = held.outer, .resolvers = held.resolvers }, .{ .input = .{ .idx = 0, .payload = .{ .frame = .{ .opcode = 1, .bytes = "hi" } } } });
+    try testing.expect(oc2 == .terminal);
+    defer oc2.terminal.deinit(testing.allocator);
+    try testing.expectEqualStrings("done", oc2.terminal.body);
+    try testing.expect(writesetHasKeySuffix(&ws2, "m"));
+    // The record says which promise started this activation: `_settled`
+    // carries the resolver index the input settle resolved.
+    var found = false;
+    for (oc2.terminal.tags) |t| {
+        if (std.mem.eql(u8, t.key, log_mod.SETTLED_TAG)) {
+            try testing.expectEqualStrings("0", t.value);
+            found = true;
+        }
+    }
+    try testing.expect(found);
 }
 
 test "held request: a second await re-holds the same arena; a rejection surfaces as the exception" {

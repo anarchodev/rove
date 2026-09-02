@@ -630,6 +630,14 @@ pub const Dispatcher = struct {
         defer host_promises.deinit(self.allocator);
 
         var state = self.makeState(kv, txn, writeset, bytecodes, hooks, deployment_id, request, &console_buf, &tags_buf, &shred_key_cell, &shred_slot_cell, &shred_destroys_cell, &host_promises);
+        // The settle CHOICE, for the record (`_settled` — held.zig): a
+        // fetch/input resume settles exactly one promise; a wake batch's
+        // per-entry choices ride the batch JSON instead.
+        state.settled_promise = switch (settle) {
+            .fetch => |f| f.idx,
+            .input => |inp| inp.idx,
+            .wakes => null,
+        };
         var rt: qjs.Runtime = .{ .raw = self.snapshot.rt };
         var ctx: qjs.Context = .{ .raw = self.snapshot.ctx };
         defer state.deinit(ctx.raw);
@@ -1030,6 +1038,23 @@ fn finishResponse(
         if (!log_mod.validParentSagaValue(ps)) break :stamp;
         const k = d.allocator.dupe(u8, log_mod.PARENT_SAGA_TAG) catch break :stamp;
         const v = d.allocator.dupe(u8, ps) catch {
+            d.allocator.free(k);
+            break :stamp;
+        };
+        tags_buf.append(d.allocator, .{ .key = k, .value = v }) catch {
+            d.allocator.free(k);
+            d.allocator.free(v);
+        };
+    }
+
+    // Engine provenance, the promise flow's half (`held.zig`): a fetch or
+    // input resume records WHICH host promise its settle resolved — the
+    // reserved `_settled` tag, the held-chain fold's settle choice.
+    // Stamped after the handler for the same quota reason as `_parent`;
+    // best-effort with the same drop-never-fail posture.
+    if (state.settled_promise) |sp| stamp: {
+        const k = d.allocator.dupe(u8, log_mod.SETTLED_TAG) catch break :stamp;
+        const v = std.fmt.allocPrint(d.allocator, "{d}", .{sp}) catch {
             d.allocator.free(k);
             break :stamp;
         };

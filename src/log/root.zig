@@ -59,9 +59,11 @@ pub const Tag = struct {
 /// (`tag` throws), not a silent truncation.
 pub const MAX_TAGS: usize = 4;
 /// Max ENGINE-populated tags per record, on top of `MAX_TAGS` — the
-/// defensive cap downstream copies apply is `MAX_RECORD_TAGS`, so an
-/// engine tag can never silently evict a user's fourth tag.
-pub const MAX_ENGINE_TAGS: usize = 1;
+/// defensive cap downstream copies apply is `MAX_RECORD_TAGS`, so
+/// engine tags can never silently evict a user's fourth tag. Two:
+/// `_parent` (cross-saga provenance) and `_settled` (a promise
+/// resume's settle choice).
+pub const MAX_ENGINE_TAGS: usize = 2;
 /// The record-level total: every consumer sizing or capping a record's
 /// tag list uses THIS, never `MAX_TAGS` alone (which bounds only what
 /// `tag` accepts).
@@ -72,6 +74,18 @@ pub const MAX_RECORD_TAGS: usize = MAX_TAGS + MAX_ENGINE_TAGS;
 /// the dispatcher from `Trace.parent_saga`; `_`-keys are rejected on
 /// the `tag` surface, so it cannot collide.
 pub const PARENT_SAGA_TAG = "_parent";
+
+/// Reserved engine tag: the host promise whose settlement started this
+/// activation (`src/js/held.zig` — a fetch or input resume on a
+/// promise-held chain; decimal index into the PREVIOUS activation's
+/// resolver table). The record says "this activation was started by
+/// this promise resolving", which is the held-chain fold's settle
+/// CHOICE for the kinds that settle exactly one promise. A wake batch
+/// can settle several, so ITS choices ride the batch itself
+/// (`promiseIdx` per entry, worker_log.wakesToJson) and this tag stays
+/// off wake resumes. `_`-keys are rejected on the `tag` surface, so it
+/// cannot collide.
+pub const SETTLED_TAG = "_settled";
 
 /// Whether a candidate `_parent` value may be stamped. `armed_by`
 /// transits customer-writable `_sched/` state, so an oversized or
