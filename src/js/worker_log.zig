@@ -444,6 +444,10 @@ fn recordActivation(
 /// one `{"kind":"kv","prefix":…,"firedAt":<ms>}` / `{"kind":"timer",
 /// "firedAt":<ms>}` per entry, fire-time order preserved, `firedAt` in
 /// milliseconds (the JS-facing encoding — `fired_at_ns` is internal).
+/// A PROMISE arm's entry additionally carries `promiseIdx` — the host
+/// promise its fire settles (`held.zig`), the settle CHOICE a held
+/// chain's fold reads back from the tape. Additive: every reader
+/// parses JSON and ignores unknown fields.
 /// An empty batch emits `[]` (never ""), so a taped wake_batch record
 /// explicitly says "empty batch" and the L3 guard can read an empty
 /// `activation_bytes` as "not recorded".
@@ -480,9 +484,20 @@ pub fn wakesToJson(
             .timer => try buf.appendSlice(allocator, "{\"kind\":\"timer\",\"firedAt\":"),
         }
         const ms = @divFloor(w.fired_at_ns, std.time.ns_per_ms);
-        const ms_str = try std.fmt.allocPrint(allocator, "{d}}}", .{ms});
+        const ms_str = try std.fmt.allocPrint(allocator, "{d}", .{ms});
         defer allocator.free(ms_str);
         try buf.appendSlice(allocator, ms_str);
+        // The settle CHOICE (held.zig): which host promise this arm's fire
+        // resolves. On the tape this is what makes a held chain's fold
+        // unambiguous — the record says "this activation was started by this
+        // promise resolving" — once several identical arms can be
+        // outstanding. Absent = the export flow (no promise to name).
+        if (w.promise_idx) |pi| {
+            const pi_str = try std.fmt.allocPrint(allocator, ",\"promiseIdx\":{d}", .{pi});
+            defer allocator.free(pi_str);
+            try buf.appendSlice(allocator, pi_str);
+        }
+        try buf.append(allocator, '}');
     }
     try buf.append(allocator, ']');
     return buf.toOwnedSlice(allocator);
@@ -1431,15 +1446,17 @@ test "wakesToJson matches the JS-facing encoding (prefix escape, ms, empty batch
 
     var entries = [_]components_mod.WakeEntry{
         .{ .tag = .kv, .prefix = @constCast("feed/"), .fired_at_ns = 1_500_000_000 },
-        .{ .tag = .timer, .fired_at_ns = 2_999_999_999 },
-        .{ .tag = .kv, .prefix = @constCast("q\"x\\/"), .fired_at_ns = 3_000_000_000 },
+        .{ .tag = .timer, .fired_at_ns = 2_999_999_999, .promise_idx = 0 },
+        .{ .tag = .kv, .prefix = @constCast("q\"x\\/"), .fired_at_ns = 3_000_000_000, .promise_idx = 3 },
     };
     const json = try wakesToJson(a, &entries);
     defer a.free(json);
+    // A promise arm's entry carries its settle choice (`promiseIdx`); an
+    // export-flow arm's does not.
     try testing.expectEqualStrings(
         "[{\"kind\":\"kv\",\"prefix\":\"feed/\",\"firedAt\":1500}," ++
-            "{\"kind\":\"timer\",\"firedAt\":2999}," ++
-            "{\"kind\":\"kv\",\"prefix\":\"q\\\"x\\\\/\",\"firedAt\":3000}]",
+            "{\"kind\":\"timer\",\"firedAt\":2999,\"promiseIdx\":0}," ++
+            "{\"kind\":\"kv\",\"prefix\":\"q\\\"x\\\\/\",\"firedAt\":3000,\"promiseIdx\":3}]",
         json,
     );
 }

@@ -847,7 +847,11 @@ test "transcode: wake_batch activation_bytes -> request.activation.wakes (issue 
     defer arena.deinit();
     const a = arena.allocator();
 
-    const wakes_json = "[{\"kind\":\"kv\",\"prefix\":\"feed/\",\"firedAt\":1700000000123},{\"kind\":\"timer\",\"firedAt\":1700000000456}]";
+    // The second entry carries the settle CHOICE (`promiseIdx`, a promise
+    // arm's fire — worker_log.wakesToJson); it must survive the transcode
+    // verbatim, since the chain fold reads it back as which promise to
+    // settle.
+    const wakes_json = "[{\"kind\":\"kv\",\"prefix\":\"feed/\",\"firedAt\":1700000000123},{\"kind\":\"timer\",\"firedAt\":1700000000456,\"promiseIdx\":1}]";
     var ab_b64_buf: [256]u8 = undefined;
     const ab_b64 = std.base64.standard.Encoder.encode(&ab_b64_buf, wakes_json);
 
@@ -880,6 +884,9 @@ test "transcode: wake_batch activation_bytes -> request.activation.wakes (issue 
     try testing.expectEqual(@as(i64, 1700000000123), w0.get("firedAt").?.integer);
     const w1 = wakes.items[1].object;
     try testing.expectEqualStrings("timer", w1.get("kind").?.string);
+    try testing.expectEqual(@as(i64, 1), w1.get("promiseIdx").?.integer);
+    // The export-flow entry carries none — absence distinguishes the flows.
+    try testing.expect(w0.get("promiseIdx") == null);
 }
 
 /// A pool-backed ref for these hand-written tapes. The seed stands in for a
