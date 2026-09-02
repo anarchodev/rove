@@ -103,7 +103,7 @@ pub fn Fns(comptime FrontH2: type) type {
             const rh_src = self.reg.get(t.upgrade_ent, self.server.coll(.ws_upgrade_out), h2.ReqHeaders) catch null;
             const path: []const u8 = if (rh_src) |rh| (headerValue(rh.*, ":path") orelse "/") else "/";
 
-            var pairs: [8]NameValue = undefined;
+            var pairs: [9]NameValue = undefined;
             var n: usize = 0;
             pairs[n] = .{ .name = ":method", .value = "CONNECT" };
             n += 1;
@@ -123,6 +123,20 @@ pub fn Fns(comptime FrontH2: type) type {
             n += 1;
             pairs[n] = .{ .name = "via", .value = "1.1 rewind-front" }; // WS upgrades are h1 at the edge
             n += 1;
+            // The client's chain id rides the tunnel (distributed-tracing
+            // posture): the worker's establishWsChain honors it as the
+            // connection's saga id, so every hop of the conversation —
+            // open, frames, wakes, fetches, close — records under the id
+            // the client pinned. Dropped here, the whole saga would fall
+            // back to the minted per-connection id.
+            if (rh_src) |rh| {
+                if (headerValue(rh.*, "x-rove-correlation-id")) |corr| {
+                    if (corr.len > 0 and corr.len <= 256) {
+                        pairs[n] = .{ .name = "x-rove-correlation-id", .value = corr };
+                        n += 1;
+                    }
+                }
+            }
             const p = try packFields(self.allocator, pairs[0..n]);
             return .{ .fields = p.fields, .count = p.count, ._buf = p.buf, ._buf_len = p.buf_len };
         }

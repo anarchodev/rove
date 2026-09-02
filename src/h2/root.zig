@@ -1288,6 +1288,19 @@ pub fn H2(comptime opts: Options) type {
 
         // ── Extended-CONNECT WS (architecture/websockets.md) ─────────────────
 
+        /// The upgrade request's headers for a WS identity entity (h2
+        /// tunnel — the CONNECT head rides the entity as `ReqHeaders`).
+        /// Null on the h1 path, whose framed state keeps only
+        /// authority/path. Borrowed; valid while the entity lives.
+        pub fn wsUpgradeHeaders(h2: *Self, ws_ent: Entity) ?ReqHeaders {
+            for ([_]*StreamColl{ h2.coll(.ws_streams), h2.coll(.ws_connect_out) }) |cl| {
+                if (!h2.reg.isInCollection(ws_ent, cl)) continue;
+                const rh = h2.reg.get(ws_ent, cl, ReqHeaders) catch continue;
+                return rh.*;
+            }
+            return null;
+        }
+
         /// Routing for a WS identity entity (h2 tunnel): `:authority` /
         /// `:path` straight off the CONNECT headers. Valid while the
         /// entity lives (`ws_connect_out` pre-accept, `ws_streams`

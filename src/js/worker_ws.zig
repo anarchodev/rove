@@ -43,6 +43,7 @@ const Request = dispatcher_mod.Request;
 const worker_mod = @import("worker.zig");
 const held_mod = @import("held.zig");
 const worker_streaming = @import("worker_streaming.zig");
+const respb_mod = @import("response_builder.zig");
 const worker_drain = @import("worker_drain.zig");
 const globals = @import("globals.zig");
 const builtin_modules_mod = @import("builtin_modules.zig");
@@ -214,11 +215,26 @@ fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
     var dep = try resolveDeployment(worker, allocator, inst.id, route.module_base);
     defer dep.tc.release();
 
-    // Per-connection correlation id (16-hex of a fresh request_id), stable
-    // across the connection's frames — mirrors the inbound mint.
+    // Per-connection saga id: honor `X-Rove-Correlation-Id` from the
+    // upgrade when present (≤256 bytes, no NUL — the same
+    // distributed-tracing rule as plain inbound, worker_dispatch), so a
+    // client-pinned id names the WHOLE conversation's saga; else the
+    // 16-hex of a fresh request_id, stable across the connection's
+    // frames — mirrors the inbound mint. Header available on the h2
+    // tunnel only (the h1-direct framed state keeps no headers — the
+    // mint covers it).
     const request_id: u64 = worker_mod.mintRequestId(worker, inst);
     var saga_buf: [16]u8 = undefined;
-    const corr = std.fmt.bufPrint(&saga_buf, "{x:0>16}", .{request_id}) catch unreachable;
+    const corr: []const u8 = blk: {
+        if (server.wsUpgradeHeaders(conn_ent)) |rh| {
+            if (respb_mod.findHeader(rh, "x-rove-correlation-id")) |h| {
+                if (h.len > 0 and h.len <= 256 and std.mem.indexOfScalar(u8, h, 0) == null) {
+                    break :blk h;
+                }
+            }
+        }
+        break :blk std.fmt.bufPrint(&saga_buf, "{x:0>16}", .{request_id}) catch unreachable;
+    };
 
     const ent = try server.reg.create(worker.parked_continuations);
     // Through the funnel: components already transferred by the sets
