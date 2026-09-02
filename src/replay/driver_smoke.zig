@@ -373,6 +373,130 @@ fn runArenaGc(a: std.mem.Allocator) !void {
     try runInboundUser(a, "eve", &.{}, "ARENA_GC (normal run after churn)");
 }
 
+
+// ── held-chain fold (the promise flow, src/js/held.zig / rove#929) ──
+// `Engine.runChain` drives a handler that AWAITS host promises across
+// settle hops on one parked request arena: hold → settle → terminal.
+// Three chains: a timer await (wake entry value), a fetch await (whole-body
+// resolve addressed by fetchId), and a `for await (const m of
+// request.messages)` loop (input pulls: two frames then eof).
+
+const AWAIT_TIMER_HANDLER =
+    \\export default async function () {
+    \\  kv.set("before", "1");
+    \\  const w = await after.ms(5000);
+    \\  kv.set("woke", w.kind + "@" + w.firedAt + "@" + Date.now());
+    \\  return { status: 201, body: "woke" };
+    \\}
+;
+
+const AWAIT_FETCH_HANDLER =
+    \\export default async function () {
+    \\  const r = await after.fetch("https://api.example.test/x");
+    \\  kv.set("got", r.status + ":" + r.text);
+    \\  return { status: 200, body: String(r.status) };
+    \\}
+;
+
+const AWAIT_MESSAGES_HANDLER =
+    \\export default async function () {
+    \\  const seen = [];
+    \\  for await (const m of request.messages) seen.push(m.text);
+    \\  kv.set("frames", seen.join(","));
+    \\  return "closed";
+    \\}
+;
+
+fn chainWorld0(a: std.mem.Allocator, handler: []const u8, seed: u64, now_ms: u64) ![]const u8 {
+    var buf = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &buf);
+    const w = &aw.writer;
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",");
+    try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/held\",\"host\":\"ex.test\"},");
+    try w.print("\"seed\":{d},\"now_ms\":{d},", .{ seed, now_ms });
+    try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(handler, .{}, w);
+    try w.writeAll("}]}");
+    buf = aw.toArrayList();
+    return buf.items;
+}
+
+fn runChainScenarios(a: std.mem.Allocator) !void {
+    var eng = try root.Engine.init();
+    const stdout = std.fs.File.stdout();
+
+    // (1) timer: hold with a pending timer arm; the settle delivers the wake
+    // entry and the pinned clock, and the fold ends terminal.
+    {
+        const w0 = try chainWorld0(a, AWAIT_TIMER_HANDLER, 7, 1000);
+        const chain = try std.fmt.allocPrint(a,
+            "{{\"chain\":[{s},{{\"settle\":{{\"kind\":\"wakes\",\"entries\":[{{\"id\":\"p0\",\"firedAtMs\":6000}}]}},\"seed\":8,\"now_ms\":6000}}]}}", .{w0});
+        var out = std.ArrayList(u8){};
+        try eng.runChain(a, chain, null, null, null, &out);
+        try stdout.writeAll("CHAIN_TIMER: ");
+        try stdout.writeAll(out.items);
+        try stdout.writeAll("\n");
+        check(out.items, &.{
+            "\"disposition\":\"held\"",
+            "\"pending\":[{\"id\":\"p0\",\"kind\":\"timer\",\"ms\":5000}]",
+            "\"key\":\"before\"",
+            "\"activation\":\"wake_batch\"",
+            "\"status\":201",
+            "\"body\":\"woke\"",
+            "\"key\":\"woke\"",
+            "\"value\":\"timer@6000@6000\"",
+        }, &.{"held with no wake source"}, "CHAIN TIMER (hold, settle, terminal)");
+    }
+
+    // (2) fetch: the whole-body resolve, addressed by fetchId; the resumed
+    // hop reads the settle value's status/text.
+    {
+        const w0 = try chainWorld0(a, AWAIT_FETCH_HANDLER, 9, 2000);
+        const chain = try std.fmt.allocPrint(a,
+            "{{\"chain\":[{s},{{\"settle\":{{\"kind\":\"fetch\",\"fetchId\":\"ftch_1\",\"status\":200,\"body\":\"hello\"}},\"seed\":10,\"now_ms\":2500}}]}}", .{w0});
+        var out = std.ArrayList(u8){};
+        try eng.runChain(a, chain, null, null, null, &out);
+        try stdout.writeAll("CHAIN_FETCH: ");
+        try stdout.writeAll(out.items);
+        try stdout.writeAll("\n");
+        check(out.items, &.{
+            "\"disposition\":\"held\"",
+            "\"kind\":\"fetch\"",
+            "\"fetchId\":\"ftch_1\"",
+            "\"activation\":\"fetch_chunk\"",
+            "\"key\":\"got\"",
+            "\"value\":\"200:hello\"",
+            "\"body\":\"200\"",
+        }, &.{}, "CHAIN FETCH (whole-body promise resolve)");
+    }
+
+    // (3) messages: the iterable flow — each frame settles one input pull
+    // and the handler immediately pulls again (held with a fresh input
+    // promise); eof ends the loop and the fold lands terminal.
+    {
+        const w0 = try chainWorld0(a, AWAIT_MESSAGES_HANDLER, 11, 3000);
+        const chain = try std.fmt.allocPrint(a,
+            "{{\"chain\":[{s}," ++
+                "{{\"settle\":{{\"kind\":\"input\",\"frame\":{{\"text\":\"a\"}}}},\"seed\":12,\"now_ms\":3100}}," ++
+                "{{\"settle\":{{\"kind\":\"input\",\"frame\":{{\"text\":\"b\"}}}},\"seed\":13,\"now_ms\":3200}}," ++
+                "{{\"settle\":{{\"kind\":\"input\",\"eof\":true}},\"seed\":14,\"now_ms\":3300}}]}}", .{w0});
+        var out = std.ArrayList(u8){};
+        try eng.runChain(a, chain, null, null, null, &out);
+        try stdout.writeAll("CHAIN_MESSAGES: ");
+        try stdout.writeAll(out.items);
+        try stdout.writeAll("\n");
+        check(out.items, &.{
+            "\"pending\":[{\"id\":\"p0\",\"kind\":\"input\"}]",
+            "\"activation\":\"ws_message\"",
+            "\"activation\":\"disconnect\"",
+            "\"key\":\"frames\"",
+            "\"value\":\"a,b\"",
+            "\"body\":\"closed\"",
+        }, &.{"no pending input pull"}, "CHAIN MESSAGES (for-await frames, eof ends the loop)");
+    }
+    std.debug.print("CHAIN OK — hold/settle/terminal on one parked request arena\n", .{});
+}
+
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -417,6 +541,10 @@ pub fn main() !void {
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "cronpkg")) {
         try runCronPkg(a);
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "chain")) {
+        try runChainScenarios(a);
         return;
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "leafpkgs")) {

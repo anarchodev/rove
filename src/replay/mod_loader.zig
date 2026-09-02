@@ -24,6 +24,15 @@ pub const SimModCtx = struct {
     /// The world's package resolver, or null when the world declares no
     /// packages. Borrowed for the duration of one run.
     resolver: ?*const package_resolver.PackageResolver = null,
+    /// The reactor's (ctx, rt), captured at base setup. The chain fold
+    /// (root.zig runChain) needs them for what the reactor API cannot do
+    /// from outside a run: re-pin seed/clock on the ENTERED held request
+    /// (`JS_SetRandomSeed`/`JS_SetDateNow` write per-request state) and
+    /// park/restore the default request around a held one
+    /// (`JS_CurrentRequest`/`JS_EnterRequest`) — the worker dispatcher's
+    /// hot-swap pattern.
+    ctx: ?*c.JSContext = null,
+    rt: ?*c.JSRuntime = null,
 };
 
 // arenajs replay bindings (declared here rather than via the reactor header's
@@ -46,6 +55,11 @@ threadlocal var scratch: [512]u8 = undefined;
 /// `?*anyopaque` (cast to the qjs types here) so root.zig — which owns no
 /// `@cImport` — can name this hook's type when declaring the reactor extern.
 pub fn simSetup(ctx: ?*anyopaque, rt: ?*anyopaque, user: ?*anyopaque) callconv(.c) c_int {
+    if (user) |op| {
+        const mc: *SimModCtx = @ptrCast(@alignCast(op));
+        mc.ctx = @ptrCast(ctx);
+        mc.rt = @ptrCast(rt);
+    }
     if (arena_install_replay_bindings(@ptrCast(ctx)) < 0) return -1;
     // Replace arenajs's replay kv object with the common binding
     // (`rove-binding` over the replay-host vtable) — the same coercion,

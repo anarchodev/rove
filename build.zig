@@ -268,7 +268,7 @@ pub fn build(b: *std.Build) void {
         fn f(bb: *std.Build, mod: *std.Build.Module) void {
             // schedule stays (installs the private `_system.sched` the sim
             // webhook shim captures); the 11 lifted customer globals are gone.
-            const names = [_][]const u8{ "crypto", "http", "request", "base64", "urlsearchparams", "platform", "time", "schedule", "webhook", "after", "stream", "next", "blob" };
+            const names = [_][]const u8{ "crypto", "http", "request", "base64", "urlsearchparams", "platform", "time", "schedule", "webhook", "after", "stream", "next", "blob", "held" };
             inline for (names) |nm| {
                 mod.addAnonymousImport("g_" ++ nm, .{ .root_source_file = bb.path("src/js/globals/" ++ nm ++ ".js") });
             }
@@ -1850,6 +1850,14 @@ pub fn build(b: *std.Build) void {
     // step in. Wiring this one in now keeps the budget's refusal from rotting
     // the same way.
     test_step.dependOn(&driver_smoke_elided.step);
+    // Held-chain fold (the promise flow, rove#929): hold → settle → terminal
+    // on the real engine. On the gate beside `elided` — same build, and a
+    // regression here is the sim silently diverging from the worker's held
+    // model, which every app test depends on.
+    const driver_smoke_chain = b.addRunArtifact(driver_smoke_exe);
+    driver_smoke_chain.addArg("chain");
+    driver_smoke_step.dependOn(&driver_smoke_chain.step);
+    test_step.dependOn(&driver_smoke_chain.step);
 
     // ── rewind: the OIDC customer CLI (docs/architecture/cli-and-deploy.md §6, Track 3).
     // The customer-shippable half of the split — carries an OIDC session

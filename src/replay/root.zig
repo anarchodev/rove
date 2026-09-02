@@ -86,6 +86,26 @@ extern fn arena_run_module_r(r: *ArenaReactor, entry_name: [*c]const u8, entry_s
 const InterruptFn = fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int;
 extern fn arena_set_interrupt_r(r: *ArenaReactor, cb: ?*const InterruptFn, opaque_ctx: ?*anyopaque) void;
 
+// ── requests held across host operations (qjs-arena-reactor.h §requests) ──
+// The chain fold (`runChain`) parks one request across settles: created and
+// pin-seeded via the reactor wrapper, entered for the whole fold, freed at
+// the end. The qjs-level symbols cover what the reactor API cannot do from
+// outside a run — park/restore the DEFAULT request around the held one
+// (`JS_CurrentRequest`/`JS_EnterRequest`, the worker dispatcher's hot-swap
+// pattern) and re-pin seed/clock on the ENTERED request per hop
+// (`JS_SetRandomSeed`/`JS_SetDateNow` write per-request state). Declared
+// with opaque pointers, matching this file's no-@cImport posture.
+pub const ArenaRequest = opaque {};
+extern fn arena_request_new_r(r: *ArenaReactor, request_kb: c_int, mode: c_int) ?*ArenaRequest;
+extern fn arena_request_free_r(r: *ArenaReactor, req: *ArenaRequest) c_int;
+extern fn arena_request_eval_r(r: *ArenaReactor, src: [*c]const u8) c_int;
+extern fn arena_request_pump_r(r: *ArenaReactor) c_int;
+extern fn JS_CurrentRequest(rt: ?*anyopaque) ?*ArenaRequest;
+extern fn JS_EnterRequest(rt: ?*anyopaque, req: ?*ArenaRequest) c_int;
+extern fn JS_LeaveRequest(rt: ?*anyopaque) c_int;
+extern fn JS_SetRandomSeed(ctx: ?*anyopaque, seed: u64) void;
+extern fn JS_SetDateNow(ctx: ?*anyopaque, ms: i64) void;
+
 /// Wall-clock CPU budget for a sim run — the offline analog of the worker's
 /// per-request budget (`dispatcher.Budget`). A runaway `while(true)` handler
 /// would otherwise hang `rewind test` forever instead of surfacing the 504 the
@@ -235,6 +255,31 @@ pub const Engine = struct {
         base_dir: ?[]const u8,
         fp_graph: ?*const first_party.Graph,
         out: *std.ArrayList(u8),
+    ) Error!void {
+        return self.simulateOpts(a, world_json, source_dir, base_dir, fp_graph, out, .{});
+    }
+
+    /// Per-run knobs `runChain` needs beyond the plain `simulate` surface.
+    pub const RunOpts = struct {
+        /// Drive a HOLDABLE activation: the driver publishes the
+        /// held-promise table (epilogue.zig), so a bare `after.*` arm or
+        /// input pull returns a promise. Chain runs only.
+        holdable: bool = false,
+        /// Caller-owned Host storage. A chain's later hops keep reading and
+        /// writing the SAME closed-world kv overlay the inbound hop built —
+        /// a stack-local host would die with `simulateOpts`'s frame.
+        host: ?*hostmod.Host = null,
+    };
+
+    fn simulateOpts(
+        self: *Engine,
+        a: std.mem.Allocator,
+        world_json: []const u8,
+        source_dir: ?[]const u8,
+        base_dir: ?[]const u8,
+        fp_graph: ?*const first_party.Graph,
+        out: *std.ArrayList(u8),
+        ropts: RunOpts,
     ) Error!void {
         const parsed = std.json.parseFromSlice(std.json.Value, a, world_json, .{}) catch
             return Error.BadFixture;
@@ -462,6 +507,7 @@ pub const Engine = struct {
             .captured = wv.captured,
             .warnings = header_warnings.items,
             .triggers = trigs,
+            .holdable = ropts.holdable,
         });
         const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
         const entry_z = try a.dupeZ(u8, wv.entry);
@@ -469,7 +515,9 @@ pub const Engine = struct {
         // ── drive the sim reactor. `arena_run_module_r` resets the request
         // arena on entry, so repeated simulate() calls on `self.sim` are
         // isolated (no cross-run kv/alloc leak). ──
-        var host = hostmod.Host{
+        var local_host: hostmod.Host = undefined;
+        const host: *hostmod.Host = ropts.host orelse &local_host;
+        host.* = hostmod.Host{
             .a = a,
             .kv_map = kv_map,
             .sources = sources,
@@ -533,7 +581,188 @@ pub const Engine = struct {
         // assertion; absent ⇒ plain sim (bundle only).
         if (wv.expected_json) |ej| appendVerify(a, out, ej) catch {};
     }
+
+    /// One held CHAIN — the saga fold (`docs/architecture/replay-and-sim.md`;
+    /// the promise flow, src/js/held.zig). `chain_json` is
+    /// `{"chain": [world0, hop1, …]}`: `world0` a full declarative world (a
+    /// holdable, connection-ful kind), each hop
+    /// `{ "settle": {kind:"wakes"|"fetch"|"input", …}, "seed", "now_ms",
+    /// "kv"?: {key: value|null} }`. The inbound hop runs the ordinary module
+    /// driver inside a FRESH request arena that stays entered for the whole
+    /// fold; each hop re-pins seed/clock, folds its kv changes into the
+    /// closed-world overlay, settles the named host promise
+    /// (`__rove_runSettle`, epilogue.zig), pumps, and reads the hop's parked
+    /// bundle. Appends `{"hops":[bundle0, bundle1, …]}` to `out`. The
+    /// request is FREED when the fold returns — a chain run parks nothing
+    /// across calls: settle consumes, and a scenario fork re-folds its
+    /// whole prefix (rove#929's fork rule).
+    pub fn runChain(
+        self: *Engine,
+        a: std.mem.Allocator,
+        chain_json: []const u8,
+        source_dir: ?[]const u8,
+        base_dir: ?[]const u8,
+        fp_graph: ?*const first_party.Graph,
+        out: *std.ArrayList(u8),
+    ) Error!void {
+        const parsed = std.json.parseFromSlice(std.json.Value, a, chain_json, .{}) catch
+            return Error.BadFixture;
+        if (parsed.value != .object) return Error.BadFixture;
+        const chain_v = parsed.value.object.get("chain") orelse return Error.BadFixture;
+        if (chain_v != .array or chain_v.array.items.len == 0) return Error.BadFixture;
+        const hops = chain_v.array.items;
+
+        const rt: ?*anyopaque = @ptrCast(self.mod_ctx.rt);
+        const jctx: ?*anyopaque = @ptrCast(self.mod_ctx.ctx);
+        if (rt == null or jctx == null) return Error.ArenaInit;
+
+        // Park the default request; the fold runs in its own arena. Restore
+        // + free on every exit — a chain run holds nothing across calls.
+        const dflt = JS_CurrentRequest(rt);
+        const req = arena_request_new_r(self.sim, 102400, 0) orelse return Error.ArenaInit;
+        defer {
+            // JS_FreeRequest leaves the request first if it is entered.
+            _ = arena_request_free_r(self.sim, req);
+            if (dflt) |d| {
+                _ = JS_EnterRequest(rt, d);
+            }
+        }
+        if (JS_EnterRequest(rt, req) != 0) return Error.ArenaInit;
+
+        // The chain's host outlives the inbound hop's frame: later hops keep
+        // reading/writing the same closed-world kv overlay. Struct-literal
+        // init (not `undefined`): `simulateOpts` re-initializes it whole,
+        // but raw memory must never be first touched by a field assignment
+        // (rove#574 class — scripts/ops/create_init_lint.py).
+        var chain_host: hostmod.Host = .{ .a = a };
+
+        const w0_json = std.json.Stringify.valueAlloc(a, hops[0], .{}) catch return Error.OutOfMemory;
+        try out.appendSlice(a, "{\"hops\":[");
+        try self.simulateOpts(a, w0_json, source_dir, base_dir, fp_graph, out, .{
+            .holdable = true,
+            .host = &chain_host,
+        });
+        var still_held = runIsHeld(a, chain_host.output);
+
+        for (hops[1..]) |hop_v| {
+            try out.appendSlice(a, ",");
+            if (hop_v != .object) return Error.BadFixture;
+            const hop = hop_v.object;
+            if (!still_held) {
+                // Folding past a terminal hop is the caller's error — loud,
+                // bundle-shaped, and the fold stops.
+                try out.appendSlice(a, "{\"activation\":\"resume\",\"export\":\"(await)\",\"response\":null,\"disposition\":\"terminal\",\"body\":null,\"effects\":[],\"error\":{\"message\":\"settle after a terminal hop — the chain continued past the handler's terminal response\"},\"ok\":false}");
+                break;
+            }
+            const settle_v = hop.get("settle") orelse return Error.BadFixture;
+
+            // The hop's kv changes fold into the overlay BEFORE the settle,
+            // so the resumed handler re-reads the world that woke it (the
+            // edge-wake contract: the wake is "go look", values come from kv).
+            if (hop.get("kv")) |kvv| {
+                if (kvv != .object) return Error.BadFixture;
+                var it = kvv.object.iterator();
+                while (it.next()) |e| {
+                    const skey = try storeKey(a, e.key_ptr.*);
+                    if (e.value_ptr.* == .null) {
+                        _ = chain_host.kv_map.remove(skey);
+                    } else {
+                        const vs = switch (e.value_ptr.*) {
+                            .string => |str| str,
+                            else => std.json.Stringify.valueAlloc(a, e.value_ptr.*, .{}) catch return Error.OutOfMemory,
+                        };
+                        try chain_host.kv_map.put(a, skey, vs);
+                    }
+                }
+            }
+
+            // A resume is its own recorded activation: fresh seed/clock pins
+            // (written into the ENTERED request's state — the worker's
+            // installActivationPins analog), a fresh CPU budget, a fresh
+            // parked output.
+            const hop_seed: u64 = jHopU64(hop, "seed");
+            const hop_now: u64 = jHopU64(hop, "now_ms");
+            JS_SetRandomSeed(jctx, hop_seed);
+            JS_SetDateNow(jctx, @bitCast(hop_now));
+            self.budget.fired = false;
+            self.budget.deadline_ns = @as(i64, @intCast(std.time.nanoTimestamp())) + SIM_CPU_BUDGET_NS;
+            chain_host.output = null;
+            chain_host.install(); // re-take in case a nested caller swapped hosts
+
+            const settle_json = std.json.Stringify.valueAlloc(a, settle_v, .{}) catch return Error.OutOfMemory;
+            const label = settleLabel(settle_v);
+            const script = std.fmt.allocPrintSentinel(a, ";__rove_runSettle({{\"settle\":{s}}});", .{settle_json}, 0) catch return Error.OutOfMemory;
+            var rc = arena_request_eval_r(self.sim, script.ptr);
+            const rc_pump = arena_request_pump_r(self.sim);
+            if (rc == 0) rc = rc_pump;
+
+            if (self.budget.fired) {
+                try emitCpuBudget504(a, out, label, "(await)");
+                still_held = false;
+                continue;
+            }
+            try emitWorld(a, out, .{
+                .entry = "",
+                .activation = label,
+                .export_name = "(await)",
+                .rc = rc,
+                .divergence = chain_host.diverged,
+                .writes = chain_host.writes.items,
+                .run_json = chain_host.output,
+            });
+            still_held = runIsHeld(a, chain_host.output);
+        }
+        try out.appendSlice(a, "]}");
+    }
 };
+
+/// A hop's u64 field (seed / now_ms). Missing or non-numeric reads 0 — the
+/// same default an absent world `seed` gets.
+fn jHopU64(o: std.json.ObjectMap, key: []const u8) u64 {
+    const v = o.get(key) orelse return 0;
+    return switch (v) {
+        .integer => |i| @bitCast(i),
+        .float => |f| @intFromFloat(f),
+        else => 0,
+    };
+}
+
+/// Whether a hop's parked run output classified as HELD — outstanding host
+/// promises (`held_pending`, the promise flow) or a `next()` disposition
+/// (the export flow, which a chain can still carry transitionally).
+fn runIsHeld(a: std.mem.Allocator, run_json: ?[]const u8) bool {
+    const rj = run_json orelse return false;
+    const p = std.json.parseFromSlice(std.json.Value, a, rj, .{}) catch return false;
+    if (p.value != .object) return false;
+    if (p.value.object.get("held_pending")) |hp| {
+        if (hp == .array and hp.array.items.len > 0) return true;
+    }
+    if (p.value.object.get("result")) |res| {
+        if (res == .object) {
+            if (res.object.get("__rove_disposition")) |d| {
+                if (d == .string and std.mem.eql(u8, d.string, "next")) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// The activation label a settle hop records — the same kind the worker
+/// stamps on the equivalent resume's record.
+fn settleLabel(settle_v: std.json.Value) []const u8 {
+    if (settle_v != .object) return "resume";
+    const kind = settle_v.object.get("kind") orelse return "resume";
+    if (kind != .string) return "resume";
+    if (std.mem.eql(u8, kind.string, "wakes")) return "wake_batch";
+    if (std.mem.eql(u8, kind.string, "fetch")) return "fetch_chunk";
+    if (std.mem.eql(u8, kind.string, "input")) {
+        if (settle_v.object.get("eof")) |e| {
+            if (e == .bool and e.bool) return "disconnect";
+        }
+        return "ws_message";
+    }
+    return "resume";
+}
 
 /// Process-global sim engine backing `runWorld`. Lazily created once and
 /// **reused** (each `simulate` resets the sim reactor's request arena), so
@@ -881,7 +1110,18 @@ fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs)
     var target_val: ?std.json.Value = null;
     var fn_val: ?std.json.Value = null;
     var body_val: ?std.json.Value = null;
+    // The promise hold (src/js/held.zig): the driver classified the hop as
+    // parked on outstanding host promises and listed them — the settle
+    // address book a chain's next hop names. Distinct from the `next()`
+    // disposition below (which carries ctx/target instead).
+    var pending_val: ?std.json.Value = null;
     if (run) |r| {
+        if (r.get("held_pending")) |hpv| {
+            if (hpv == .array and hpv.array.items.len > 0) {
+                held = true;
+                pending_val = hpv;
+            }
+        }
         if (r.get("result")) |res| {
             if (res == .object) {
                 if (res.object.get("__rove_disposition")) |disp| {
@@ -906,6 +1146,11 @@ fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs)
     if (held) {
         try w.writeAll(",\"ctx\":");
         if (ctx_val) |cv| try std.json.Stringify.value(cv, .{}, w) else try w.writeAll("null");
+        // Promise holds only: the outstanding host promises, creation order.
+        if (pending_val) |pv| {
+            try w.writeAll(",\"pending\":");
+            try std.json.Stringify.value(pv, .{}, w);
+        }
         // Emitted only for a cross-module park (the recorder stores null on
         // the ambient same-module `next()`), so same-module bundles are
         // byte-identical with or without this field.

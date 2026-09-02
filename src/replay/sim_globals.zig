@@ -50,6 +50,12 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     "\n;" ++ @embedFile("g_crypto") ++
     "\n;" ++ @embedFile("g_http") ++
     "\n;" ++ @embedFile("g_request") ++
+    // `held.js` — the worker's request.messages / request.chunks iterables,
+    // patched onto the SAME `__rove_request_proto` request.js publishes.
+    // Bottoms out on the `_system.held.nextInput` recorder (a held-promise
+    // cell), so a `for await (const m of request.messages)` handler runs
+    // offline with the worker's own shim rather than a second one.
+    "\n;" ++ @embedFile("g_held") ++
     "\n;" ++ @embedFile("g_base64") ++
     "\n;" ++ @embedFile("g_urlsearchparams") ++
     "\n;" ++ @embedFile("g_platform") ++

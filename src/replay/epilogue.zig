@@ -90,6 +90,13 @@ pub const Opts = struct {
     /// statically imported as a namespace and dispatched from the epilogue kv
     /// wrapper, so mutation/rejection are shared with the recorder.
     triggers: []const TriggerReg = &.{},
+    /// The activation can HOLD across host settles (a connection-ful kind
+    /// driven through the engine's chain fold): the driver publishes the
+    /// held-promise table so a bare `after.*` arm / input pull returns a
+    /// promise (system_recorders.js heldProm — the worker's
+    /// `state.host_promises != null`, src/js/held.zig). False for every
+    /// plain `simulate` run, which keeps the export flow exactly as before.
+    holdable: bool = false,
 };
 
 /// A registered kv trigger: the watched key `prefix` + the resolved `module`
@@ -280,6 +287,8 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     try jsonStr(w, opts.activation);
     try w.writeAll(",\"captured\":");
     try w.writeAll(if (opts.captured) "true" else "false");
+    try w.writeAll(",\"holdable\":");
+    try w.writeAll(if (opts.holdable) "true" else "false");
     try w.writeAll("};\n");
 
     // ── the fixed reconstruction + invoke + side-channel capture ──
@@ -369,7 +378,7 @@ const EPILOGUE_BODY_HEAD =
     \\  // The effect sink is a per-run global array so BASE-installed globals
     \\  // (the sim_globals `_system.*` recorders) push to the SAME ordered log
     \\  // as these per-request shims. `__effects` is a local alias to it.
-    \\  const __effects = (globalThis.__rove_effects = []);
+    \\  let __effects = (globalThis.__rove_effects = []);
     \\  // ── the interaction digest ──
     \\  // The ordered sequence of reads served and effects emitted, folded into
     \\  // a rolling hash as entries ARRIVE. Order is the point and cannot be
@@ -386,7 +395,7 @@ const EPILOGUE_BODY_HEAD =
     \\  // the worker does not fold those — a digest is only useful if every
     \\  // engine hashes the same set.
     \\  const __DG = globalThis.__interactionDigest;
-    \\  const __dg = __DG ? new __DG.Digest() : null;
+    \\  let __dg = __DG ? new __DG.Digest() : null;
     \\  // A cross-store element's digest key is the NAMESPACED one
     \\  // (`__rove_store/<tag>/<key>`): the worker gives cross-store ops no
     \\  // verb of their own, so the store is data in the key
@@ -425,8 +434,9 @@ const EPILOGUE_BODY_HEAD =
     \\      default: break;
     \\    }
     \\  };
-    \\  { const __rawPush = __effects.push.bind(__effects);
-    \\    __effects.push = (e) => { __foldEffect(e); return __rawPush(e); }; }
+    \\  const __patchPush = (arr) => { const raw = arr.push.bind(arr);
+    \\    arr.push = (e) => { __foldEffect(e); return raw(e); }; };
+    \\  __patchPush(__effects);
     \\  // Per-run fetch/subscribe id counter (the sim_globals recorders mint
     \\  // `ftch_<seq>`/`sub_<seq>` from it) — reset here so ids are deterministic
     \\  // per activation, like prod's per-request derived ids.
@@ -438,6 +448,11 @@ const EPILOGUE_BODY_HEAD =
     \\  globalThis.__rove_stream_bytes = 0;
     \\  globalThis.__rove_blob_receive_used = false;
     \\  globalThis.__rove_activation_kind = D.kind;
+    \\  // Held-promise table (system_recorders.js heldProm): non-null only on
+    \\  // a holdable activation — the driver's declaration that this
+    \\  // connection can be held (the worker's `state.host_promises != null`).
+    \\  globalThis.__rove_held_promises = D.holdable ? [] : null;
+    \\  globalThis.__rove_input_pulled = null;
     \\  // Captured tapes replay trust-the-tape: recorder checks that depend on
     \\  // harness-seeded state (platform.scope's exists marker) stand down.
     \\  globalThis.__rove_captured = D.captured;
@@ -448,7 +463,7 @@ const EPILOGUE_BODY_HEAD =
     \\  // writes the line ("[warn] retrying 2"); the `level` field is
     \\  // bundle-internal filtering sugar. Change one formatter, change both.
     \\  const __fmtLog = (x) => { if (typeof x === "string") return x; try { const s = JSON.stringify(x); return s === undefined ? String(x) : s; } catch (_) { return String(x); } };
-    \\  const __mklog = (level, prefix) => (...a) => { const parts = a.map(__fmtLog); if (prefix) parts.unshift(prefix); __effects.push({ kind: "log", level, message: parts.join(" ") }); };
+    \\  const __mklog = (level, prefix) => (...a) => { const parts = a.map(__fmtLog); if (prefix) parts.unshift(prefix); globalThis.__rove_effects.push({ kind: "log", level, message: parts.join(" ") }); };
     \\  globalThis.console = { log: __mklog("info", ""), warn: __mklog("warn", "[warn]"), error: __mklog("error", "[error]"), info: __mklog("info", "[info]"), debug: __mklog("debug", "[debug]") };
     \\  // World-build warnings (dropped authored headers, …) lead the effect
     \\  // log so the author sees them before the handler's own output.
@@ -465,7 +480,12 @@ const EPILOGUE_BODY_HEAD =
     \\    enumerable: true, configurable: true,
     \\    get() { if (!(n in D.values)) miss("header '" + n + "'"); return D.values[n]; },
     \\  });
-    \\  const request = { method: D.method, path: D.path, host: D.host, query: D.query, headers };
+    \\  // The shared request prototype (globals/request.js, patched by held.js):
+    \\  // `messages` / `chunks` iterables and the text/json accessors ride it —
+    \\  // the worker's own shims, not a sim copy. The per-request payload
+    \\  // accessors defined below shadow the proto's on this instance.
+    \\  const request = Object.create(globalThis.__rove_request_proto || Object.prototype);
+    \\  Object.assign(request, { method: D.method, path: D.path, host: D.host, query: D.query, headers });
     \\  // The uniform payload surface (handler-shape §7): bytes/text/json
     \\  // derive from the ONE recorded payload; reading any of them is the
     \\  // same recorded fact the original run's body-read flag captured.
@@ -723,7 +743,7 @@ const EPILOGUE_BODY_TAIL =
     \\  __act.tag = __rove_request_tag;
     \\  __act.shredKey = __rove_request_shred_key;
     \\  __act.unmaskedIp = __unmaskedIp;
-    \\  let __result = null, __err = null, __short = false;
+    \\  let __result = null, __err = null, __short = false, __pendingOuter = null;
     \\  // Await like the worker's pumpJobs: drain microtasks, and if the promise
     \\  // is STILL pending treat it as a plain value (prod ships its JSON — "{}")
     \\  // rather than awaiting forever (response_building.unwrapPromise). Returns
@@ -747,7 +767,10 @@ const EPILOGUE_BODY_TAIL =
     \\  // `await` re-adopt it and hang the epilogue forever.
     \\  const __settled = async (p) => {
     \\    const r = await __settle(p);
-    \\    if (r.pending) __effects.push({ kind: "log", level: "warn", message: "handler returned a still-pending promise — prod treats it as a plain value (body \"{}\")" });
+    \\    // A pending outer WITH an outstanding host promise is the promise
+    \\    // flow's hold (classified in __finishHop) — not the plain-value case.
+    \\    const __hpw = globalThis.__rove_held_promises;
+    \\    if (r.pending && !(__hpw && __hpw.some((c) => !c.settled))) globalThis.__rove_effects.push({ kind: "log", level: "warn", message: "handler returned a still-pending promise — prod treats it as a plain value (body \"{}\")" });
     \\    return r;
     \\  };
     \\  try {
@@ -773,14 +796,16 @@ const EPILOGUE_BODY_TAIL =
     \\    if (!__short) {
     \\      const __fn = ns[D.fn];
     \\      if (typeof __fn === "function") {
-    \\        __result = (await __settled(__fn(__act))).v;
+    \\        const __w0 = await __settled(__fn(__act));
+    \\        __result = __w0.v; if (__w0.pending) __pendingOuter = __w0.v;
     \\      } else if (D.kind === "disconnect") {
     \\        // Prod: a missing onDisconnect is a no-op, not a 404 — the held
     \\        // stream closes regardless (module_execution).
     \\      } else if ((D.kind === "inbound_headers" || D.kind === "inbound_chunk") && typeof ns["default"] === "function") {
     \\        // Prod: no onHeaders/onChunk probe hit → fall back to the classic
     \\        // buffered dispatch at the default export (worker_dispatch §3.5).
-    \\        __result = (await __settled(ns["default"](__act))).v;
+    \\        const __w1 = await __settled(ns["default"](__act));
+    \\        __result = __w1.v; if (__w1.pending) __pendingOuter = __w1.v;
     \\      } else {
     \\        // Prod 404s any other missing export (module_execution).
     \\        globalThis.response = { status: 404, headers: {}, cookies: [] };
@@ -810,166 +835,294 @@ const EPILOGUE_BODY_TAIL =
     \\      if (__e.kind !== "read" && __e.kind !== "log" && __e.kind !== "stream") __e.rolledBack = true;
     \\    }
     \\  }
-    \\  // The one held/terminal disposition read: the handler parked with
-    \\  // `next()` (a thrown handler's __result is the 500 body string, so it
-    \\  // reads terminal). Shared by the drop-tagging pass below and the
-    \\  // terminal-body derivation — one bind-or-drop decision, like the worker.
-    \\  const __held = __result !== null && typeof __result === "object" && __result.__rove_disposition === "next";
-    \\  // ── connection-scoped effect disposition (prod parity) ──
-    \\  // `after.ms`/`after.kv` arm — and a connection-scoped `after.fetch`
-    \\  // binds — only at the handler-success seam, and only when the activation
-    \\  // ends HELD (returns `next()`); a terminal return discards them
-    \\  // (on.zig / worker_dispatch's bind-or-drop). A connectionless activation
-    \\  // (durable_wake / send_callback / disconnect) has no socket at all, which
-    \\  // also drops stream frames (stream.zig's `pending_stream_chunks orelse
-    \\  // return`). The unbound `http.fetch` primitive (bound:false — what
-    \\  // webhook.send/blob compose on) fires regardless. Tag the discarded
-    \\  // entries `dropped` — excluded from matchers/kv-folds like `rolledBack`,
-    \\  // kept on the log for debugging — and warn, so a test can't green on an
-    \\  // effect prod never ships. Rolled-back entries are already excluded.
-    \\  // Authored worlds only: a captured tape is the record of what prod
-    \\  // actually did (including resume shapes whose accumulators differ from
-    \\  // the authored kinds, e.g. a held send_callback hop that binds fetches)
-    \\  // — replay must not re-litigate it. Same posture as the authored-header
-    \\  // hygiene warnings.
-    \\  if (!D.captured) {
-    \\    const __connless = D.kind === "durable_wake" || D.kind === "send_callback" || D.kind === "disconnect" || D.kind === "subscription_fire";
-    \\    const __dropWakes = __connless || !__held;
-    \\    // Warns append to __effects mid-iteration: for..of visits the new tail,
-    \\    // but a {kind:"log"} entry matches no branch below, so this terminates.
-    \\    for (const __e of __effects) {
-    \\      if (__e.rolledBack) continue;
-    \\      let __what = null;
-    \\      if (__e.kind === "timer" && __dropWakes) __what = "after.ms(" + __e.ms + ")";
-    \\      else if (__e.kind === "kv-wake" && __dropWakes) __what = "after.kv(" + JSON.stringify(__e.prefix) + ")";
-    \\      else if (__e.kind === "fetch" && __e.bound && __dropWakes) __what = "after.fetch(" + JSON.stringify(__e.url) + ")";
-    \\      else if (__e.kind === "stream" && __connless) __what = "stream.write";
-    \\      if (__what === null) continue;
-    \\      __e.dropped = true;
-    \\      __effects.push({ kind: "log", level: "warn", message: "dropped connection-scoped effect: " + __what + " — " + (__connless ? "a " + D.kind + " activation has no connection" : "the handler returned a terminal response instead of next(), so the socket was not held") + "; prod discards it and it never fires" });
-    \\    }
-    \\  }
-    \\  // ── response vetting (prod parity) — the emit-side rules the worker
-    \\  // applies to everything the handler set on `response`, mirrored from
-    \\  // src/js/response_building.zig (extractResponseMetadata /
-    \\  // isEmittableHeaderName / isCleanHeaderValue / sanitizeSetCookie) and
-    \\  // worker_dispatch's status clamp. Drops are silent — handler bugs
-    \\  // don't 500 the request — exactly as live.
-    \\  const __vetResponse = () => {
-    \\    const raw = globalThis.response || {};
-    \\    // status: ToInt32 coercion (x|0) then clamp 100..599.
-    \\    let st = raw.status;
-    \\    st = (st === undefined || st === null) ? 200 : (st | 0);
-    \\    if (st < 100) st = 100; else if (st > 599) st = 599;
-    \\    // headers: the first 32 own enumerable props, then filter — pseudo
-    \\    // (:*), token-invalid, hop-by-hop, platform-managed (set-cookie /
-    \\    // content-length), and x-rewind-*/x-rove-internal-* names dropped;
-    \\    // non-string or CR/LF/NUL values dropped; names lowercased (HTTP/2).
-    \\    const RESERVED = ["connection", "transfer-encoding", "upgrade", "keep-alive", "te", "trailer", "proxy-authenticate", "proxy-authorization", "set-cookie", "content-length"];
-    \\    const emittable = (n) => {
-    \\      if (!n.length || n[0] === ":") return false;
-    \\      for (let i = 0; i < n.length; i++) { const c = n.charCodeAt(i); if (c <= 0x20 || c === 0x7f) return false; }
-    \\      const l = n.toLowerCase();
-    \\      if (RESERVED.includes(l)) return false;
-    \\      if (l.startsWith("x-rewind-") || l.startsWith("x-rove-internal-")) return false;
-    \\      return true;
+    \\    // ── per-hop finalization (the promise flow, src/js/held.zig) ──
+    \\    // Classification → connection-scoped effect disposition → response
+    \\    // vetting → terminal-body derivation → digest close → the parked __out
+    \\    // is a FUNCTION because a held chain runs it once per hop: the inbound
+    \\    // hop calls it at the bottom of this driver, and `__rove_runSettle`
+    \\    // (chain runs — root.zig's fold) calls it after each settle. Cross-hop
+    \\    // state (request/response/__act, the held-promise table, the handler's
+    \\    // outer promise) lives on globalThis or in this closure; per-hop state
+    \\    // (the effect log, the digest, the per-activation counters) is
+    \\    // recreated by __beginHop.
+    \\    // ── response vetting (prod parity) — the emit-side rules the worker
+    \\    // applies to everything the handler set on `response`, mirrored from
+    \\    // src/js/response_building.zig (extractResponseMetadata /
+    \\    // isEmittableHeaderName / isCleanHeaderValue / sanitizeSetCookie) and
+    \\    // worker_dispatch's status clamp. Drops are silent — handler bugs
+    \\    // don't 500 the request — exactly as live.
+    \\    const __vetResponse = () => {
+    \\      const raw = globalThis.response || {};
+    \\      // status: ToInt32 coercion (x|0) then clamp 100..599.
+    \\      let st = raw.status;
+    \\      st = (st === undefined || st === null) ? 200 : (st | 0);
+    \\      if (st < 100) st = 100; else if (st > 599) st = 599;
+    \\      // headers: the first 32 own enumerable props, then filter — pseudo
+    \\      // (:*), token-invalid, hop-by-hop, platform-managed (set-cookie /
+    \\      // content-length), and x-rewind-*/x-rove-internal-* names dropped;
+    \\      // non-string or CR/LF/NUL values dropped; names lowercased (HTTP/2).
+    \\      const RESERVED = ["connection", "transfer-encoding", "upgrade", "keep-alive", "te", "trailer", "proxy-authenticate", "proxy-authorization", "set-cookie", "content-length"];
+    \\      const emittable = (n) => {
+    \\        if (!n.length || n[0] === ":") return false;
+    \\        for (let i = 0; i < n.length; i++) { const c = n.charCodeAt(i); if (c <= 0x20 || c === 0x7f) return false; }
+    \\        const l = n.toLowerCase();
+    \\        if (RESERVED.includes(l)) return false;
+    \\        if (l.startsWith("x-rewind-") || l.startsWith("x-rove-internal-")) return false;
+    \\        return true;
+    \\      };
+    \\      const cleanVal = (v) => { for (let i = 0; i < v.length; i++) { const c = v.charCodeAt(i); if (c === 13 || c === 10 || c === 0) return false; } return true; };
+    \\      const hdrs = {};
+    \\      const hsrc = (raw.headers && typeof raw.headers === "object") ? raw.headers : {};
+    \\      for (const k of Object.keys(hsrc).slice(0, 32)) {
+    \\        if (!emittable(k)) continue;
+    \\        const v = hsrc[k];
+    \\        if (typeof v !== "string" || !cleanVal(v)) continue;
+    \\        hdrs[k.toLowerCase()] = v;
+    \\      }
+    \\      // cookies: strings only, first 32, `Domain=` stripped (a handler must
+    \\      // not push a cookie onto the parent domain — sanitizeSetCookie).
+    \\      const cookies = [];
+    \\      const csrc = Array.isArray(raw.cookies) ? raw.cookies : [];
+    \\      for (let i = 0; i < Math.min(csrc.length, 32); i++) {
+    \\        const c0 = csrc[i];
+    \\        if (typeof c0 !== "string" || !c0.length) continue;
+    \\        const segs = c0.split(";");
+    \\        let cout = segs[0].trim();
+    \\        for (let j = 1; j < segs.length; j++) {
+    \\          const seg = segs[j].trim();
+    \\          if (!seg.length) continue;
+    \\          const eq = seg.indexOf("=");
+    \\          const an = (eq < 0 ? seg : seg.slice(0, eq)).trim().toLowerCase();
+    \\          if (an === "domain") continue;
+    \\          cout += "; " + seg;
+    \\        }
+    \\        if (cout.length) cookies.push(cout);
+    \\      }
+    \\      return { status: st, headers: hdrs, cookies };
     \\    };
-    \\    const cleanVal = (v) => { for (let i = 0; i < v.length; i++) { const c = v.charCodeAt(i); if (c === 13 || c === 10 || c === 0) return false; } return true; };
-    \\    const hdrs = {};
-    \\    const hsrc = (raw.headers && typeof raw.headers === "object") ? raw.headers : {};
-    \\    for (const k of Object.keys(hsrc).slice(0, 32)) {
-    \\      if (!emittable(k)) continue;
-    \\      const v = hsrc[k];
-    \\      if (typeof v !== "string" || !cleanVal(v)) continue;
-    \\      hdrs[k.toLowerCase()] = v;
-    \\    }
-    \\    // cookies: strings only, first 32, `Domain=` stripped (a handler must
-    \\    // not push a cookie onto the parent domain — sanitizeSetCookie).
-    \\    const cookies = [];
-    \\    const csrc = Array.isArray(raw.cookies) ? raw.cookies : [];
-    \\    for (let i = 0; i < Math.min(csrc.length, 32); i++) {
-    \\      const c0 = csrc[i];
-    \\      if (typeof c0 !== "string" || !c0.length) continue;
-    \\      const segs = c0.split(";");
-    \\      let cout = segs[0].trim();
-    \\      for (let j = 1; j < segs.length; j++) {
-    \\        const seg = segs[j].trim();
-    \\        if (!seg.length) continue;
-    \\        const eq = seg.indexOf("=");
-    \\        const an = (eq < 0 ? seg : seg.slice(0, eq)).trim().toLowerCase();
-    \\        if (an === "domain") continue;
-    \\        cout += "; " + seg;
+    \\    const __finishHop = (hop) => {
+    \\      let __result = hop.result, __err = hop.err;
+    \\      const __K = hop.kind;
+    \\      const __hp = globalThis.__rove_held_promises || [];
+    \\      // Park-must-be-resumable, checked on a RESUME exactly where the worker
+    \\      // checks it (dispatcher.zig resumeHeldOnce): a re-hold awaiting nothing
+    \\      // the host owns can never settle — fail loud at the park site. The
+    \\      // FIRST hop keeps prod's plain-value disposition instead (a pending
+    \\      // outer with no host promise stringifies to "{}"; __settled warned).
+    \\      const __heldNext0 = __result !== null && typeof __result === "object" && __result.__rove_disposition === "next";
+    \\      if (hop.resume && hop.pending && !__heldNext0 && !__hp.some((c) => !c.settled)) {
+    \\        globalThis.response = { status: 500, headers: {}, cookies: [] };
+    \\        __err = { message: "handler awaited a promise no host operation will settle (held with no wake source)", stack: "" };
+    \\        __result = "handler awaited a promise no host operation will settle (held with no wake source)\n";
+    \\        hop = Object.assign({}, hop, { pending: false });
     \\      }
-    \\      if (cout.length) cookies.push(cout);
-    \\    }
-    \\    return { status: st, headers: hdrs, cookies };
-    \\  };
-    \\  const __vet = __vetResponse();
-    \\  // ── terminal body derivation (response_building.bodyFromReturn +
-    \\  // dispatcher.prependStreamChunks): a returned Uint8Array is RAW BYTES
-    \\  // (base64 through the bundle — `bodyB64` + `binary`); a non-string
-    \\  // non-bytes return is JSON and auto-stamps `content-type:
-    \\  // application/json` unless the handler set its own; a first-hop
-    \\  // terminal after `stream.write` ships the buffered chunks AHEAD of the
-    \\  // body. `__bodyOverride` rides the bundle only when prod's wire body
-    \\  // differs from the plain return value.
-    \\  let __bodyOverride = null;
-    \\  // The bytes prod puts ON THE WIRE — what the worker folds into the
-    \\  // digest's closing element (dispatcher.zig folds `pending.body`, not the
-    \\  // return value). They differ whenever `__bodyOverride` exists, so the
-    \\  // digest has to follow the override rather than the plain result.
-    \\  let __wireBody = "";
-    \\  {
-    \\    if (!__held && !__err) {
-    \\      const isBytes = __result instanceof Uint8Array;
-    \\      let isJson = false, text = null;
-    \\      if (typeof __result === "string") text = __result;
-    \\      else if (__result === undefined || __result === null || isBytes) text = null;
-    \\      else { const j = JSON.stringify(__result); if (j !== undefined) { text = j; isJson = true; } }
-    \\      if (isJson && !("content-type" in __vet.headers)) __vet.headers["content-type"] = "application/json";
-    \\      // First-hop HTTP terminals only — a WS frame goes to the socket and
-    \\      // a resume's chunks are already on the open stream.
-    \\      const frames = (D.kind === "inbound" || D.kind === "inbound_headers")
-    \\        ? __effects.filter((e) => e.kind === "stream" && !e.rolledBack).map((e) => e.data)
-    \\        : [];
-    \\      const b64 = (u) => { const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let s = ""; for (let i = 0; i < u.length; i += 3) { const b0 = u[i], b1 = i + 1 < u.length ? u[i + 1] : 0, b2 = i + 2 < u.length ? u[i + 2] : 0; s += A[b0 >> 2] + A[((b0 & 3) << 4) | (b1 >> 4)] + (i + 1 < u.length ? A[((b1 & 15) << 2) | (b2 >> 6)] : "=") + (i + 2 < u.length ? A[b2 & 63] : "="); } return s; };
-    \\      if (isBytes && frames.length) {
-    \\        const head = __utf8Encode(frames.join(""));
-    \\        const all = new Uint8Array(head.length + __result.length);
-    \\        all.set(head, 0); all.set(__result, head.length);
-    \\        __bodyOverride = { b64: b64(all) };
-    \\        __wireBody = all;
-    \\      } else if (isBytes) {
-    \\        __bodyOverride = { b64: b64(__result) };
-    \\        __wireBody = __result;
-    \\      } else if (frames.length) {
-    \\        __bodyOverride = { text: frames.join("") + (text === null ? "" : text) };
-    \\        __wireBody = __bodyOverride.text;
-    \\      } else {
-    \\        __wireBody = text === null ? "" : text;
+    \\      // The one held/terminal disposition read, now two-armed: the export
+    \\      // flow's `next()` park (a thrown handler's __result is the 500 body
+    \\      // string, so it reads terminal), or the promise flow's hold — the
+    \\      // outer promise still pending with ≥1 host promise outstanding.
+    \\      // Shared by the drop-tagging pass below and the terminal-body
+    \\      // derivation — one bind-or-drop decision, like the worker.
+    \\      const __heldNext = __result !== null && typeof __result === "object" && __result.__rove_disposition === "next";
+    \\      const __heldP = !__heldNext && !!hop.pending && __hp.some((c) => !c.settled);
+    \\      const __held = __heldNext || __heldP;
+    \\      // ── connection-scoped effect disposition (prod parity) ──
+    \\      // `after.ms`/`after.kv` arm — and a connection-scoped `after.fetch`
+    \\      // binds — only at the handler-success seam, and only when the activation
+    \\      // ends HELD (returns `next()`, or is parked on an awaited host promise);
+    \\      // a terminal return discards them (on.zig / worker_dispatch's
+    \\      // bind-or-drop) — an ignored promise arm dies with the request the same
+    \\      // way. A connectionless activation (durable_wake / send_callback /
+    \\      // disconnect) has no socket at all, which also drops stream frames
+    \\      // (stream.zig's `pending_stream_chunks orelse return`). The unbound
+    \\      // `http.fetch` primitive (bound:false — what webhook.send/blob compose
+    \\      // on) fires regardless. Tag the discarded entries `dropped` — excluded
+    \\      // from matchers/kv-folds like `rolledBack`, kept on the log for
+    \\      // debugging — and warn, so a test can't green on an effect prod never
+    \\      // ships. Rolled-back entries are already excluded.
+    \\      // Authored worlds only: a captured tape is the record of what prod
+    \\      // actually did — replay must not re-litigate it.
+    \\      if (!D.captured) {
+    \\        const __connless = __K === "durable_wake" || __K === "send_callback" || __K === "disconnect" || __K === "subscription_fire";
+    \\        const __dropWakes = __connless || !__held;
+    \\        // Warns append to the log mid-iteration: for..of visits the new tail,
+    \\        // but a {kind:"log"} entry matches no branch below, so this terminates.
+    \\        for (const __e of globalThis.__rove_effects) {
+    \\          if (__e.rolledBack) continue;
+    \\          let __what = null;
+    \\          if (__e.kind === "timer" && __dropWakes) __what = "after.ms(" + __e.ms + ")";
+    \\          else if (__e.kind === "kv-wake" && __dropWakes) __what = "after.kv(" + JSON.stringify(__e.prefix) + ")";
+    \\          else if (__e.kind === "fetch" && __e.bound && __dropWakes) __what = "after.fetch(" + JSON.stringify(__e.url) + ")";
+    \\          else if (__e.kind === "stream" && __connless) __what = "stream.write";
+    \\          if (__what === null) continue;
+    \\          __e.dropped = true;
+    \\          globalThis.__rove_effects.push({ kind: "log", level: "warn", message: "dropped connection-scoped effect: " + __what + " — " + (__connless ? "a " + __K + " activation has no connection" : "the handler returned a terminal response instead of holding, so the socket was not held") + "; prod discards it and it never fires" });
+    \\        }
     \\      }
-    \\    }
-    \\  }
-    \\  // Closed LAST, after every effect has folded — the element that makes the
-    \\  // digest a superset of a status comparison. Status is clamped exactly as
-    \\  // the worker clamps it (dispatcher.zig), so an out-of-range status folds
-    \\  // to the same element on both.
-    \\  if (__dg) {
-    \\    const __st = __held ? 0 : Math.max(100, Math.min(599, __vet && __vet.status !== undefined ? __vet.status : 200));
-    \\    // A THROWN handler's wire body is the "handler threw: …" text set in
-    \\    // the catch above — prod folds `pending.body`, which is that same
-    \\    // text. The body-derivation block below only runs on the success path,
-    \\    // so reading `__wireBody` alone folded an empty body here and made a
-    \\    // throwing activation digest differently from prod's.
-    \\    if (!__held) __dg.response(__st, __err ? String(__result) : __wireBody);
-    \\  }
-    \\  let __out;
-    \\  try {
-    \\    __out = JSON.stringify({ response: __vet, result: __result, body_override: __bodyOverride, error: __err, effects: __effects, digest: __dg ? __dg.hex() : null });
-    \\  } catch (e) {
-    \\    __out = JSON.stringify({ response: __vet, result: null, body_override: __bodyOverride, effects: __effects, digest: __dg ? __dg.hex() : null,
-    \\      error: { message: "replay result not JSON-serialisable: " + String((e && e.message) || e), stack: "" } });
-    \\  }
+    \\      const __vet = __vetResponse();
+    \\      // ── terminal body derivation (response_building.bodyFromReturn +
+    \\      // dispatcher.prependStreamChunks): a returned Uint8Array is RAW BYTES
+    \\      // (base64 through the bundle — `bodyB64` + `binary`); a non-string
+    \\      // non-bytes return is JSON and auto-stamps `content-type:
+    \\      // application/json` unless the handler set its own; a first-hop
+    \\      // terminal after `stream.write` ships the buffered chunks AHEAD of the
+    \\      // body. `__bodyOverride` rides the bundle only when prod's wire body
+    \\      // differs from the plain return value.
+    \\      let __bodyOverride = null;
+    \\      // The bytes prod puts ON THE WIRE — what the worker folds into the
+    \\      // digest's closing element (dispatcher.zig folds `pending.body`, not the
+    \\      // return value). They differ whenever `__bodyOverride` exists, so the
+    \\      // digest has to follow the override rather than the plain result.
+    \\      let __wireBody = "";
+    \\      {
+    \\        if (!__held && !__err) {
+    \\          const isBytes = __result instanceof Uint8Array;
+    \\          let isJson = false, text = null;
+    \\          if (typeof __result === "string") text = __result;
+    \\          else if (__result === undefined || __result === null || isBytes) text = null;
+    \\          else { const j = JSON.stringify(__result); if (j !== undefined) { text = j; isJson = true; } }
+    \\          if (isJson && !("content-type" in __vet.headers)) __vet.headers["content-type"] = "application/json";
+    \\          // First-hop HTTP terminals only — a WS frame goes to the socket and
+    \\          // a resume's chunks are already on the open stream.
+    \\          const frames = (__K === "inbound" || __K === "inbound_headers")
+    \\            ? globalThis.__rove_effects.filter((e) => e.kind === "stream" && !e.rolledBack).map((e) => e.data)
+    \\            : [];
+    \\          const b64 = (u) => { const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let s = ""; for (let i = 0; i < u.length; i += 3) { const b0 = u[i], b1 = i + 1 < u.length ? u[i + 1] : 0, b2 = i + 2 < u.length ? u[i + 2] : 0; s += A[b0 >> 2] + A[((b0 & 3) << 4) | (b1 >> 4)] + (i + 1 < u.length ? A[((b1 & 15) << 2) | (b2 >> 6)] : "=") + (i + 2 < u.length ? A[b2 & 63] : "="); } return s; };
+    \\          if (isBytes && frames.length) {
+    \\            const head = __utf8Encode(frames.join(""));
+    \\            const all = new Uint8Array(head.length + __result.length);
+    \\            all.set(head, 0); all.set(__result, head.length);
+    \\            __bodyOverride = { b64: b64(all) };
+    \\            __wireBody = all;
+    \\          } else if (isBytes) {
+    \\            __bodyOverride = { b64: b64(__result) };
+    \\            __wireBody = __result;
+    \\          } else if (frames.length) {
+    \\            __bodyOverride = { text: frames.join("") + (text === null ? "" : text) };
+    \\            __wireBody = __bodyOverride.text;
+    \\          } else {
+    \\            __wireBody = text === null ? "" : text;
+    \\          }
+    \\        }
+    \\      }
+    \\      // Closed LAST, after every effect has folded — the element that makes the
+    \\      // digest a superset of a status comparison. Status is clamped exactly as
+    \\      // the worker clamps it (dispatcher.zig), so an out-of-range status folds
+    \\      // to the same element on both.
+    \\      if (__dg) {
+    \\        const __st = __held ? 0 : Math.max(100, Math.min(599, __vet && __vet.status !== undefined ? __vet.status : 200));
+    \\        // A THROWN handler's wire body is the "handler threw: …" text set in
+    \\        // the catch above — prod folds `pending.body`, which is that same
+    \\        // text. The body-derivation block below only runs on the success path,
+    \\        // so reading `__wireBody` alone folded an empty body here and made a
+    \\        // throwing activation digest differently from prod's.
+    \\        if (!__held) __dg.response(__st, __err ? String(__result) : __wireBody);
+    \\      }
+    \\      // The outstanding host promises, in creation order — the bundle's
+    \\      // `pending` (the settle address book: `id` is the stable "p<n>" a
+    \\      // chain's next hop names as its settle CHOICE). Promise holds only.
+    \\      const __pendingList = __heldP ? __hp.filter((c) => !c.settled).map((c) => { const e = { id: c.id, kind: c.kind }; if (c.ms !== undefined) e.ms = c.ms; if (c.prefix !== undefined) e.prefix = c.prefix; if (c.fetchId !== undefined) { e.fetchId = c.fetchId; e.url = c.url; } return e; }) : null;
+    \\      let __out;
+    \\      try {
+    \\        __out = JSON.stringify({ response: __vet, result: __result, body_override: __bodyOverride, error: __err, effects: globalThis.__rove_effects, digest: __dg ? __dg.hex() : null, held_pending: __pendingList });
+    \\      } catch (e) {
+    \\        __out = JSON.stringify({ response: __vet, result: null, body_override: __bodyOverride, effects: globalThis.__rove_effects, digest: __dg ? __dg.hex() : null, held_pending: __pendingList,
+    \\          error: { message: "replay result not JSON-serialisable: " + String((e && e.message) || e), stack: "" } });
+    \\      }
+    \\      return __out;
+    \\    };
+    \\    globalThis.__rove_finishHop = __finishHop;
+    \\    // A resume hop is its own recorded activation: fresh effect log, fresh
+    \\    // digest, fresh per-activation counters. The fetch-id counter is NOT
+    \\    // reset — ids stay unique across the chain so a cell's fetchId can
+    \\    // never collide with a later hop's.
+    \\    const __beginHop = (kind) => {
+    \\      __dg = __DG ? new __DG.Digest() : null;
+    \\      __effects = (globalThis.__rove_effects = []);
+    \\      __patchPush(__effects);
+    \\      globalThis.__rove_stream_bytes = 0;
+    \\      globalThis.__rove_email_sends = 0;
+    \\      globalThis.__rove_activation_kind = kind;
+    \\    };
+    \\    const __b64bytes = (b) => { const bin = atob(b); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
+    \\    // Settle a held hop (chain runs only — the host evals
+    \\    // `__rove_runSettle(H)` in the re-entered request, then pumps; the async
+    \\    // tail below completes within that pump and parks the hop's bundle).
+    \\    // H.settle addresses cells by their stable "p<n>" id; the value shapes
+    \\    // mirror the worker's resumeHeldOnce (dispatcher.zig) exactly: a wake
+    \\    // entry {kind, prefix?, firedAt}, a fetch result {status, bytes, text,
+    \\    // headers?, truncated} (or a rejection), an input iterator-result.
+    \\    globalThis.__rove_runSettle = (H) => {
+    \\      const hp = globalThis.__rove_held_promises || [];
+    \\      const byId = (id) => hp.find((c) => c.id === id);
+    \\      const st = H.settle || {};
+    \\      let kind = "wake_batch";
+    \\      if (st.kind === "fetch") kind = "fetch_chunk";
+    \\      else if (st.kind === "input") kind = st.eof ? "disconnect" : "ws_message";
+    \\      __beginHop(kind);
+    \\      try {
+    \\        if (st.kind === "wakes") {
+    \\          for (const e of st.entries || []) {
+    \\            const c = byId(e.id);
+    \\            if (!c || c.settled) throw new Error("resume: no such host promise: " + e.id);
+    \\            c.settled = true;
+    \\            const v = { kind: c.kind === "kv" ? "kv" : "timer", firedAt: e.firedAtMs || 0 };
+    \\            if (c.kind === "kv") v.prefix = c.prefix;
+    \\            c._resolve(v);
+    \\          }
+    \\        } else if (st.kind === "fetch") {
+    \\          const c = st.id ? byId(st.id) : hp.find((x) => x.kind === "fetch" && x.fetchId === st.fetchId && !x.settled);
+    \\          if (!c || c.settled) throw new Error("resume: no such host promise: " + (st.id || st.fetchId));
+    \\          c.settled = true;
+    \\          if (st.reject) {
+    \\            const err = new Error(st.reject);
+    \\            c._reject(err);
+    \\          } else {
+    \\            const bytes = st.bodyB64 != null ? __b64bytes(st.bodyB64) : __utf8Encode(st.body || "");
+    \\            const v = { status: (st.status | 0), bytes: bytes, text: __utf8Decode(bytes), truncated: !!st.truncated };
+    \\            if (st.headers) v.headers = st.headers;
+    \\            c._resolve(v);
+    \\          }
+    \\        } else if (st.kind === "input") {
+    \\          const c = byId(globalThis.__rove_input_pulled);
+    \\          if (!c || c.settled) throw new Error("resume: no pending input pull");
+    \\          c.settled = true;
+    \\          globalThis.__rove_input_pulled = null;
+    \\          if (st.eof) c._resolve({ done: true });
+    \\          else {
+    \\            const f = st.frame || {};
+    \\            const bytes = f.bytesB64 != null ? __b64bytes(f.bytesB64) : __utf8Encode(f.text || "");
+    \\            c._resolve({ value: { opcode: f.opcode == null ? 1 : f.opcode, bytes: bytes, text: __utf8Decode(bytes) }, done: false });
+    \\          }
+    \\        } else {
+    \\          throw new Error("resume: unknown settle kind: " + String(st.kind));
+    \\        }
+    \\      } catch (e) {
+    \\        // A bad settle address is the CALLER's error (a chain world naming a
+    \\        // promise that does not exist / was consumed) — park it loudly
+    \\        // without touching the held handler.
+    \\        __rove_park_output(JSON.stringify({ response: { status: 500, headers: {}, cookies: [] }, result: null, error: { message: String(e), stack: "" }, effects: globalThis.__rove_effects, digest: null, held_pending: null }));
+    \\        return;
+    \\      }
+    \\      (async () => {
+    \\        let out;
+    \\        try {
+    \\          const w = await __settled(globalThis.__rove_hop.outer);
+    \\          out = __finishHop({ result: w.v, err: null, pending: !!w.pending, kind: kind, resume: true });
+    \\        } catch (e) {
+    \\          // The outer promise REJECTED — prod parity with the hop-0 catch:
+    \\          // 500 "handler threw", head discarded, this hop's outputs rolled
+    \\          // back (reads / logs / already-wired stream frames stay).
+    \\          globalThis.response = { status: 500, headers: {}, cookies: [] };
+    \\          for (const __e of globalThis.__rove_effects) {
+    \\            if (__e.kind !== "read" && __e.kind !== "log" && __e.kind !== "stream") __e.rolledBack = true;
+    \\          }
+    \\          out = __finishHop({ result: "handler threw: " + String(e) + "\n", err: { message: String(e), stack: String((e && e.stack) || "") }, pending: false, kind: kind, resume: true });
+    \\        }
+    \\        __rove_park_output(out);
+    \\      })();
+    \\    };
+    \\    const __out = __finishHop({ result: __result, err: __err, pending: __pendingOuter !== null, kind: D.kind, resume: false });
+    \\    globalThis.__rove_hop = { outer: __pendingOuter };
     \\
 ;
 

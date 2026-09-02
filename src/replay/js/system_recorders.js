@@ -386,6 +386,27 @@
     exportRec: 1,
   };
 
+  // ── held-promise cells (src/js/held.zig parity) ──
+  // A bare same-connection arm (`after.ms/kv`, a non-streamed bare
+  // `after.fetch`, a `request.messages` pull) on a HOLDABLE activation
+  // returns a promise the settle hop resolves — the promise flow. The
+  // resolver rides the cell (request-arena memory, like the worker's
+  // Zig-side HostPromise list); `__rove_held_promises` is non-null only
+  // when the driver declared the activation holdable, so on every other
+  // run these return undefined exactly as the worker's bindings do when
+  // `state.host_promises` is null. `id` is the STABLE settle address
+  // ("p<n>", creation order across the whole chain — the sim keeps one
+  // growing table where the worker replaces its per-activation list, so
+  // a chain's settle CHOICE stays unambiguous).
+  var heldProm = function(cell){
+    var hp = globalThis.__rove_held_promises;
+    if (!hp) return undefined;
+    cell.settled = false;
+    var p = new Promise(function(res, rej){ cell._resolve = res; cell._reject = rej; });
+    cell.id = "p" + hp.length;
+    hp.push(cell);
+    return p;
+  };
   globalThis._system = {
     // The park/continue native (`next.js` captures this at base-eval).
     // Mirrors the worker's disposition: target "" = same-module;
@@ -398,6 +419,20 @@
     // reason.
     continuation: {
       next: function(target, o){ return { __rove_disposition: "next", target: (target ? target : null), fn: (o && typeof o.fn === "string") ? o.fn : null, ctx: (o && o.ctx !== undefined) ? o.ctx : null }; },
+    },
+    // The held-request input pull (on.zig jsHeldNextInput parity): one
+    // pending pull at a time; rejects loudly on an activation that
+    // cannot be held. The settle hop resolves it with the iterator
+    // result ({value:{opcode,bytes,text},done:false} or {done:true}).
+    held: {
+      nextInput: function(){
+        var hp = globalThis.__rove_held_promises;
+        if (!hp) return Promise.reject(new Error("request input cannot be awaited on this activation"));
+        if (globalThis.__rove_input_pulled != null) return Promise.reject(new Error("request input is already being awaited (one pull at a time)"));
+        var p = heldProm({ kind: "input" });
+        globalThis.__rove_input_pulled = "p" + (hp.length - 1);
+        return p;
+      },
     },
     crypto: {
       getRandomValues: function(a){ return nat.getRandomValues(a); },
@@ -456,14 +491,23 @@
         checkFetchBody(o);
         var onv = o.on === undefined ? "" : String(o.on);
         if (onv.length > 0 && !isExportName(onv)) throw new TypeError("after.fetch: `on` must be a JS identifier (alphanumeric/underscore/$, first char non-digit)");
-        return recFetch(url, o, o.on || null, true);
+        var id = recFetch(url, o, o.on || null, true);
+        // Promise form (http.zig jsOnFetch parity): a bare NON-STREAMED
+        // after.fetch resolves once with the whole buffered response;
+        // `{on}` keeps the export flow and so does stream:true. The
+        // fetch id rides the promise as `.fetchId`.
+        if (!(o && o.on) && !(o && o.stream)) {
+          var p = heldProm({ kind: "fetch", fetchId: id, url: url });
+          if (p !== undefined) { p.fetchId = id; return p; }
+        }
+        return id;
       },
       // jsOnKv: string prefix required. jsOnTimer: ToInt64(ms) must be > 0
       // (so undefined/NaN/0/negative/fractional-below-1 all throw) — with
       // JS_ToInt64's mod-2^64 wrap, so an overflowing delay (≥ 2^63 wraps
       // negative) throws here exactly as live.
-      kv: function(prefix, o){ if (typeof prefix !== "string") throw new TypeError("after.kv(prefix, opts?) requires a string prefix"); push({ kind: "kv-wake", prefix: prefix, on: (o && o.on) || null }); },
-      timer: function(ms, o){ ms = Number(BigInt.asIntN(64, BigInt(toInt(ms)))); if (ms <= 0) throw new TypeError("after.ms(ms): ms must be > 0"); push({ kind: "timer", ms: ms, on: (o && o.on) || null }); },
+      kv: function(prefix, o){ if (typeof prefix !== "string") throw new TypeError("after.kv(prefix, opts?) requires a string prefix"); push({ kind: "kv-wake", prefix: prefix, on: (o && o.on) || null }); if (!(o && o.on)) return heldProm({ kind: "kv", prefix: prefix }); },
+      timer: function(ms, o){ ms = Number(BigInt.asIntN(64, BigInt(toInt(ms)))); if (ms <= 0) throw new TypeError("after.ms(ms): ms must be > 0"); push({ kind: "timer", ms: ms, on: (o && o.on) || null }); if (!(o && o.on)) return heldProm({ kind: "timer", ms: ms }); },
     },
     blob: {
       // jsBlobPresign (bindings/blob.zig): hash = 64 lowercase hex; a
