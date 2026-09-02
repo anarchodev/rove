@@ -45,6 +45,9 @@ pub const exportFixtureIsFaithful = export_fixture.isFaithfulTranscode;
 /// stays unresolved makes the transcoded world REFUSE that input rather than
 /// replay it as empty.
 pub const exportFixtureOutOfLine = export_fixture.outOfLinePayloads;
+/// Assemble transcoded per-record worlds into ONE chain world — the saga
+/// fold's input (`{"chain":[world0, hop1, …]}` → `runChain`).
+pub const assembleChain = export_fixture.assembleChain;
 pub const OutOfLinePayload = export_fixture.OutOfLine;
 
 // ── the JS-authored test runner (harness reactor + saga library) ──
@@ -787,6 +790,14 @@ pub fn runWorld(
     out: *std.ArrayList(u8),
 ) Error!void {
     if (g_run_engine == null) g_run_engine = try Engine.init();
+    // A CHAIN world (`{"chain":[world0, hop1, …]}` — a transcoded saga, or an
+    // authored fold) folds via `runChain`; a flat world runs once. Sniffed by
+    // an actual parse, not a substring — "chain" can appear in kv data.
+    const sniff = std.json.parseFromSlice(std.json.Value, a, world_json, .{}) catch
+        return Error.BadFixture;
+    if (sniff.value == .object and sniff.value.object.get("chain") != null) {
+        return g_run_engine.?.runChain(a, world_json, source_dir, null, null, out);
+    }
     try g_run_engine.?.simulate(a, world_json, source_dir, null, null, out);
 }
 

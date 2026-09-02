@@ -453,6 +453,14 @@ const EPILOGUE_BODY_HEAD =
     \\  // connection can be held (the worker's `state.host_promises != null`).
     \\  globalThis.__rove_held_promises = D.holdable ? [] : null;
     \\  globalThis.__rove_input_pulled = null;
+    \\  // Per-hop settle addressing (the worker's per-activation promise_idx):
+    \\  // `__rove_hop_n` is the hop ordinal (0 = the inbound hop), and
+    \\  // `__rove_hop_created` counts host promises created THIS hop, in
+    \\  // creation order — the mirror of the worker's per-activation
+    \\  // resolver list, so a recorded promiseIdx/_settled maps to the cell
+    \\  // created at (previous hop, that index).
+    \\  globalThis.__rove_hop_n = 0;
+    \\  globalThis.__rove_hop_created = 0;
     \\  // Captured tapes replay trust-the-tape: recorder checks that depend on
     \\  // harness-seeded state (platform.scope's exists marker) stand down.
     \\  globalThis.__rove_captured = D.captured;
@@ -1020,7 +1028,7 @@ const EPILOGUE_BODY_TAIL =
     \\      // The outstanding host promises, in creation order — the bundle's
     \\      // `pending` (the settle address book: `id` is the stable "p<n>" a
     \\      // chain's next hop names as its settle CHOICE). Promise holds only.
-    \\      const __pendingList = __heldP ? __hp.filter((c) => !c.settled).map((c) => { const e = { id: c.id, kind: c.kind }; if (c.ms !== undefined) e.ms = c.ms; if (c.prefix !== undefined) e.prefix = c.prefix; if (c.fetchId !== undefined) { e.fetchId = c.fetchId; e.url = c.url; } return e; }) : null;
+    \\      const __pendingList = __heldP ? __hp.filter((c) => !c.settled).map((c) => { const e = { id: c.id, kind: c.kind, act: c.act, actIdx: c.actIdx }; if (c.ms !== undefined) e.ms = c.ms; if (c.prefix !== undefined) e.prefix = c.prefix; if (c.fetchId !== undefined) { e.fetchId = c.fetchId; e.url = c.url; } return e; }) : null;
     \\      let __out;
     \\      try {
     \\        __out = JSON.stringify({ response: __vet, result: __result, body_override: __bodyOverride, error: __err, effects: globalThis.__rove_effects, digest: __dg ? __dg.hex() : null, held_pending: __pendingList });
@@ -1042,6 +1050,8 @@ const EPILOGUE_BODY_TAIL =
     \\      globalThis.__rove_stream_bytes = 0;
     \\      globalThis.__rove_email_sends = 0;
     \\      globalThis.__rove_activation_kind = kind;
+    \\      globalThis.__rove_hop_n = (globalThis.__rove_hop_n || 0) + 1;
+    \\      globalThis.__rove_hop_created = 0;
     \\    };
     \\    const __b64bytes = (b) => { const bin = atob(b); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
     \\    // Settle a held hop (chain runs only — the host evals
@@ -1054,6 +1064,10 @@ const EPILOGUE_BODY_TAIL =
     \\    globalThis.__rove_runSettle = (H) => {
     \\      const hp = globalThis.__rove_held_promises || [];
     \\      const byId = (id) => hp.find((c) => c.id === id);
+    \\      // The per-hop address (a recorded fold's spelling): the cell created at
+    \\      // (hop `act`, creation index `idx`) — the worker's per-activation
+    \\      // promiseIdx/_settled mapped onto the sim's cells.
+    \\      const byAddr = (e) => (e.id != null) ? byId(e.id) : hp.find((c) => c.act === e.act && c.actIdx === e.idx);
     \\      const st = H.settle || {};
     \\      let kind = "wake_batch";
     \\      if (st.kind === "fetch") kind = "fetch_chunk";
@@ -1062,16 +1076,18 @@ const EPILOGUE_BODY_TAIL =
     \\      try {
     \\        if (st.kind === "wakes") {
     \\          for (const e of st.entries || []) {
-    \\            const c = byId(e.id);
-    \\            if (!c || c.settled) throw new Error("resume: no such host promise: " + e.id);
+    \\            const c = byAddr(e);
+    \\            if (!c || c.settled) throw new Error("resume: no such host promise: " + (e.id != null ? e.id : "act " + e.act + " idx " + e.idx));
     \\            c.settled = true;
     \\            const v = { kind: c.kind === "kv" ? "kv" : "timer", firedAt: e.firedAtMs || 0 };
     \\            if (c.kind === "kv") v.prefix = c.prefix;
     \\            c._resolve(v);
     \\          }
     \\        } else if (st.kind === "fetch") {
-    \\          const c = st.id ? byId(st.id) : hp.find((x) => x.kind === "fetch" && x.fetchId === st.fetchId && !x.settled);
-    \\          if (!c || c.settled) throw new Error("resume: no such host promise: " + (st.id || st.fetchId));
+    \\          const c = st.id ? byId(st.id)
+    \\            : (st.act != null) ? hp.find((x) => x.act === st.act && x.actIdx === st.idx)
+    \\            : hp.find((x) => x.kind === "fetch" && x.fetchId === st.fetchId && !x.settled);
+    \\          if (!c || c.settled) throw new Error("resume: no such host promise: " + (st.id || st.fetchId || ("act " + st.act + " idx " + st.idx)));
     \\          c.settled = true;
     \\          if (st.reject) {
     \\            const err = new Error(st.reject);

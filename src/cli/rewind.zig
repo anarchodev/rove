@@ -1022,7 +1022,9 @@ fn cmdLogs(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, limit: ?[]
 /// (record + inline tapes via /v1/logs/{tenant}/show/{id}) and its deployment's
 /// handler sources (/v1/sources/{tenant}/{dep_hex}), and write a self-contained
 /// fixture JSON that `rewind replay` re-executes offline forever.
-fn cmdPull(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []const u8, out_file: ?[]const u8) void {
+/// Pull ONE record and transcode it to a world — the shared per-record
+/// half of `pull` and `pull --saga`. Returns the world JSON (arena-owned).
+fn pullWorld(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []const u8) []const u8 {
     // 1. the record (with inline tapes).
     const surl = std.fmt.allocPrint(a, "{s}/v1/logs/{s}/show/{s}", .{ cfg.admin_url, tenant, req_id }) catch c.oom();
     const sr = httpCall(a, cfg, "GET", surl, &.{}, null, true, 30);
@@ -1070,6 +1072,17 @@ fn cmdPull(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []
     emitStr(w, dep_id);
     w.writeAll(",\"activation\":") catch c.oom();
     emitStr(w, jStr(rec_val, "activation") orelse "inbound");
+    // The record's `_settled` engine tag — which host promise this resume's
+    // settle resolved (the chain fold's settle choice). The transcode lifts
+    // it onto the activation bag as `settledPromise`.
+    if (rec.get("tags")) |tv| {
+        if (tv == .object) {
+            if (jStrM(tv.object, "_settled")) |sv| {
+                w.writeAll(",\"settled_promise\":") catch c.oom();
+                emitStr(w, sv);
+            }
+        }
+    }
     w.writeAll(",\"entry\":\"index.mjs\",\"request\":{\"method\":") catch c.oom();
     emitStr(w, jStr(rec_val, "method") orelse "GET");
     w.writeAll(",\"path\":") catch c.oom();
@@ -1156,12 +1169,73 @@ fn cmdPull(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []
     replay.exportFixture(a, bundle, &world) catch |e|
         c.fatal("pull: transcode to world failed: {s}", .{@errorName(e)});
 
+    return world.items;
+}
+
+/// `rewind pull <tenant> <req_id> [-o FILE]` — one record → one world.
+fn cmdPull(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []const u8, out_file: ?[]const u8) void {
+    const world = pullWorld(a, cfg, tenant, req_id);
     if (out_file) |path| {
-        std.fs.cwd().writeFile(.{ .sub_path = path, .data = world.items }) catch |e|
+        std.fs.cwd().writeFile(.{ .sub_path = path, .data = world }) catch |e|
             c.fatal("pull: write {s}: {s}", .{ path, @errorName(e) });
-        std.debug.print("wrote world → {s}  ({s}, dep {s})\n", .{ path, req_id, dep_hex });
+        std.debug.print("wrote world → {s}  ({s})\n", .{ path, req_id });
     } else {
-        std.debug.print("{s}\n", .{world.items});
+        std.debug.print("{s}\n", .{world});
+    }
+}
+
+/// `rewind pull <tenant> --saga <saga_id> [-o FILE]` — every hop of one
+/// saga (`/v1/{tenant}/saga/{id}`, exec_seq order), each pulled and
+/// transcoded, assembled into ONE chain world (`{"chain":[…]}`) that
+/// `rewind replay` folds — the saga fold, the held chain's replay unit.
+fn cmdPullSaga(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, saga_id: []const u8, out_file: ?[]const u8) void {
+    var worlds = std.ArrayList([]const u8){};
+    var after_seq: []const u8 = "0";
+    var pages: usize = 0;
+    while (true) {
+        pages += 1;
+        if (pages > 64) c.fatal("pull --saga: {s} exceeds 64 pages of hops — not a foldable chain", .{saga_id});
+        const url = std.fmt.allocPrint(a, "{s}/v1/{s}/saga/{s}?limit=500&after_seq={s}", .{ cfg.admin_url, tenant, saga_id, after_seq }) catch c.oom();
+        const r = httpCall(a, cfg, "GET", url, &.{}, null, true, 60);
+        if (r.code == 401) c.fatal("not signed in — run `rewind login`", .{});
+        if (r.code == 403) c.fatal("operator-only — log read needs an operator (is_root) session", .{});
+        if (r.code == 404) c.fatal("pull --saga: saga {s} not found for {s}", .{ saga_id, tenant });
+        if (r.code != 200) c.fatal("pull --saga {s}: {d} {s}", .{ saga_id, r.code, c.trunc(r.body) });
+        const p = std.json.parseFromSlice(std.json.Value, a, r.body, .{}) catch
+            c.fatal("pull --saga: response did not parse", .{});
+        if (p.value != .object) c.fatal("pull --saga: response is not an object", .{});
+        const o = p.value.object;
+        // An unstamped hop has no tape position; a chain containing one
+        // cannot be ordered, and order is the whole fold. Loud.
+        if (o.get("unplaced")) |uv| {
+            if (uv == .array and uv.array.items.len > 0)
+                c.fatal("pull --saga: {s} has {d} unplaced hop(s) (no exec_seq) — the chain cannot be ordered", .{ saga_id, uv.array.items.len });
+        }
+        const hops: []const std.json.Value = blk: {
+            const hv = o.get("hops") orelse break :blk &.{};
+            break :blk if (hv == .array) hv.array.items else &.{};
+        };
+        for (hops) |hv| {
+            if (hv != .object) continue;
+            const rid = jStrM(hv.object, "request_id") orelse continue;
+            std.debug.print("pull --saga: hop {d} ← {s}\n", .{ worlds.items.len, rid });
+            worlds.append(a, pullWorld(a, cfg, tenant, rid)) catch c.oom();
+        }
+        // Keyset paging: follow next_cursor.exec_seq until the page is last.
+        const nc = o.get("next_cursor") orelse break;
+        if (nc != .object) break;
+        after_seq = jStrM(nc.object, "exec_seq") orelse break;
+    }
+    if (worlds.items.len == 0) c.fatal("pull --saga: saga {s} has no hops", .{saga_id});
+    var chain = std.ArrayList(u8){};
+    replay.assembleChain(a, worlds.items, &chain) catch |e|
+        c.fatal("pull --saga: chain assembly failed: {s} (see warnings above — an export-flow hop cannot fold)", .{@errorName(e)});
+    if (out_file) |path| {
+        std.fs.cwd().writeFile(.{ .sub_path = path, .data = chain.items }) catch |e|
+            c.fatal("pull --saga: write {s}: {s}", .{ path, @errorName(e) });
+        std.debug.print("wrote chain world → {s}  ({s}, {d} hops)\n", .{ path, saga_id, worlds.items.len });
+    } else {
+        std.debug.print("{s}\n", .{chain.items});
     }
 }
 
@@ -1932,17 +2006,29 @@ pub fn main() void {
         }
         cmdLogs(a, &cfg, rest[0], limit, after);
     } else if (std.mem.eql(u8, verb, "pull")) {
-        if (rest.len < 2) c.fatal("pull needs <tenant> <req_id> [-o FILE]", .{});
+        if (rest.len < 2) c.fatal("pull needs <tenant> <req_id | --saga <saga_id>> [-o FILE]", .{});
         var out_file: ?[]const u8 = null;
-        var j: usize = 2;
+        var saga: ?[]const u8 = null;
+        var req: ?[]const u8 = null;
+        var j: usize = 1;
         while (j < rest.len) : (j += 1) {
             if (std.mem.eql(u8, rest[j], "-o")) {
                 if (j + 1 >= rest.len) c.fatal("-o needs a path", .{});
                 out_file = rest[j + 1];
                 j += 1;
+            } else if (std.mem.eql(u8, rest[j], "--saga")) {
+                if (j + 1 >= rest.len) c.fatal("--saga needs a saga id", .{});
+                saga = rest[j + 1];
+                j += 1;
+            } else if (req == null) {
+                req = rest[j];
             } else c.fatal("pull: unknown option '{s}'", .{rest[j]});
         }
-        cmdPull(a, &cfg, rest[0], rest[1], out_file);
+        if (saga) |sid| {
+            cmdPullSaga(a, &cfg, rest[0], sid, out_file);
+        } else if (req) |rid| {
+            cmdPull(a, &cfg, rest[0], rid, out_file);
+        } else c.fatal("pull needs <req_id> or --saga <saga_id>", .{});
     } else unreachable; // verb validated above (replay handled before loadCfg)
 }
 

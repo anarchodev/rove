@@ -404,6 +404,13 @@
     cell.settled = false;
     var p = new Promise(function(res, rej){ cell._resolve = res; cell._reject = rej; });
     cell.id = "p" + hp.length;
+    // The per-hop address (the worker's per-activation promise_idx): which
+    // hop created this cell, and its index among that hop's creations —
+    // heldProm is the single creation point, so the counter mirrors the
+    // worker's combined resolver list exactly.
+    cell.act = globalThis.__rove_hop_n || 0;
+    cell.actIdx = globalThis.__rove_hop_created || 0;
+    globalThis.__rove_hop_created = (globalThis.__rove_hop_created || 0) + 1;
     hp.push(cell);
     return p;
   };

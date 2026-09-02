@@ -137,6 +137,14 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     };
     const seed = jStr(obj, "seed");
     const ts_ns = jStr(obj, "timestamp_ns");
+    // The record's `_settled` tag (threaded by `rewind pull`): which host
+    // promise of the PREVIOUS activation this resume's settle resolved —
+    // the chain fold's settle CHOICE for fetch/input resumes (a wake
+    // batch's choices ride per-entry `promiseIdx` in the wakes JSON).
+    const settled_promise: ?u32 = blk: {
+        const sp = jStr(obj, "settled_promise") orelse break :blk null;
+        break :blk std.fmt.parseInt(u32, sp, 10) catch null;
+    };
 
     // ── KV: get(ok) → seed the map; prefix → seed the map with the returned
     // rows (so a replay-time re-scan finds them). Closed world: a not_found read
@@ -423,6 +431,13 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         try w.writeAll(",\n    \"fetchId\": ");
         try jsonStr(w, id);
     }
+    // A held fetch resume's settle CHOICE rides the activation bag
+    // (freeform — the epilogue's synthesized fetch bag merges around it).
+    if (std.mem.eql(u8, activation, "fetch_chunk")) {
+        if (settled_promise) |sp| {
+            try w.print(",\n    \"activation\": {{ \"kind\": \"fetch_chunk\", \"settledPromise\": {d} }}", .{sp});
+        }
+    }
     // wake batch → request.activation {kind:"wake_batch", wakes:[…]}
     // (the same bag shape an authored `rewind:test` world carries).
     if (wake_batch_json) |wj| {
@@ -490,6 +505,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
             try w.writeAll("\"data\": ");
             try jsonStr(w, ws_data orelse "");
         }
+        if (settled_promise) |sp| try w.print(", \"settledPromise\": {d}", .{sp});
         try w.writeAll(" }");
     }
     try w.writeAll("\n  }");
@@ -887,6 +903,191 @@ test "transcode: wake_batch activation_bytes -> request.activation.wakes (issue 
     try testing.expectEqual(@as(i64, 1), w1.get("promiseIdx").?.integer);
     // The export-flow entry carries none — absence distinguishes the flows.
     try testing.expect(w0.get("promiseIdx") == null);
+}
+
+// ── the saga fold's chain assembly ─────────────────────────────────────────
+
+/// Assemble transcoded per-record worlds into ONE chain world —
+/// `{"chain":[world0, hop1, …]}` — the saga fold's input (`runChain`;
+/// `docs/architecture/replay-and-sim.md`). `worlds[0]` is the inbound
+/// record's world, verbatim; each later world contributes a settle hop:
+/// its seed/now pins, its kv readset (folded into the chain's overlay
+/// before the settle — the resumed handler re-reads the world that woke
+/// it), and the settle derived from its activation:
+///   - `wake_batch` → `{kind:"wakes"}` entries addressed by the taped
+///     per-entry `promiseIdx` (worker_log.wakesToJson) at the PREVIOUS
+///     hop — the worker's resolver table is per-activation, so
+///     (hop k−1, promiseIdx) names the cell exactly;
+///   - `fetch_chunk` → `{kind:"fetch"}` addressed by the record's
+///     `_settled` tag (`settledPromise` on the bag), with the recorded
+///     status/body/truncated as the resolve value;
+///   - `ws_message` → an input frame; `disconnect` → input eof.
+/// A hop the promise flow cannot express — an export-flow wake entry
+/// (no `promiseIdx`), a fetch resume with no `_settled` — fails LOUD:
+/// folding it as a guess would replay a chain prod never ran.
+pub fn assembleChain(
+    a: std.mem.Allocator,
+    worlds: []const []const u8,
+    out: *std.ArrayList(u8),
+) Error!void {
+    if (worlds.len == 0) return Error.BadFixture;
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, out);
+    defer out.* = aw.toArrayList();
+    const w = &aw.writer;
+    try w.writeAll("{\"chain\":[");
+    try w.writeAll(worlds[0]);
+    for (worlds[1..], 1..) |wj, k| {
+        try w.writeAll(",");
+        const parsed = std.json.parseFromSlice(std.json.Value, a, wj, .{}) catch
+            return Error.BadFixture;
+        if (parsed.value != .object) return Error.BadFixture;
+        const o = parsed.value.object;
+        const kind = jStr(o, "activation") orelse return Error.BadFixture;
+        const req: ?std.json.ObjectMap = if (o.get("request")) |rv|
+            (if (rv == .object) rv.object else null)
+        else
+            null;
+        const bag: ?std.json.ObjectMap = blk: {
+            const r = req orelse break :blk null;
+            const av = r.get("activation") orelse break :blk null;
+            break :blk if (av == .object) av.object else null;
+        };
+
+        try w.writeAll("{\"settle\":");
+        if (std.mem.eql(u8, kind, "wake_batch")) {
+            const wakes: []const std.json.Value = blk: {
+                const b = bag orelse break :blk &.{};
+                const wv = b.get("wakes") orelse break :blk &.{};
+                break :blk if (wv == .array) wv.array.items else &.{};
+            };
+            try w.writeAll("{\"kind\":\"wakes\",\"entries\":[");
+            for (wakes, 0..) |wkv, i| {
+                if (i != 0) try w.writeByte(',');
+                if (wkv != .object) return Error.BadFixture;
+                const pi = wkv.object.get("promiseIdx") orelse {
+                    std.log.warn("assembleChain: hop {d} wake entry has no promiseIdx (an export-flow arm) — the chain fold covers the promise flow only", .{k});
+                    return Error.BadFixture;
+                };
+                if (pi != .integer) return Error.BadFixture;
+                const fired: i64 = blk: {
+                    const fv = wkv.object.get("firedAt") orelse break :blk 0;
+                    break :blk if (fv == .integer) fv.integer else 0;
+                };
+                try w.print("{{\"act\":{d},\"idx\":{d},\"firedAtMs\":{d}}}", .{ k - 1, pi.integer, fired });
+            }
+            try w.writeAll("]}");
+        } else if (std.mem.eql(u8, kind, "fetch_chunk")) {
+            const sp = blk: {
+                const b = bag orelse break :blk null;
+                const v = b.get("settledPromise") orelse break :blk null;
+                break :blk if (v == .integer) @as(?i64, v.integer) else null;
+            } orelse {
+                std.log.warn("assembleChain: hop {d} fetch resume has no _settled/settledPromise — record predates the settle-choice tape, or rode the export flow", .{k});
+                return Error.BadFixture;
+            };
+            try w.print("{{\"kind\":\"fetch\",\"act\":{d},\"idx\":{d}", .{ k - 1, sp });
+            if (req) |r| {
+                if (r.get("status")) |sv| if (sv == .integer) try w.print(",\"status\":{d}", .{sv.integer});
+                if (r.get("bodyB64")) |bv| {
+                    if (bv == .string) {
+                        try w.writeAll(",\"bodyB64\":");
+                        try jsonStr(w, bv.string);
+                    }
+                } else if (r.get("body")) |bv| if (bv == .string) {
+                    try w.writeAll(",\"body\":");
+                    try jsonStr(w, bv.string);
+                };
+                if (r.get("bodyTruncated")) |tv| if (tv == .bool and tv.bool) try w.writeAll(",\"truncated\":true");
+            }
+            try w.writeAll("}");
+        } else if (std.mem.eql(u8, kind, "ws_message")) {
+            const b = bag orelse return Error.BadFixture;
+            const op: i64 = blk: {
+                const v = b.get("opcode") orelse break :blk 1;
+                break :blk if (v == .integer) v.integer else 1;
+            };
+            try w.print("{{\"kind\":\"input\",\"frame\":{{\"opcode\":{d}", .{op});
+            if (b.get("dataB64")) |dv| {
+                if (dv == .string) {
+                    try w.writeAll(",\"bytesB64\":");
+                    try jsonStr(w, dv.string);
+                }
+            } else if (b.get("data")) |dv| if (dv == .string) {
+                try w.writeAll(",\"text\":");
+                try jsonStr(w, dv.string);
+            };
+            try w.writeAll("}}");
+        } else if (std.mem.eql(u8, kind, "disconnect")) {
+            try w.writeAll("{\"kind\":\"input\",\"eof\":true}");
+        } else {
+            std.log.warn("assembleChain: hop {d} activation '{s}' has no promise-flow settle — the fold cannot express it", .{ k, kind });
+            return Error.BadFixture;
+        }
+
+        // The hop's determinism pins + its readset (folded into the chain
+        // overlay before the settle).
+        const seed: i64 = blk: {
+            const v = o.get("seed") orelse break :blk 0;
+            break :blk if (v == .integer) v.integer else 0;
+        };
+        const now_ms: i64 = blk: {
+            const v = o.get("now_ms") orelse break :blk 0;
+            break :blk if (v == .integer) v.integer else 0;
+        };
+        try w.print(",\"seed\":{d},\"now_ms\":{d}", .{ seed, now_ms });
+        if (o.get("kv")) |kvv| {
+            if (kvv == .object and kvv.object.count() > 0) {
+                try w.writeAll(",\"kv\":");
+                try std.json.Stringify.value(kvv, .{}, w);
+            }
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}");
+}
+
+test "assembleChain: inbound + wake_batch(promiseIdx) + ws frame + eof -> settle hops" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const w0 = "{\"entry\":\"index.mjs\",\"activation\":\"inbound\",\"seed\":7,\"now_ms\":1000}";
+    const w1 = "{\"activation\":\"wake_batch\",\"seed\":8,\"now_ms\":6000,\"kv\":{\"watch/flag\":\"lit\"},\"request\":{\"activation\":{\"kind\":\"wake_batch\",\"wakes\":[{\"kind\":\"timer\",\"firedAt\":6000,\"promiseIdx\":0}]}}}";
+    const w2 = "{\"activation\":\"ws_message\",\"seed\":9,\"now_ms\":6100,\"request\":{\"activation\":{\"opcode\":1,\"data\":\"hi\"}}}";
+    const w3 = "{\"activation\":\"disconnect\",\"seed\":10,\"now_ms\":6200}";
+
+    var out = std.ArrayList(u8){};
+    try assembleChain(a, &.{ w0, w1, w2, w3 }, &out);
+
+    const p = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    const chain = p.value.object.get("chain").?.array.items;
+    try testing.expectEqual(@as(usize, 4), chain.len);
+    // hop 1: the wake settle, addressed at (hop 0, promiseIdx 0).
+    const h1 = chain[1].object;
+    const st1 = h1.get("settle").?.object;
+    try testing.expectEqualStrings("wakes", st1.get("kind").?.string);
+    const e0 = st1.get("entries").?.array.items[0].object;
+    try testing.expectEqual(@as(i64, 0), e0.get("act").?.integer);
+    try testing.expectEqual(@as(i64, 0), e0.get("idx").?.integer);
+    try testing.expectEqual(@as(i64, 6000), e0.get("firedAtMs").?.integer);
+    try testing.expectEqual(@as(i64, 8), h1.get("seed").?.integer);
+    try testing.expectEqualStrings("lit", h1.get("kv").?.object.get("watch/flag").?.string);
+    // hop 2: the frame; hop 3: eof.
+    const st2 = chain[2].object.get("settle").?.object;
+    try testing.expectEqualStrings("input", st2.get("kind").?.string);
+    try testing.expectEqualStrings("hi", st2.get("frame").?.object.get("text").?.string);
+    const st3 = chain[3].object.get("settle").?.object;
+    try testing.expect(st3.get("eof").?.bool);
+}
+
+test "assembleChain: an export-flow wake entry (no promiseIdx) refuses loud" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w0 = "{\"entry\":\"index.mjs\",\"activation\":\"inbound\"}";
+    const w1 = "{\"activation\":\"wake_batch\",\"request\":{\"activation\":{\"kind\":\"wake_batch\",\"wakes\":[{\"kind\":\"timer\",\"firedAt\":5}]}}}";
+    var out = std.ArrayList(u8){};
+    try testing.expectError(Error.BadFixture, assembleChain(a, &.{ w0, w1 }, &out));
 }
 
 /// A pool-backed ref for these hand-written tapes. The seed stands in for a

@@ -438,7 +438,7 @@ fn runChainScenarios(a: std.mem.Allocator) !void {
         try stdout.writeAll("\n");
         check(out.items, &.{
             "\"disposition\":\"held\"",
-            "\"pending\":[{\"id\":\"p0\",\"kind\":\"timer\",\"ms\":5000}]",
+            "\"pending\":[{\"id\":\"p0\",\"kind\":\"timer\",\"act\":0,\"actIdx\":0,\"ms\":5000}]",
             "\"key\":\"before\"",
             "\"activation\":\"wake_batch\"",
             "\"status\":201",
@@ -486,7 +486,7 @@ fn runChainScenarios(a: std.mem.Allocator) !void {
         try stdout.writeAll(out.items);
         try stdout.writeAll("\n");
         check(out.items, &.{
-            "\"pending\":[{\"id\":\"p0\",\"kind\":\"input\"}]",
+            "\"pending\":[{\"id\":\"p0\",\"kind\":\"input\",\"act\":0,\"actIdx\":0}]",
             "\"activation\":\"ws_message\"",
             "\"activation\":\"disconnect\"",
             "\"key\":\"frames\"",
