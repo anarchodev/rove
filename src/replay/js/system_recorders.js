@@ -440,6 +440,16 @@
         globalThis.__rove_input_pulled = "p" + (hp.length - 1);
         return p;
       },
+      // One chunk pull on a headers-settled streamed fetch (rove#930) —
+      // the worker's jsHeldNextFetchChunk rule: one outstanding pull.
+      nextFetchChunk: function(fid){
+        var hp = globalThis.__rove_held_promises;
+        if (!hp) return Promise.reject(new Error("fetch chunks cannot be awaited on this activation"));
+        if (globalThis.__rove_fetch_pull != null) return Promise.reject(new Error("a fetch chunk is already being awaited (one pull at a time)"));
+        var p = heldProm({ kind: "fetch_chunk", fetchId: String(fid) });
+        globalThis.__rove_fetch_pull = "p" + (hp.length - 1);
+        return p;
+      },
     },
     crypto: {
       getRandomValues: function(a){ return nat.getRandomValues(a); },
@@ -505,7 +515,12 @@
         // fetch id rides the promise as `.fetchId`.
         if (!(o && o.on) && !(o && o.stream)) {
           var p = heldProm({ kind: "fetch", fetchId: id, url: url });
-          if (p !== undefined) { p.fetchId = id; return p; }
+          if (p !== undefined) {
+            p.fetchId = id;
+            // The shim's collector cap (http.zig stamps the same).
+            p.capBytes = (o && o.max_response_chunk_bytes != null) ? o.max_response_chunk_bytes : 262144;
+            return p;
+          }
         }
         return id;
       },

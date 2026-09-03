@@ -1920,6 +1920,10 @@ fn finishContResume(
             hr.resolvers = h.resolvers;
             h.resolvers = &.{};
             hr.input_promise = h.input_promise;
+            if (h.fetch_pull) |fp| {
+                h.fetch_pull = null;
+                worker_mod.attachHeldFetchPull(worker, ctx.ent, fp.id, fp.idx);
+            }
         } else |_| {}
         h.req = null; // the entity already owns the arena
         const synth = worker_mod.synthHeldContinuation(allocator, ctx.cont_path, &h) catch {
@@ -2518,11 +2522,11 @@ fn resumeContinuation(
 /// event is this activation's Msg and rides the fetch tape channel
 /// exactly as the export path's does, so the fold replays it. Owns
 /// `ev`.
-fn resumeHeldFetch(
+pub fn resumeHeldFetch(
     worker: anytype,
     ent: rove.Entity,
     ev: *components_mod.UpstreamFetchEvent,
-    promise_idx: u32,
+    settle: held_mod.Settle,
 ) void {
     const allocator = worker.allocator;
     const server = worker.h2;
@@ -2557,17 +2561,6 @@ fn resumeHeldFetch(
             if (cnt.pending > 0) cnt.pending -= 1;
         } else |_| {}
     }
-
-    const settle: held_mod.Settle = .{ .fetch = if (ev.seq != 0 or !ev.final) .{
-        .idx = promise_idx,
-        .reject = "await after.fetch cannot consume a streamed response — omit {stream:true} or use the {on} export form",
-    } else .{
-        .idx = promise_idx,
-        .status = ev.terminal_status,
-        .bytes = ev.bytes,
-        .headers_json = ev.fetch_headers orelse "",
-        .truncated = ev.body_truncated,
-    } };
 
     const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
     var txn_owned = true;
@@ -2689,6 +2682,87 @@ fn resumeHeldFetch(
     });
 }
 
+/// The settle a queued-or-arriving stream event produces on the
+/// outstanding pull: a chunk iterator-result, or `{done:true}` with the
+/// terminal fields (rove#930).
+fn chunkSettle(ev: *const components_mod.UpstreamFetchEvent, pull_idx: u32) held_mod.Settle {
+    return .{ .fetch = if (ev.final) .{
+        .idx = pull_idx,
+        .phase = .done,
+        .status = ev.terminal_status,
+        .truncated = ev.body_truncated,
+    } else .{
+        .idx = pull_idx,
+        .phase = .chunk,
+        .bytes = ev.bytes,
+    } };
+}
+
+/// Route one event for a HEADERS-settled streamed fetch: settle the
+/// outstanding pull now, or queue (owned) until the handler pulls.
+/// Owns `ev`.
+pub fn routeHeldFetchStreamEvent(
+    worker: anytype,
+    ent: rove.Entity,
+    stream_idx: usize,
+    ev: *components_mod.UpstreamFetchEvent,
+) void {
+    const server = worker.h2;
+    const hr = server.reg.get(ent, worker.parked_continuations, components_mod.HeldRequest) catch {
+        components_mod.UpstreamFetchEvent.deinitItem(ev, worker.allocator);
+        return;
+    };
+    const fs = &hr.fetch_streams[stream_idx];
+    if (fs.pull) |pidx| {
+        fs.pull = null;
+        worker_mod.resumeHeldFetchDispatch(worker, ent, ev, chunkSettle(ev, pidx));
+        return;
+    }
+    fs.queue.append(worker.allocator, ev.*) catch {
+        components_mod.UpstreamFetchEvent.deinitItem(ev, worker.allocator);
+        std.log.warn("rove-js held-fetch: chunk queue append failed fetch_id={s} — chunk dropped", .{ev.fetch_id});
+        return;
+    };
+    ev.* = .{}; // ownership moved into the queue
+}
+
+/// Deliver ONE queued chunk to every stream whose handler is awaiting a
+/// pull — the tick-time pump pairing `routeHeldFetchStreamEvent`'s queue
+/// (a pull ATTACHES between resumes, so delivery cannot always happen at
+/// event arrival). One event per stream per tick keeps a resume from
+/// starving its siblings.
+pub fn pumpHeldFetchStreams(worker: anytype) void {
+    const server = worker.h2;
+    const ents = worker.parked_continuations.entitySlice();
+    if (ents.len == 0) return;
+    var buf: [64]rove.Entity = undefined;
+    var n: usize = 0;
+    for (ents) |ent| {
+        if (n == buf.len) break;
+        const hr = server.reg.get(ent, worker.parked_continuations, components_mod.HeldRequest) catch continue;
+        if (hr.req == null) continue;
+        for (hr.fetch_streams) |*fs| {
+            if (fs.pull != null and fs.queue.items.len > 0) {
+                buf[n] = ent;
+                n += 1;
+                break;
+            }
+        }
+    }
+    for (buf[0..n]) |ent| {
+        const hr = server.reg.get(ent, worker.parked_continuations, components_mod.HeldRequest) catch continue;
+        for (hr.fetch_streams) |*fs| {
+            if (fs.pull) |pidx| {
+                if (fs.queue.items.len == 0) continue;
+                fs.pull = null;
+                var evt = fs.queue.orderedRemove(0);
+                worker_mod.resumeHeldFetchDispatch(worker, ent, &evt, chunkSettle(&evt, pidx));
+                break; // one per entity per tick; the resume may reshape the entity
+            }
+        }
+    }
+}
+
 /// The bound-fetch resume engine (the streaming substrate,
 /// `docs/architecture/routing-and-ingress.md`; handler surface in
 /// `docs/handler-shape.md` §5.5). Sibling of `resumeContinuation`:
@@ -2732,10 +2806,46 @@ pub fn resumeBoundFetchChain(
         worker_mod.fireFetchEventActivation(worker, ev, null);
         return;
     }
-    // A chain parked by promise settles its awaited fetch (`held.zig`).
+    // A HEADERS-settled streamed fetch consumes its chunks by PULL
+    // (rove#930): settle the outstanding pull, or queue the event until
+    // the handler pulls again (the WS input-gate analog; bounded
+    // upstream by `max_total_response_bytes`).
+    if (worker_mod.heldFetchStreamIndex(worker, ent, ev.fetch_id)) |si| {
+        deinit_event = false; // the router owns the event now
+        routeHeldFetchStreamEvent(worker, ent, si, ev);
+        return;
+    }
+    // A chain parked by promise settles its awaited fetch (`held.zig`,
+    // the Fetch-API shape): a buffered final event resolves the whole
+    // response; an AUTO-mode headers event (empty seq-0, headers
+    // attached, status stamped) resolves `{status, headers,
+    // complete:false}` and registers the fetch for chunk pulls.
     if (takeHeldFetchPromise(worker, ent, ev.fetch_id)) |pidx| {
         deinit_event = false; // resumeHeldFetch takes ownership
-        resumeHeldFetch(worker, ent, ev, pidx);
+        const is_headers = !ev.final and ev.seq == 0 and ev.bytes.len == 0 and ev.fetch_headers != null;
+        const settle: held_mod.Settle = .{ .fetch = if (is_headers) blk: {
+            worker_mod.registerHeldFetchStream(worker, ent, ev.fetch_id);
+            break :blk .{
+                .idx = pidx,
+                .phase = .headers,
+                .status = ev.terminal_status,
+                .headers_json = ev.fetch_headers orelse "",
+            };
+        } else if (ev.seq != 0 or !ev.final) .{
+            // Unreachable for the promise form (auto mode's chunks route
+            // through the stream above) — a defensive refusal for a
+            // mis-shaped event, never a silent settle.
+            .idx = pidx,
+            .reject = "await after.fetch received a chunk event with no headers settle — mis-shaped transfer",
+        } else .{
+            .idx = pidx,
+            .phase = .whole,
+            .status = ev.terminal_status,
+            .bytes = ev.bytes,
+            .headers_json = ev.fetch_headers orelse "",
+            .truncated = ev.body_truncated,
+        } };
+        resumeHeldFetch(worker, ent, ev, settle);
         return;
     }
     const desc = server.reg.get(ent, worker.parked_continuations, components_mod.ContDescriptor) catch return;

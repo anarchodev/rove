@@ -729,6 +729,10 @@ fn finishWsResume(
             hr.resolvers = hv.resolvers;
             hv.resolvers = &.{};
             hr.input_promise = hv.input_promise;
+            if (hv.fetch_pull) |fp| {
+                hv.fetch_pull = null;
+                worker_mod.attachHeldFetchPull(worker, chain_ent, fp.id, fp.idx);
+            }
             const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, act, rl.method, rl.path, rl.host, chain_ctx.saga_id, p.now_ns, p.exec_seq);
             const wrote = p.ws.ops.items.len > 0;
             const read_version = p.txn.readVersion();
@@ -1063,6 +1067,45 @@ pub fn resumeHeldWsWake(worker: anytype, chain_ent: rove.Entity, conn_ent: rove.
 /// A bound fetch's event on a promise-held WS chain: settle the awaited
 /// fetch promise. Returns false when the fetch is not promise-bound
 /// (export flow — the caller dispatches it normally). Borrows `ev`.
+/// Settle a WS chain's outstanding streamed-fetch chunk pull (rove#930):
+/// the hub routes here for a WS chain (the cont path is
+/// `worker_drain.resumeHeldFetch`). Builds the `fetch_chunk` activation +
+/// Msg from `ev` and resumes through `resumeHeldWs` so frames ship and the
+/// socket lives. Owns `ev`.
+pub fn resumeHeldWsFetchChunk(
+    worker: anytype,
+    chain_ent: rove.Entity,
+    conn_ent: rove.Entity,
+    ev: *components_mod.UpstreamFetchEvent,
+    settle: held_mod.Settle,
+) void {
+    defer components_mod.UpstreamFetchEvent.deinitItem(ev, worker.allocator);
+    const fetch_ev: worker_mod.FetchEvent = .{
+        .fetch_id = ev.fetch_id,
+        .seq = ev.seq,
+        .byte_offset = ev.byte_offset,
+        .bytes = ev.bytes,
+        .headers = ev.fetch_headers orelse "",
+        .final = ev.final,
+        .terminal_status = ev.terminal_status,
+        .terminal_ok = ev.terminal_ok,
+        .body_truncated = ev.body_truncated,
+        .export_name = "",
+        .content_hash = if (ev.content_hash) |*h| h[0..] else "",
+    };
+    resumeHeldWs(worker, chain_ent, conn_ent, settle, .{ .fetch_chunk = .{
+        .id = ev.fetch_id,
+        .seq = ev.seq,
+        .byte_offset = ev.byte_offset,
+        .bytes = ev.bytes,
+        .headers = ev.fetch_headers,
+        .final = ev.final,
+        .terminal_status = if (ev.final) ev.terminal_status else 0,
+        .terminal_ok = if (ev.final) ev.terminal_ok else false,
+        .body_truncated = if (ev.final) ev.body_truncated else false,
+    } }, .fetch_chunk, .{ .fetch = fetch_ev }, "ws-held-fetch-chunk");
+}
+
 fn tryResumeHeldWsFetch(worker: anytype, chain_ent: rove.Entity, conn_ent: rove.Entity, ev: *components_mod.UpstreamFetchEvent) bool {
     const idx = worker_drain.takeHeldFetchPromise(worker, chain_ent, ev.fetch_id) orelse return false;
     if (ev.final) {
@@ -1070,11 +1113,27 @@ fn tryResumeHeldWsFetch(worker: anytype, chain_ent: rove.Entity, conn_ent: rove.
             if (cnt.pending > 0) cnt.pending -= 1;
         } else |_| {}
     }
-    const settle: held_mod.Settle = .{ .fetch = if (ev.seq != 0 or !ev.final) .{
+    // The Fetch-API shape on a WS chain (rove#930), mirroring
+    // `worker_drain.resumeBoundFetchChain`: a buffered final event
+    // resolves the whole response; an AUTO-mode headers event (empty
+    // seq-0 with headers) resolves `{status, headers, complete:false}`
+    // and registers the fetch for chunk pulls; a mis-shaped chunk event
+    // with no headers settle is a defensive reject.
+    const is_headers = !ev.final and ev.seq == 0 and ev.bytes.len == 0 and ev.fetch_headers != null;
+    const settle: held_mod.Settle = .{ .fetch = if (is_headers) blk: {
+        worker_mod.registerHeldFetchStream(worker, chain_ent, ev.fetch_id);
+        break :blk .{
+            .idx = idx,
+            .phase = .headers,
+            .status = ev.terminal_status,
+            .headers_json = ev.fetch_headers orelse "",
+        };
+    } else if (ev.seq != 0 or !ev.final) .{
         .idx = idx,
-        .reject = "await after.fetch cannot consume a streamed response — omit {stream:true} or use the {on} export form",
+        .reject = "await after.fetch received a chunk event with no headers settle — mis-shaped transfer",
     } else .{
         .idx = idx,
+        .phase = .whole,
         .status = ev.terminal_status,
         .bytes = ev.bytes,
         .headers_json = ev.fetch_headers orelse "",
@@ -1317,6 +1376,14 @@ pub fn resumeBoundFetchChainWs(
     conn_ent: rove.Entity,
     ev: *components_mod.UpstreamFetchEvent,
 ) void {
+    // A HEADERS-settled streamed fetch (rove#930) consumes its chunks by
+    // PULL: route through the shared queue/pump (worker_drain), which
+    // dispatches the settle back to the WS finish via the hub. Ownership
+    // of `ev` moves into the router.
+    if (worker_mod.heldFetchStreamIndex(worker, chain_ent, ev.fetch_id)) |si| {
+        worker_drain.routeHeldFetchStreamEvent(worker, chain_ent, si, ev);
+        return;
+    }
     defer components_mod.UpstreamFetchEvent.deinitItem(ev, worker.allocator);
 
     // A chain parked by promise settles its awaited fetch (`held.zig`).

@@ -919,6 +919,7 @@ pub const FetchEngine = struct {
             .allocator = self.allocator,
             .pf = pf.*, // take ownership; caller skips deinit on success
             .stream_mode = pf.stream,
+            .auto_mode = pf.auto,
             .max_chunk = @max(@as(usize, pf.max_response_chunk_bytes), 1),
             .max_total = pf.max_total_response_bytes,
             .effective_total_cap = if (pf.stream)
@@ -1487,6 +1488,14 @@ const FetchCtx = struct {
     /// and treats completion as "subscription ended" rather than
     /// "fetch succeeded."
     held: bool,
+    /// The Fetch-API promise form's AUTO mode (rove#930): buffer when the
+    /// response declares `content-length ≤ max_chunk` (one final event with
+    /// the body), else emit a HEADERS event at end-of-headers and stream
+    /// the chunks. Decided in `onHeaderLineCb` at the blank terminator.
+    auto_mode: bool = false,
+    /// Auto mode resolved to the STREAM path (the headers event went out;
+    /// chunks emit per writeback from seq 1).
+    auto_streaming: bool = false,
 
     /// Raw response header block (libcurl-delivered `Name: value\r\n`
     /// lines + status + blank terminator). Parsed into a JSON object
@@ -1704,8 +1713,8 @@ fn onChunkCb(bytes: []const u8, ctx: ?*anyopaque) blob_curl_multi.WriteAction {
         return if (s.capped) .abort else .consume;
     }
 
-    if (s.stream_mode) {
-        // Stream mode: emit per writeback, split into ≤ max_chunk.
+    if (s.stream_mode or s.auto_streaming) {
+        // Stream(ed) mode: emit per writeback, split into ≤ max_chunk.
         var off: usize = 0;
         while (off < take.len) {
             const end = @min(off + s.max_chunk, take.len);
@@ -1726,13 +1735,74 @@ fn onChunkCb(bytes: []const u8, ctx: ?*anyopaque) blob_curl_multi.WriteAction {
     }
 }
 
-/// Per-header-line callback — accumulates the raw block.
+/// Per-header-line callback — accumulates the raw block. AUTO mode
+/// (rove#930) decides at the blank terminator line: content-length
+/// declared and ≤ the chunk cap → keep buffering (one final event with
+/// the body); absent or larger → emit the HEADERS event NOW — the
+/// settle-at-headers signal is independent of the first body writeback,
+/// so a silent-start SSE stream settles on time — and stream the
+/// chunks. Only a real response block decides (status ≥ 200 skips
+/// 1xx interim blocks; customer fetches never follow redirects).
 fn onHeaderLineCb(line: []const u8, ctx: ?*anyopaque) void {
     const s: *FetchCtx = @ptrCast(@alignCast(ctx.?));
     if (s.failed) return;
     s.headers.appendSlice(s.allocator, line) catch {
         s.failed = true;
+        return;
     };
+    if (s.auto_mode and !s.auto_streaming and std.mem.trimRight(u8, line, "\r\n").len == 0) {
+        const st = s.transfer.statusCode();
+        if (st < 200) return; // 1xx interim block — the real one follows
+        const cl = parseContentLength(s.headers.items);
+        if (cl != null and cl.? <= s.max_chunk) return; // buffered path
+        s.auto_streaming = true;
+        s.effective_total_cap = s.max_total;
+        if (!emitHeadersEvent(s, st)) s.failed = true;
+    }
+}
+
+/// Case-insensitive `content-length` scan over the raw header block.
+fn parseContentLength(block: []const u8) ?u64 {
+    var it = std.mem.splitScalar(u8, block, '\n');
+    while (it.next()) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "content-length")) continue;
+        const v = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        return std.fmt.parseInt(u64, v, 10) catch null;
+    }
+    return null;
+}
+
+/// The AUTO mode's settle-at-headers event: seq 0, empty bytes,
+/// `final: false`, the parsed header object attached, and — uniquely for
+/// a non-final event — the upstream status stamped (`terminal_status`),
+/// since the promise resolves `{status, headers}` from it.
+fn emitHeadersEvent(s: *FetchCtx, status: u16) bool {
+    var headers_json: ?[]u8 = null;
+    if (s.headers.items.len > 0) {
+        headers_json = parseHeadersWireToJson(s.allocator, s.headers.items) catch null;
+    }
+    var ev = buildChunkEvent(
+        s.allocator,
+        &s.pf,
+        s.emitted_seq,
+        s.byte_offset,
+        "",
+        headers_json,
+    ) catch {
+        if (headers_json) |hj| s.allocator.free(hj);
+        return false;
+    };
+    ev.terminal_status = status;
+    s.engine.routeEvent(s.pf.tenant_id, ev) catch |err| {
+        var e = ev;
+        UpstreamFetchEvent.deinitItem(&e, s.allocator);
+        std.log.warn("rove-js fetch_engine: route headers event: {s}", .{@errorName(err)});
+        return false;
+    };
+    s.emitted_seq += 1; // seq 0 is the headers event; chunks start at 1
+    return true;
 }
 
 /// Transfer completion — fires inside `multi.drainCompleted`. Emit
@@ -1767,8 +1837,9 @@ fn onDoneCb(transfer: *blob_curl_multi.Transfer, result: blob_curl_multi.Result,
                 "rove-js fetch_engine: relay terminal NOT delivered tenant={s} id={s}: {s} — held chain cleans up on disconnect",
                 .{ s.pf.tenant_id, s.pf.id, @errorName(err) },
             );
-    } else if (!s.stream_mode) {
-        // ONE event with `final: true` + the body + terminal fields.
+    } else if (!s.stream_mode and !s.auto_streaming) {
+        // ONE event with `final: true` + the body + terminal fields
+        // (the buffered path — plain non-streamed AND auto-under-cap).
         emitFinalWithBody(s, result.status, transport_ok) catch |err|
             std.log.warn(
                 "rove-js fetch_engine: emit final tenant={s} id={s}: {s}",

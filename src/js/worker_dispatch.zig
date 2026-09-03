@@ -2923,6 +2923,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                         .outer = h.outer,
                         .resolvers = h.resolvers,
                         .input_promise = h.input_promise,
+                        // A first-hop pull can name no stream (headers
+                        // settles happen on resumes); the deadline
+                        // backstops it — freed with the outcome below.
                     }) catch {
                         synth.deinit(allocator);
                         break :blk false;

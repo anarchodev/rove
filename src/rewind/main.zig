@@ -524,6 +524,9 @@ fn workerMain(args: *WorkerCtx) !void {
         // in parked_continuations (the pump's readiness signal) within
         // the same tick.
         rjs.pumpInboundChunks(worker);
+        // Deliver queued streamed-fetch chunks to handlers awaiting a pull
+        // (the Fetch-API shape's r.chunks — rove#930).
+        rjs.pumpHeldFetchStreams(worker);
         try rjs.serviceParkedStreams(worker);
         // docs/architecture/websockets.md (piece D): dispatch inbound WS
         // frames (h2 `ws_message_out`) to the held chain's `onMessage` /

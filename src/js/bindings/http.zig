@@ -488,6 +488,12 @@ pub fn jsOnFetch(
             break :promise_blk;
         };
         fetches.items[fetches.items.len - 1].promise_idx = @intCast(promises.items.len - 1);
+        // The Fetch-API shape (rove#930): the engine runs AUTO mode for the
+        // promise form — settle at completion under the chunk cap, else at
+        // headers with chunk pulls. `capBytes` rides the promise so the
+        // shim's `r.text()` collector knows where its rejection line is.
+        fetches.items[fetches.items.len - 1].auto = true;
+        _ = c.JS_SetPropertyStr(ctx, promise, "capBytes", c.JS_NewInt64(ctx, @intCast(fetches.items[fetches.items.len - 1].max_response_chunk_bytes)));
         _ = c.JS_SetPropertyStr(ctx, promise, "fetchId", res); // consumes res
         return promise;
     }

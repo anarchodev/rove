@@ -752,22 +752,43 @@ pub const Dispatcher = struct {
                     c.JS_FreeValue(ctx.raw, rv);
                     break :fetch_blk;
                 }
-                // `{status, bytes, text, headers?, truncated}` — `status`
-                // alone is the success contract (no derived `ok`),
-                // matching the flattened request surface.
+                // The Fetch-API shape (held.zig SettleFetch, rove#930).
+                // `.whole` / `.headers` resolve the FETCH promise with the
+                // raw response the shim wraps as `r`: `{status, headers?,
+                // complete}` plus, for `.whole`, the body in hand.
+                // `.chunk` / `.done` resolve the outstanding CHUNK PULL
+                // with an iterator result — the `request.messages` shape.
                 const obj = c.JS_NewObject(ctx.raw);
-                _ = c.JS_SetPropertyStr(ctx.raw, obj, "status", c.JS_NewInt32(ctx.raw, @intCast(f.status)));
-                _ = c.JS_SetPropertyStr(ctx.raw, obj, "bytes", c.JS_NewUint8ArrayCopy(ctx.raw, f.bytes.ptr, f.bytes.len));
-                _ = c.JS_SetPropertyStr(ctx.raw, obj, "text", c.JS_NewStringLen(ctx.raw, f.bytes.ptr, f.bytes.len));
-                if (f.headers_json.len > 0) {
-                    const h = c.JS_ParseJSON(ctx.raw, f.headers_json.ptr, f.headers_json.len, "headers.json");
-                    if (c.JS_IsException(h)) {
-                        _ = ctx.takeException();
-                    } else {
-                        _ = c.JS_SetPropertyStr(ctx.raw, obj, "headers", h);
-                    }
+                switch (f.phase) {
+                    .whole, .headers => {
+                        _ = c.JS_SetPropertyStr(ctx.raw, obj, "status", c.JS_NewInt32(ctx.raw, @intCast(f.status)));
+                        if (f.headers_json.len > 0) {
+                            const h = c.JS_ParseJSON(ctx.raw, f.headers_json.ptr, f.headers_json.len, "headers.json");
+                            if (c.JS_IsException(h)) {
+                                _ = ctx.takeException();
+                            } else {
+                                _ = c.JS_SetPropertyStr(ctx.raw, obj, "headers", h);
+                            }
+                        }
+                        _ = c.JS_SetPropertyStr(ctx.raw, obj, "complete", if (f.phase == .whole) globals.js_true else globals.js_false);
+                        if (f.phase == .whole) {
+                            _ = c.JS_SetPropertyStr(ctx.raw, obj, "bytes", c.JS_NewUint8ArrayCopy(ctx.raw, f.bytes.ptr, f.bytes.len));
+                            _ = c.JS_SetPropertyStr(ctx.raw, obj, "truncated", if (f.truncated) globals.js_true else globals.js_false);
+                        }
+                    },
+                    .chunk => {
+                        const val = c.JS_NewObject(ctx.raw);
+                        _ = c.JS_SetPropertyStr(ctx.raw, val, "bytes", c.JS_NewUint8ArrayCopy(ctx.raw, f.bytes.ptr, f.bytes.len));
+                        _ = c.JS_SetPropertyStr(ctx.raw, val, "text", c.JS_NewStringLen(ctx.raw, f.bytes.ptr, f.bytes.len));
+                        _ = c.JS_SetPropertyStr(ctx.raw, obj, "value", val);
+                        _ = c.JS_SetPropertyStr(ctx.raw, obj, "done", globals.js_false);
+                    },
+                    .done => {
+                        _ = c.JS_SetPropertyStr(ctx.raw, obj, "done", globals.js_true);
+                        _ = c.JS_SetPropertyStr(ctx.raw, obj, "status", c.JS_NewInt32(ctx.raw, @intCast(f.status)));
+                        _ = c.JS_SetPropertyStr(ctx.raw, obj, "truncated", if (f.truncated) globals.js_true else globals.js_false);
+                    },
                 }
-                _ = c.JS_SetPropertyStr(ctx.raw, obj, "truncated", if (f.truncated) globals.js_true else globals.js_false);
                 var argv1 = [_]c.JSValue{obj};
                 const rv = c.JS_Call(ctx.raw, held.resolvers[f.idx].resolve, globals.js_undefined, 1, &argv1);
                 c.JS_FreeValue(ctx.raw, obj);
@@ -1136,7 +1157,20 @@ fn finishResponse(
             d.allocator.free(resolvers);
             return DispatchError.OutOfMemory;
         };
-        return .{ .held = .{ .outer = pending.held_outer, .resolvers = resolvers, .input_promise = state.input_promise, .tags = tags } };
+        return .{ .held = .{
+            .outer = pending.held_outer,
+            .resolvers = resolvers,
+            .input_promise = state.input_promise,
+            // Ownership of the pull's id transfers to the outcome (the
+            // worker attaches it to the fetch's stream); null it so the
+            // state's own cleanup does not double-free.
+            .fetch_pull = fpblk: {
+                const fp = state.fetch_pull;
+                state.fetch_pull = null;
+                break :fpblk fp;
+            },
+            .tags = tags,
+        } };
     }
 
     // Handler `stream.*` effects (§2.2): a handler that called

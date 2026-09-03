@@ -131,8 +131,28 @@ pub const HeldRequest = struct {
     /// `request.messages` pull). Null ⇒ inbound frames queue on the
     /// connection's input gate until the handler pulls again.
     input_promise: ?u32 = null,
+    /// Streamed fetches this chain consumes by CHUNK PULL (rove#930 —
+    /// the Fetch-API shape's headers-settled fetches). One entry per
+    /// fetch that settled at headers and is not yet done: chunk events
+    /// queue here while the handler is elsewhere (the WS input-gate
+    /// analog, bounded upstream by `max_total_response_bytes`), and
+    /// `pull` names the resolver of an outstanding
+    /// `nextFetchChunk(id)` when the handler is awaiting one.
+    fetch_streams: []FetchStream = &.{},
 
     pub const FetchPromise = struct { id: []u8 = &.{}, idx: u32 = 0 };
+
+    /// One headers-settled streamed fetch: queued (owned) events await
+    /// the handler's next pull.
+    pub const FetchStream = struct {
+        /// Allocator-owned fetch id.
+        id: []u8 = &.{},
+        /// The outstanding pull's resolver index, if the handler is
+        /// awaiting a chunk of THIS fetch right now.
+        pull: ?u32 = null,
+        /// Queued chunk/terminal events, arrival order, each owned.
+        queue: std.ArrayListUnmanaged(UpstreamFetchEvent) = .empty,
+    };
 
     pub fn deinit(allocator: std.mem.Allocator, items: []HeldRequest) void {
         for (items) |*item| {
@@ -142,6 +162,12 @@ pub const HeldRequest = struct {
                 if (fp.id.len > 0) allocator.free(fp.id);
             }
             if (item.fetch_promises.len > 0) allocator.free(item.fetch_promises);
+            for (item.fetch_streams) |*fs| {
+                if (fs.id.len > 0) allocator.free(fs.id);
+                for (fs.queue.items) |*qe| UpstreamFetchEvent.deinitItem(qe, allocator);
+                fs.queue.deinit(allocator);
+            }
+            if (item.fetch_streams.len > 0) allocator.free(item.fetch_streams);
             item.* = .{};
         }
     }

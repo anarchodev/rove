@@ -393,7 +393,8 @@ const AWAIT_TIMER_HANDLER =
 const AWAIT_FETCH_HANDLER =
     \\export default async function () {
     \\  const r = await after.fetch("https://api.example.test/x");
-    \\  kv.set("got", r.status + ":" + r.text);
+    \\  const t = await r.text();
+    \\  kv.set("got", r.status + ":" + t);
     \\  return { status: 200, body: String(r.status) };
     \\}
 ;

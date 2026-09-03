@@ -212,3 +212,54 @@ pub fn jsHeldNextInput(
     }
     return promise;
 }
+
+/// `_system.held.nextFetchChunk(fetchId)` — one chunk pull on a
+/// HEADERS-settled streamed fetch (the Fetch-API shape, rove#930): the
+/// `request.messages` pattern per fetch. Resolves with an iterator
+/// result — `{value:{bytes,text}, done:false}` per chunk,
+/// `{done:true}` at the transfer's end. One outstanding pull per
+/// activation; an activation that cannot be held rejects loudly.
+pub fn jsHeldNextFetchChunk(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const state = globals.getState(ctx);
+    var funcs: [2]c.JSValue = undefined;
+    const promise = c.JS_NewPromiseCapability(ctx, &funcs);
+    if (c.JS_IsException(promise)) return promise;
+    const fail: ?[]const u8 = blk: {
+        if (argc < 1) break :blk "nextFetchChunk requires a fetch id";
+        const promises = state.host_promises orelse break :blk "fetch chunks cannot be awaited on this activation";
+        if (state.fetch_pull != null) break :blk "a fetch chunk is already being awaited (one pull at a time)";
+        var len: usize = 0;
+        const cstr = c.JS_ToCStringLen(ctx, &len, argv[0]);
+        if (cstr == null or len == 0) break :blk "nextFetchChunk requires a fetch id";
+        defer c.JS_FreeCString(ctx, cstr);
+        // The shim pulls with the PROMISE id (`ftch_<hex>` — the value
+        // `after.fetch` returned on `.fetchId`), but the worker keys a
+        // held fetch stream by the event's BARE hex id. Strip the
+        // prefix so `attachHeldFetchPull` matches `registerHeldFetchStream`.
+        const raw_id = @as([*]const u8, @ptrCast(cstr))[0..len];
+        const bare = if (std.mem.startsWith(u8, raw_id, "ftch_")) raw_id["ftch_".len..] else raw_id;
+        const id = state.allocator.dupe(u8, bare) catch break :blk "nextFetchChunk: out of memory";
+        promises.append(state.allocator, .{ .resolve = funcs[0], .reject = funcs[1] }) catch {
+            state.allocator.free(id);
+            break :blk "nextFetchChunk: out of memory";
+        };
+        state.fetch_pull = .{ .id = id, .idx = @intCast(promises.items.len - 1) };
+        break :blk null;
+    };
+    if (fail) |msg| {
+        const err = c.JS_NewError(ctx);
+        _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
+        var argv1 = [_]c.JSValue{err};
+        const rv = c.JS_Call(ctx, funcs[1], js_undefined, 1, &argv1);
+        c.JS_FreeValue(ctx, rv);
+        c.JS_FreeValue(ctx, err);
+        c.JS_FreeValue(ctx, funcs[0]);
+        c.JS_FreeValue(ctx, funcs[1]);
+    }
+    return promise;
+}

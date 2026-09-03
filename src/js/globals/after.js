@@ -24,6 +24,62 @@
 (function () {
   const sys = _system.after;
   const sysHttp = _system.http;
+  const sysHeld = _system.held;
+
+  // The Fetch-API response handle (rove#930): wraps the raw settle value
+  // — `{status, headers, complete, bytes?, truncated?}` — behind one
+  // surface whether the engine buffered the body (content-length under
+  // the chunk cap: `complete: true`, bytes in hand, accessors resolve as
+  // microtasks) or settled at headers (`complete: false`, the body
+  // arrives through chunk pulls). The body is SINGLE-READ (`text()`,
+  // `bytes()`, or iterating `chunks` consumes it — the Fetch posture).
+  // `text()`/`bytes()` REJECT when collection crosses the chunk cap
+  // (`maxChunkBytes`) or the transfer was truncated at the total cap —
+  // a loud error, never a flag to forget; iterate `chunks` for more.
+  function makeFetchResponse(raw, fid, cap) {
+    const complete = raw.complete === true;
+    let served = false;
+    const iter = {
+      next() {
+        if (complete) {
+          if (served || raw.bytes === undefined || raw.bytes.length === 0) return Promise.resolve({ done: true });
+          served = true;
+          return Promise.resolve({ value: { bytes: raw.bytes, text: new TextDecoder().decode(raw.bytes) }, done: false });
+        }
+        return sysHeld.nextFetchChunk(fid);
+      },
+    };
+    iter[Symbol.asyncIterator] = function () { return iter; };
+    async function collect() {
+      if (complete) {
+        if (raw.truncated) throw new Error("after.fetch: response exceeded " + cap + " bytes — iterate r.chunks for a bounded read");
+        return raw.bytes || new Uint8Array(0);
+      }
+      const parts = [];
+      let total = 0;
+      for (;;) {
+        const step = await sysHeld.nextFetchChunk(fid);
+        if (step.done) {
+          if (step.truncated) throw new Error("after.fetch: response truncated at the total cap — iterate r.chunks for a bounded read");
+          break;
+        }
+        total += step.value.bytes.length;
+        if (total > cap) throw new Error("after.fetch: response exceeded " + cap + " bytes — iterate r.chunks for a bounded read");
+        parts.push(step.value.bytes);
+      }
+      const out = new Uint8Array(total);
+      let off = 0;
+      for (const b of parts) { out.set(b, off); off += b.length; }
+      return out;
+    }
+    return {
+      status: raw.status,
+      headers: raw.headers || {},
+      chunks: iter,
+      bytes: () => collect(),
+      text: () => collect().then((u8) => new TextDecoder().decode(u8)),
+    };
+  }
 
 // Fail-loud on retired option spellings (audit batch 3): silence would
 // mean a silently-ignored option — worse than a break, pre-launch.
@@ -137,14 +193,18 @@ function _rejectRenamed(verb, opts, renames) {
      *   door engages it): intermediate chunks are spliced straight onto
      *   the held stream — `{on}` fires only for the first event and the
      *   terminal. Inert on any other fetch.
-     * @returns {Promise<{status:number,bytes:Uint8Array,text:string,headers:Object,truncated:boolean}>|string}
-     *   Without `on`, on a held connection: a promise that resolves once
-     *   with the whole buffered response — `await` it to continue in
-     *   place (`status` alone is the success contract; a streamed
-     *   response rejects — pass `{on}` to consume chunks). The fetch id
-     *   rides the promise as `.fetchId` (for `after.cancel`). With
-     *   `on`, or where the connection cannot be held: the fetch id
-     *   string (`ftch_…`, opaque — compare to `request.fetchId`).
+     * @returns {Promise<{status:number,headers:Object,chunks:AsyncIterable,text:function,bytes:function}>|string}
+     *   Without `on`, on a held connection: a promise resolving with the
+     *   RESPONSE HANDLE `r` — `r.status`/`r.headers` at settle (the
+     *   engine settles at completion when the response declares
+     *   `content-length` under the chunk cap, else at headers);
+     *   `await r.text()` / `await r.bytes()` for the whole body (REJECTS
+     *   past the cap — iterate for more); `for await (const c of
+     *   r.chunks)` piecewise. The body is single-read. `status` alone is
+     *   the success contract. The fetch id rides the promise as
+     *   `.fetchId` (for `after.cancel`). With `on`, or where the
+     *   connection cannot be held: the fetch id string (`ftch_…`,
+     *   opaque — compare to `request.fetchId`).
      * @throws {Error} `code:"rate_limited"` when the per-tenant outbound
      *   rate limit is exhausted (shared with `webhook.send`/`email.send`).
      * @example
@@ -174,7 +234,13 @@ function _rejectRenamed(verb, opts, renames) {
       if (opts.timeoutMs != null) native.timeout_ms = opts.timeoutMs;
       if (opts.maxChunkBytes != null) native.max_response_chunk_bytes = opts.maxChunkBytes;
       if (opts.maxTotalBytes != null) native.max_total_response_bytes = opts.maxTotalBytes;
-      return sys.fetch(url, native);
+      const p = sys.fetch(url, native);
+      if (!(p instanceof Promise)) return p; // export flow: the fetch id
+      const fid = p.fetchId;
+      const cap = p.capBytes;
+      const wrapped = p.then((raw) => makeFetchResponse(raw, fid, cap));
+      wrapped.fetchId = fid; // for after.cancel
+      return wrapped;
     },
 
     /**

@@ -1343,6 +1343,30 @@ class ChainNode extends Node {
       : { opcode: 1, text: String(data) };
     return this._settleHop({ kind: "input", frame: f });
   }
+  /** One streamed-fetch chunk (rove#930): settles the handler's pending
+   *  `r.chunks` pull (a `nextFetchChunk` host promise) with the bytes. */
+  chunk(data, opts = {}) {
+    requirePending(this, "chunk()");
+    if (!this.pending.some((x) => x.kind === "fetch_chunk"))
+      throw new Error("chunk(): the handler is not awaiting a fetch chunk on this hop (pull r.chunks first)");
+    const st = { kind: "fetch", phase: "chunk" };
+    if (data instanceof Uint8Array) st.bodyB64 = b64(data);
+    else st.body = String(data);
+    return this._settleHop(st, opts);
+  }
+
+  /** The streamed fetch's terminal: the pending pull resolves
+   *  `{done:true}` (with the terminal status/truncation), the for-await
+   *  ends, and the handler runs on. */
+  done(opts = {}) {
+    requirePending(this, "done()");
+    if (!this.pending.some((x) => x.kind === "fetch_chunk"))
+      throw new Error("done(): the handler is not awaiting a fetch chunk on this hop");
+    const st = { kind: "fetch", phase: "done", status: opts.status != null ? opts.status : 200 };
+    if (opts.truncated) st.truncated = true;
+    return this._settleHop(st, opts);
+  }
+
   /** Client close: the pending input pull resolves `{done:true}`, the
    *  for-await loop ends, and the handler runs on to its terminal return. */
   close() {
@@ -1358,6 +1382,20 @@ class ChainNode extends Node {
  *  reject it (a response shape the promise cannot carry). */
 class PromiseFetchHandle {
   constructor(node, cell) { this.node = node; this.cell = cell; }
+  /** The STREAMED settle (rove#930): the engine found no content-length
+   *  under the chunk cap and settled at headers — the fetch promise
+   *  resolves `{status, headers, complete:false}` and the body arrives
+   *  through `.chunk(bytes)` hops ended by `.done()`. */
+  headers(response = {}) {
+    const st = {
+      kind: "fetch",
+      id: this.cell.id,
+      phase: "headers",
+      status: response.status != null ? response.status : 200,
+    };
+    if (response.headers) st.headers = response.headers;
+    return this.node._settleHop(st, { now_ms: this.node._seedNow().now + (response.latencyMs || 1) });
+  }
   resolve(response = {}) {
     requireProdReachable("resolve()", { url: this.cell.url, stream: false }, response);
     const st = {

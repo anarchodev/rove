@@ -110,6 +110,7 @@ pub const drainFetchPendingDurability = worker.drainFetchPendingDurability;
 pub const drainPendingBoundResumes = worker.drainPendingBoundResumes;
 pub const sweepParkedContinuations = worker.sweepParkedContinuations;
 pub const pumpInboundChunks = worker.pumpInboundChunks;
+pub const pumpHeldFetchStreams = @import("worker_drain.zig").pumpHeldFetchStreams;
 pub const serviceParkedStreams = worker.serviceParkedStreams;
 pub const serviceWsMessages = worker.serviceWsMessages;
 pub const drainOnLeadershipLoss = worker.drainOnLeadershipLoss;

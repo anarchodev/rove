@@ -453,6 +453,7 @@ const EPILOGUE_BODY_HEAD =
     \\  // connection can be held (the worker's `state.host_promises != null`).
     \\  globalThis.__rove_held_promises = D.holdable ? [] : null;
     \\  globalThis.__rove_input_pulled = null;
+    \\  globalThis.__rove_fetch_pull = null;
     \\  // Per-hop settle addressing (the worker's per-activation promise_idx):
     \\  // `__rove_hop_n` is the hop ordinal (0 = the inbound hop), and
     \\  // `__rove_hop_created` counts host promises created THIS hop, in
@@ -1083,6 +1084,20 @@ const EPILOGUE_BODY_TAIL =
     \\            if (c.kind === "kv") v.prefix = c.prefix;
     \\            c._resolve(v);
     \\          }
+    \\        } else if (st.kind === "fetch" && (st.phase === "chunk" || st.phase === "done")) {
+    \\          // Chunk pulls (the Fetch-API streamed path, rove#930): settle the
+    \\          // outstanding nextFetchChunk pull with an iterator result — the
+    \\          // worker's resumeHeldFetch chunk/done shapes.
+    \\          const c = byId(globalThis.__rove_fetch_pull);
+    \\          if (!c || c.settled) throw new Error("resume: no outstanding fetch chunk pull");
+    \\          c.settled = true;
+    \\          globalThis.__rove_fetch_pull = null;
+    \\          if (st.phase === "done") {
+    \\            c._resolve({ done: true, status: (st.status | 0), truncated: !!st.truncated });
+    \\          } else {
+    \\            const bytes = st.bodyB64 != null ? __b64bytes(st.bodyB64) : __utf8Encode(st.body || "");
+    \\            c._resolve({ value: { bytes: bytes, text: __utf8Decode(bytes) }, done: false });
+    \\          }
     \\        } else if (st.kind === "fetch") {
     \\          const c = st.id ? byId(st.id)
     \\            : (st.act != null) ? hp.find((x) => x.act === st.act && x.actIdx === st.idx)
@@ -1092,9 +1107,17 @@ const EPILOGUE_BODY_TAIL =
     \\          if (st.reject) {
     \\            const err = new Error(st.reject);
     \\            c._reject(err);
+    \\          } else if (st.phase === "headers") {
+    \\            // Settle-at-headers (rove#930): the raw response handle with no
+    \\            // body in hand — the shim's r pulls chunks from here on.
+    \\            const v = { status: (st.status | 0), complete: false };
+    \\            if (st.headers) v.headers = st.headers;
+    \\            c._resolve(v);
     \\          } else {
+    \\            // The buffered whole-body resolve — the raw shape the shim
+    \\            // wraps (`{status, headers?, complete:true, bytes, truncated}`).
     \\            const bytes = st.bodyB64 != null ? __b64bytes(st.bodyB64) : __utf8Encode(st.body || "");
-    \\            const v = { status: (st.status | 0), bytes: bytes, text: __utf8Decode(bytes), truncated: !!st.truncated };
+    \\            const v = { status: (st.status | 0), complete: true, bytes: bytes, truncated: !!st.truncated };
     \\            if (st.headers) v.headers = st.headers;
     \\            c._resolve(v);
     \\          }

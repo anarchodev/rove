@@ -44,13 +44,24 @@ pub const SettleWake = struct {
     fired_at_ms: i64,
 };
 
-/// A bound fetch's terminal event to settle. Resolves resolver `idx`
-/// with `{status, bytes, text, headers?, truncated}` — `status` alone
-/// is the success contract, matching the flattened request surface
-/// (there is no derived `ok`). `reject` non-null rejects instead
-/// (a streamed response cannot be awaited).
+/// A bound fetch's event to settle — the Fetch-API shape (rove#930).
+/// `phase` picks the resolve value:
+///   - `.whole`   — the buffered path (content-length ≤ chunk cap): the
+///     fetch promise resolves once with the complete raw response
+///     `{status, headers?, bytes, complete: true}`; the shim's `r.text()`
+///     is then an already-resolved microtask.
+///   - `.headers` — the streamed path's settle-at-headers: the fetch
+///     promise resolves `{status, headers?, complete: false}`; the body
+///     arrives through chunk pulls.
+///   - `.chunk` / `.done` — settle the outstanding CHUNK PULL
+///     (`_system.held.nextFetchChunk`) with an iterator result
+///     (`{value:{bytes,text}, done:false}` / `{done:true}`), the
+///     `request.messages` pattern per fetch.
+/// `status` alone is the success contract (no derived `ok`). `reject`
+/// non-null rejects the addressed resolver instead.
 pub const SettleFetch = struct {
     idx: u32,
+    phase: enum { whole, headers, chunk, done } = .whole,
     status: u16 = 0,
     bytes: []const u8 = "",
     headers_json: []const u8 = "",
@@ -98,12 +109,22 @@ pub const HeldOutcome = struct {
     /// The resolver awaiting the next connection input (`request.
     /// messages` pull) — at most one outstanding per activation.
     input_promise: ?u32 = null,
+    /// The resolver awaiting the next STREAMED-FETCH chunk
+    /// (`_system.held.nextFetchChunk(fetchId)` — the per-fetch
+    /// `request.messages` pattern, rove#930). At most one outstanding
+    /// per activation; the id names which fetch's chunk settles it.
+    /// Bytes allocator-owned (duped from the JS argument).
+    fetch_pull: ?FetchPull = null,
     /// `tag(k,v)` set during the activation — survives the hold the
     /// way a continuation's tags survive a `next()`.
     tags: []log_mod.Tag = &.{},
 
     pub fn deinit(self: *HeldOutcome, allocator: std.mem.Allocator) void {
         if (self.resolvers.len > 0) allocator.free(self.resolvers);
+        if (self.fetch_pull) |fp| {
+            if (fp.id.len > 0) allocator.free(fp.id);
+            self.fetch_pull = null;
+        }
         for (self.tags) |t| {
             allocator.free(t.key);
             allocator.free(t.value);
@@ -111,6 +132,14 @@ pub const HeldOutcome = struct {
         if (self.tags.len > 0) allocator.free(self.tags);
         self.* = undefined;
     }
+};
+
+/// An outstanding streamed-fetch chunk pull: which fetch, and the
+/// resolver its next chunk (or `{done:true}`) settles.
+pub const FetchPull = struct {
+    /// The fetch id (allocator-owned dupe).
+    id: []u8 = &.{},
+    idx: u32 = 0,
 };
 
 /// What a resume needs from the park. The worker keeps it on the held

@@ -270,6 +270,13 @@ pub const PendingFetch = struct {
     /// `host_promises`. Null for the export flow (`{on}` given, or no
     /// held accumulator).
     promise_idx: ?u32 = null,
+    /// The Fetch-API promise form (rove#930): the engine runs the AUTO
+    /// mode — buffer when the response declares content-length ≤ the
+    /// chunk cap (one final event with the body), else emit a HEADERS
+    /// event at end-of-headers and stream the chunks. Set by the
+    /// binding exactly when the bare promise form claimed the fetch;
+    /// false keeps today's stream/buffered split (the export flow).
+    auto: bool = false,
     /// Customer-facing `name:` override — see
     /// `bindings/http.zig` BuiltFetch.name. Empty → dispatcher
     /// uses `onFetchChunk` (default). Non-empty → dispatcher
@@ -627,6 +634,12 @@ pub const DispatchState = struct {
     /// (`_system.held.nextInput`), if the handler made one. Read by the
     /// dispatcher into `HeldOutcome.input_promise`.
     input_promise: ?u32 = null,
+    /// The outstanding streamed-fetch chunk pull
+    /// (`_system.held.nextFetchChunk` — held.zig `FetchPull`), if the
+    /// handler made one. Read by the dispatcher into
+    /// `HeldOutcome.fetch_pull`; the id is allocator-owned and
+    /// ownership transfers there (nulled on take).
+    fetch_pull: ?held_mod.FetchPull = null,
     /// `stream.*` effects (`docs/handler-shape.md`
     /// §2.2): true once the handler called `stream.start()` or the first
     /// `stream.write()` — the activation opens/continues a streamed
@@ -896,6 +909,12 @@ pub const DispatchState = struct {
         // Gap 2.3: `pending_fetches` is caller-owned (a
         // pointer); cleanup of accumulated entries lives at the
         // caller's defer. DispatchState only borrows.
+        // A chunk pull that never transferred to a held outcome (a
+        // terminal or thrown activation made one) frees here.
+        if (self.fetch_pull) |fp| {
+            if (fp.id.len > 0) self.allocator.free(fp.id);
+            self.fetch_pull = null;
+        }
         self.* = undefined;
     }
 };
@@ -1353,6 +1372,8 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // before `_harden.js` deletes `_system`.
     .{ .path = &.{ "_system", "held" }, .fns = &.{
         .{ .name = "nextInput", .cfunc = on_b.jsHeldNextInput, .argc = 0 },
+        // One chunk pull on a headers-settled streamed fetch (rove#930).
+        .{ .name = "nextFetchChunk", .cfunc = on_b.jsHeldNextFetchChunk, .argc = 1 },
     } },
     .{
         .path = &.{ "_system", "after" },

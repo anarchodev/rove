@@ -1430,6 +1430,25 @@ pub fn resumeHeldBoundFetch(worker: anytype, held_ent: rove.Entity, ev: *compone
     }
 }
 
+/// Settle a promise-held chain's outstanding fetch pull (rove#930), routing
+/// to the WS-aware or plain-drain resume by whether the chain holds a WS
+/// socket. The chunk router + pump (`worker_drain`) dispatch here so a
+/// streamed `after.fetch` consumed inside a WS `for await` loop resumes
+/// through the WS finish (frames ship, the socket lives) rather than the
+/// cont finish. `ev` is consumed by the resume.
+pub fn resumeHeldFetchDispatch(
+    worker: anytype,
+    held_ent: rove.Entity,
+    ev: *components_mod.UpstreamFetchEvent,
+    settle: @import("held.zig").Settle,
+) void {
+    if (worker_ws.wsConnForChain(worker, held_ent)) |conn_ent| {
+        worker_ws.resumeHeldWsFetchChunk(worker, held_ent, conn_ent, ev, settle);
+    } else {
+        worker_drain.resumeHeldFetch(worker, held_ent, ev, settle);
+    }
+}
+
 pub fn Worker(comptime opts: Options) type {
     // rove-js contributes `RaftWait` to every request entity so we can
     // park entities in `raft_pending` without allocating side state.
@@ -4237,6 +4256,56 @@ pub fn synthHeldContinuation(allocator: std.mem.Allocator, module_base: []const 
 /// grows the held entity's id→resolver map by one. On OOM the fetch
 /// still fires but nothing awaits it — the chain falls to the hold
 /// deadline; loud in the log rather than silent.
+/// The index of a held chain's streamed-fetch stream for `fetch_id`
+/// (rove#930), or null. A stream exists from its HEADERS settle until
+/// the entity dies.
+pub fn heldFetchStreamIndex(worker: anytype, ent: rove.Entity, fetch_id: []const u8) ?usize {
+    const server = worker.h2;
+    const hr = server.reg.get(ent, worker.parked_continuations, components_mod.HeldRequest) catch return null;
+    if (hr.req == null) return null;
+    for (hr.fetch_streams, 0..) |*fs, i| {
+        if (fs.id.len > 0 and std.mem.eql(u8, fs.id, fetch_id)) return i;
+    }
+    return null;
+}
+
+/// Register a streamed fetch on the held chain at its HEADERS settle
+/// (rove#930): chunk events for it queue-or-settle from now on.
+/// Best-effort — an alloc failure leaves the fetch unregistered, and
+/// its chunks fall through to the export path's warning.
+pub fn registerHeldFetchStream(worker: anytype, ent: rove.Entity, fetch_id: []const u8) void {
+    const a = worker.allocator;
+    const server = worker.h2;
+    const hr = server.reg.get(ent, worker.parked_continuations, components_mod.HeldRequest) catch return;
+    if (heldFetchStreamIndex(worker, ent, fetch_id) != null) return;
+    const id = a.dupe(u8, fetch_id) catch return;
+    const grown = a.alloc(components_mod.HeldRequest.FetchStream, hr.fetch_streams.len + 1) catch {
+        a.free(id);
+        return;
+    };
+    @memcpy(grown[0..hr.fetch_streams.len], hr.fetch_streams);
+    grown[hr.fetch_streams.len] = .{ .id = id };
+    if (hr.fetch_streams.len > 0) a.free(hr.fetch_streams);
+    hr.fetch_streams = grown;
+}
+
+/// Attach a resume's outstanding chunk pull (`nextFetchChunk`) to its
+/// fetch's stream. Takes ownership of `id`. A pull naming no stream is
+/// a handler pulling a fetch that never settled at headers — nothing
+/// will ever settle it, so it is dropped with a warn (the hold
+/// deadline is the backstop, the same posture as any unresumable park).
+pub fn attachHeldFetchPull(worker: anytype, ent: rove.Entity, id: []u8, idx: u32) void {
+    const a = worker.allocator;
+    defer if (id.len > 0) a.free(id);
+    const server = worker.h2;
+    const hr = server.reg.get(ent, worker.parked_continuations, components_mod.HeldRequest) catch return;
+    const si = heldFetchStreamIndex(worker, ent, id) orelse {
+        std.log.warn("rove-js held-fetch: nextFetchChunk({s}) names no streamed fetch on this chain — the pull can never settle", .{id});
+        return;
+    };
+    hr.fetch_streams[si].pull = idx;
+}
+
 pub fn recordFetchPromise(worker: anytype, ent: rove.Entity, coll: anytype, fetch_id: []const u8, idx: u32) void {
     const server = worker.h2;
     const hr = server.reg.get(ent, coll, components_mod.HeldRequest) catch return;

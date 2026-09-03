@@ -55,17 +55,36 @@ const fired = watch.kvWrite({ "watch/flag": "lit" });
 expect(fired.status).toBe(201);
 expect(JSON.parse(fired.body)).toEqual({ kind: "kv", prefix: "watch/", seen: "lit" });
 
-// (6) await after.fetch: resolve with the whole buffered response…
+// (6) await after.fetch — the Fetch-API shape (rove#930): the whole-body
+// resolve hands the handle; `await r.text()` is a microtask (one hop).
 const sf = scenario({ entry: "fetcher.mjs", now: "2026-07-01T00:00:00Z" });
 const f = sf.hold({ method: "POST", path: "/f?url=" + encodeURIComponent("https://up.test/data") });
 expect(f.disposition).toBe("held");
 expect(f.pending[0].kind).toBe("fetch");
 const got = f.fetch(/up\.test/).resolve({ status: 200, body: "0123456789" });
 expect(got.status).toBe(201);
-expect(JSON.parse(got.body)).toEqual({ status: 200, text: "0123456789", truncated: false, idForm: "obj" });
+expect(JSON.parse(got.body)).toEqual({ status: 200, text: "0123456789", form: "function" });
 
 // …and reject: the awaited promise rejects, the handler has no catch → 500.
 const f2 = sf.hold({ method: "POST", path: "/f?url=" + encodeURIComponent("https://up.test/data") });
 const rej = f2.fetch(/up\.test/).reject("upstream unreachable");
 expect(rej.status).toBe(500);
 expect(rej.body).toMatch(/upstream unreachable/);
+
+// (7) the STREAMED path: settle at headers, then chunk hops, then done —
+// `for await (const c of r.chunks)` consumes them in place.
+const ss = scenario({ entry: "streamer.mjs", now: "2026-07-01T00:00:00Z" });
+const s0 = ss.hold({ method: "POST", path: "/s?url=" + encodeURIComponent("https://up.test/stream") });
+expect(s0.pending[0].kind).toBe("fetch");
+const h = s0.fetch(/up\.test/).headers({ status: 200, headers: { "content-type": "text/event-stream" } });
+expect(h.disposition).toBe("held"); // awaiting the first chunk pull
+expect(h.pending.some((c) => c.kind === "fetch_chunk")).toBe(true);
+const c1 = h.chunk("hello ");
+expect(c1.disposition).toBe("held");
+const c2 = c1.chunk("world");
+const fin = c2.done();
+expect(fin.disposition).toBe("terminal");
+expect(fin.status).toBe(201);
+expect(fin.body).toBe("hello world");
+expect(fin.kv("chunks")).toBe("2");
+expect(fin.kv("head")).toBe("200:text/event-stream");
