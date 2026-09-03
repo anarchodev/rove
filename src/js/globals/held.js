@@ -73,6 +73,24 @@
     configurable: true,
     get: function () {
       const self = this;
+      // STREAMED inbound (rove#931): the body crossed the size cap, so it
+      // was never buffered — each `next()` pulls the runtime for the next
+      // sink chunk (the `request.messages` pattern, one pull at a time),
+      // ending at `{done:true}` when the body finishes. A frame arriving
+      // while the handler is mid-await queues on the input gate.
+      if (self.__rove_streamed) {
+        const it = {
+          next: function () {
+            return sys.nextInput();
+          },
+        };
+        it[Symbol.asyncIterator] = function () {
+          return it;
+        };
+        return it;
+      }
+      // BUFFERED body (≤ cap): the whole payload is in hand — yield it as
+      // one chunk, then end. Uniform surface across both delivery modes.
       const state = { served: false };
       const it = {
         next: function () {

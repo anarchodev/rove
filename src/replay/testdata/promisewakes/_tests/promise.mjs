@@ -71,6 +71,22 @@ const rej = f2.fetch(/up\.test/).reject("upstream unreachable");
 expect(rej.status).toBe(500);
 expect(rej.body).toMatch(/upstream unreachable/);
 
+// (8) STREAMED INBOUND (rove#931): the body crossed the cap, so the
+// default consumes it via `for await request.chunks`; request.text throws.
+const si = scenario({ entry: "echoer.mjs", now: "2026-07-01T00:00:00Z" });
+const b0 = si.hold({ method: "POST", path: "/upload", streamed: true });
+expect(b0.disposition).toBe("held");
+expect(b0.pending[0].kind).toBe("input");
+const b1 = b0.bodyChunk("hello ");
+expect(b1.disposition).toBe("held");
+const b2 = b1.bodyChunk("world");
+const bend = b2.bodyEnd();
+expect(bend.disposition).toBe("terminal");
+expect(bend.status).toBe(201);
+expect(bend.body).toBe("hello world");
+expect(bend.kv("body/chunks")).toBe("2");
+expect(bend.kv("body/bytes")).toBe("11");
+
 // (7) the STREAMED path: settle at headers, then chunk hops, then done —
 // `for await (const c of r.chunks)` consumes them in place.
 const ss = scenario({ entry: "streamer.mjs", now: "2026-07-01T00:00:00Z" });

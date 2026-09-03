@@ -511,6 +511,7 @@ pub const Engine = struct {
             .warnings = header_warnings.items,
             .triggers = trigs,
             .holdable = ropts.holdable,
+            .streamed_body = wv.streamed_body,
         });
         const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
         const entry_z = try a.dupeZ(u8, wv.entry);

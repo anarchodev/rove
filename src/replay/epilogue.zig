@@ -97,6 +97,10 @@ pub const Opts = struct {
     /// `state.host_promises != null`, src/js/held.zig). False for every
     /// plain `simulate` run, which keeps the export flow exactly as before.
     holdable: bool = false,
+    /// The inbound body streams (rove#931): the request carries
+    /// `__rove_streamed`, so `request.chunks` pulls and text/json/bytes
+    /// throw. Driven by a `hold({streamed:true})` scenario.
+    streamed_body: bool = false,
 };
 
 /// A registered kv trigger: the watched key `prefix` + the resolved `module`
@@ -289,6 +293,8 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     try w.writeAll(if (opts.captured) "true" else "false");
     try w.writeAll(",\"holdable\":");
     try w.writeAll(if (opts.holdable) "true" else "false");
+    try w.writeAll(",\"streamedBody\":");
+    try w.writeAll(if (opts.streamed_body) "true" else "false");
     try w.writeAll("};\n");
 
     // ── the fixed reconstruction + invoke + side-channel capture ──
@@ -538,9 +544,20 @@ const EPILOGUE_BODY_HEAD =
     \\      Object.defineProperty(request, name, { enumerable: true, configurable: true, writable: true, value: v });
     \\      return v;
     \\    } });
+    \\  // Streamed inbound (rove#931): the body is not in hand — mark the
+    \\  // request so held.js's `chunks` pulls, and make the whole-body
+    \\  // accessors throw (the worker's globals_request does the same).
+    \\  if (D.streamedBody) {
+    \\    Object.defineProperty(request, "__rove_streamed", { value: true });
+    \\    const __streamThrow = (n) => { throw new TypeError("request body is streamed (over the size cap) — iterate `request.chunks`; `request." + n + "` is unavailable"); };
+    \\    Object.defineProperty(request, "bytes", { enumerable: true, configurable: true, get() { __streamThrow("bytes"); } });
+    \\    Object.defineProperty(request, "text", { enumerable: true, configurable: true, get() { __streamThrow("text"); } });
+    \\    Object.defineProperty(request, "json", { enumerable: true, configurable: true, get() { __streamThrow("json"); } });
+    \\  } else {
     \\  __defPayload("bytes", () => __rawPayload());
     \\  __defPayload("text", () => { const b = __rawPayload(); return b === undefined ? undefined : __utf8Decode(b); });
     \\  __defPayload("json", () => { const t = request.text; return t === undefined ? undefined : JSON.parse(t); });
+    \\  }
     \\  // `request.body` is RETIRED live (globals/request.js) — it exists only
     \\  // on the captured driver so pre-retirement deployments replay their
     \\  // pinned code.
@@ -1072,7 +1089,7 @@ const EPILOGUE_BODY_TAIL =
     \\      const st = H.settle || {};
     \\      let kind = "wake_batch";
     \\      if (st.kind === "fetch") kind = "fetch_chunk";
-    \\      else if (st.kind === "input") kind = st.eof ? "disconnect" : "ws_message";
+    \\      else if (st.kind === "input") kind = st.eof ? "disconnect" : (st.chunk != null ? "inbound_chunk" : "ws_message");
     \\      __beginHop(kind);
     \\      try {
     \\        if (st.kind === "wakes") {
@@ -1127,7 +1144,12 @@ const EPILOGUE_BODY_TAIL =
     \\          c.settled = true;
     \\          globalThis.__rove_input_pulled = null;
     \\          if (st.eof) c._resolve({ done: true });
-    \\          else {
+    \\          else if (st.chunk != null) {
+    \\            // A streamed inbound body chunk (rove#931): {bytes,text}, no opcode.
+    \\            const ck = st.chunk;
+    \\            const bytes = ck.bytesB64 != null ? __b64bytes(ck.bytesB64) : __utf8Encode(ck.text || "");
+    \\            c._resolve({ value: { bytes: bytes, text: __utf8Decode(bytes) }, done: false });
+    \\          } else {
     \\            const f = st.frame || {};
     \\            const bytes = f.bytesB64 != null ? __b64bytes(f.bytesB64) : __utf8Encode(f.text || "");
     \\            c._resolve({ value: { opcode: f.opcode == null ? 1 : f.opcode, bytes: bytes, text: __utf8Decode(bytes) }, done: false });

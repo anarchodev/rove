@@ -113,6 +113,9 @@ pub const World = struct {
     /// `body` holds the raw bytes and the driver delivers them base64 so
     /// `request.bytes` is byte-exact. Set when the world carries `bodyB64`.
     body_is_binary: bool = false,
+    /// The inbound body streams (rove#931): the world drives it as a
+    /// held `default` consuming `request.chunks`. Sets `__rove_streamed`.
+    streamed_body: bool = false,
     /// The world was TRANSCODED FROM A CAPTURE (`export_fixture` stamps it),
     /// not authored. Captured worlds replay pinned deployments, so they keep
     /// the strict read-your-tape posture (a read the original run never made
@@ -206,6 +209,7 @@ const REQ_KEYS = [_][]const u8{
     "method",  "path",       "host",          "ip",       "body",   "bodyB64",
     "status",  "done",       "fetchId",       "chunkSeq", "fetchesPending",
     "bodyTruncated", "activation", "session",  "tenant",   "sagaId",        "headers",
+    "streamedBody",
     // `correlationId` is the retired spelling of `sagaId`, accepted so
     // world.json fixtures authored before the rename still load. Read
     // side only — `export-fixture` and the epilogue emit `sagaId`.
@@ -312,6 +316,10 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
         if (r.get("isRoot")) |iv| {
             if (iv != .bool) return Error.BadWorld;
             w.is_root = iv.bool;
+        }
+        if (r.get("streamedBody")) |sv| {
+            if (sv != .bool) return Error.BadWorld;
+            w.streamed_body = sv.bool;
         }
         if (r.get("body")) |bv| {
             if (bv != .null) w.body = try valueToStr(a, bv);

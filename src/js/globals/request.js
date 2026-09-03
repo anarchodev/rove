@@ -29,6 +29,7 @@
   Object.defineProperty(proto, "text", {
     configurable: true,
     get: function () {
+      if (this.__rove_streamed) throw new TypeError("request body is streamed (over the size cap) — iterate `request.chunks`; `request.text` is unavailable");
       var b = this.bytes;
       if (b === undefined) return undefined;
       var v = new TextDecoder().decode(b);
@@ -39,6 +40,7 @@
   Object.defineProperty(proto, "json", {
     configurable: true,
     get: function () {
+      if (this.__rove_streamed) throw new TypeError("request body is streamed (over the size cap) — iterate `request.chunks`; `request.json` is unavailable");
       var t = this.text;
       if (t === undefined) return undefined;
       var v = JSON.parse(t);

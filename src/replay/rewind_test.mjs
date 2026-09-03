@@ -558,7 +558,12 @@ class Scenario {
    *  handler that returns without holding is simply a one-hop chain. */
   hold(req = {}) {
     const n = this.inbound(req);
-    return new ChainNode(this, [n.world]);
+    const w = n.world;
+    // Streamed inbound (rove#931): the body crossed the size cap, so the
+    // handler consumes it via `for await (const c of request.chunks)`.
+    // The world marks it; `.bodyChunk()`/`.bodyEnd()` settle the pulls.
+    if (req.streamed) { w.request = w.request || {}; w.request.streamedBody = true; delete w.request.body; }
+    return new ChainNode(this, [w]);
   }
 
   /** A headers-first inbound activation → the root node at `onHeaders`. The
@@ -1365,6 +1370,25 @@ class ChainNode extends Node {
     const st = { kind: "fetch", phase: "done", status: opts.status != null ? opts.status : 200 };
     if (opts.truncated) st.truncated = true;
     return this._settleHop(st, opts);
+  }
+
+  /** One streamed inbound body chunk (rove#931): settles the handler's
+   *  pending `request.chunks` pull with the bytes. */
+  bodyChunk(data, opts = {}) {
+    requirePending(this, "bodyChunk()");
+    if (!this.pending.some((x) => x.kind === "input"))
+      throw new Error("bodyChunk(): the handler is not awaiting request.chunks on this hop");
+    const ck = (data instanceof Uint8Array) ? { bytesB64: b64(data) } : { text: String(data) };
+    return this._settleHop({ kind: "input", chunk: ck });
+  }
+
+  /** End of the inbound body: the pending pull resolves `{done:true}`, the
+   *  for-await loop ends, and the handler runs on to its terminal return. */
+  bodyEnd(opts = {}) {
+    requirePending(this, "bodyEnd()");
+    if (!this.pending.some((x) => x.kind === "input"))
+      throw new Error("bodyEnd(): the handler is not awaiting request.chunks on this hop");
+    return this._settleHop({ kind: "input", eof: true });
   }
 
   /** Client close: the pending input pull resolves `{done:true}`, the
