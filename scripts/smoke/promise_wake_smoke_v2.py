@@ -266,24 +266,21 @@ def main() -> int:
             hops = fold_saga(recs, "acme", {"index.mjs": WATCH_SRC})
             check_fold(check, "fold-watch", recs, hops)
 
-        # NOTE: the streamed-fetch PROD-SAGA fold is pending rove#930 step 3.
-        # The Fetch-API shape settles a no-content-length upstream (rove's
-        # own, chunked through the front) at HEADERS and streams the body,
-        # so this saga is hold → headers → chunk… → done. The replay
-        # transcode's fetch model still reduces a fetch to one final event
-        # (its pre-S3c shape); folding the streamed phases needs the
-        # per-hop headers/chunk/done phase mapping (the tape already carries
-        # per-entry headers + status). The LIVE fetch behavior is asserted
-        # in step 7 above, and the promise-flow FOLD is covered by
-        # fold-watch; only the streamed-fetch prod fold waits on the
-        # transcode work. A pinned drive + record, so the follow-up has a
-        # real saga to fold:
+        # The streamed-fetch fold (rove#930 step 3): the Fetch-API shape
+        # settles a no-content-length upstream at HEADERS and streams the
+        # body, so this saga is hold → headers → chunk… → done. The
+        # transcode maps each hop's phase; the fold reproduces every hop.
         if wb_dep:
             r = c.request("acme", f"/fetcher?url={up.quote(bulk_url)}", method="POST",
                           data="{}", headers={"x-rove-correlation-id": "fold-fetch-1"},
                           timeout=30.0)
-            check("fold-fetch chain drove → 201 (fold pending rove#930 step 3)",
-                  r.status == 201, f"got {r.status}")
+            check("fold-fetch chain drove → 201", r.status == 201, f"got {r.status}")
+            recs = fetch_saga(c, "acme", "fold-fetch-1", want_hops=4)
+            check("fold-fetch saga recorded (hold→headers→chunk→done)", bool(recs),
+                  f"got {len(recs) if recs else 0} hops")
+            if recs:
+                hops = fold_saga(recs, "acme", {"index.mjs": FETCHER_SRC})
+                check_fold(check, "fold-fetch", recs, hops)
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")

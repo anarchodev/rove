@@ -2181,13 +2181,17 @@ fn finishContResume(
                     ctx.txn_done.* = true;
                     const st_fail = respb.proposeFailureStatus(perr, 500);
                     resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, st_fail, respb.proposeFailureBody(perr, spec.noun ++ " write replication failed\n")) catch {};
-                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st_fail, .fault, &.{}, &.{}, tapes, ctx.saga_id, &.{}, ctx.act, 0, ctx.exec_seq);
+                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st_fail, .fault, &.{}, &.{}, tapes, ctx.saga_id, c2m.tags, ctx.act, 0, ctx.exec_seq);
                     return;
                 };
                 ctx.txn_owned.* = false;
                 ctx.txn_done.* = true;
-                // The repark hop's tape row: status=0, parked.
-                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 0, .ok, &.{}, &.{}, tapes, ctx.saga_id, &.{}, ctx.act, seq, ctx.exec_seq);
+                // The repark hop's tape row: status=0, parked. It carries
+                // the settle-choice tags (`_settled` — held.zig): a re-held
+                // hop (a fetch headers settle that then holds on a chunk
+                // pull) still records which promise started it, so the fold
+                // is unambiguous. `c2m` owns the tags; captureLog dupes.
+                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 0, .ok, &.{}, &.{}, tapes, ctx.saga_id, c2m.tags, ctx.act, seq, ctx.exec_seq);
                 // The repark bound + staged its connection-scoped fetches
                 // (`proposeAndParkContResume`); a leftover here is a
                 // registration failure it already warned about.
@@ -2217,7 +2221,7 @@ fn finishContResume(
             // this record the hop is unreplayable (a ctx-only accumulating
             // handler hops read-only on EVERY chunk). Status 0 = the
             // parked-hop convention.
-            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 0, .ok, &.{}, &.{}, contTapes(worker, spec.tape, &ctx), ctx.saga_id, &.{}, ctx.act, 0, ctx.exec_seq);
+            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 0, .ok, &.{}, &.{}, contTapes(worker, spec.tape, &ctx), ctx.saga_id, if (desc.cont) |dc| dc.tags else &.{}, ctx.act, 0, ctx.exec_seq);
         },
         .stream => |*s| {
             resumeIntoStream(worker, s, .{

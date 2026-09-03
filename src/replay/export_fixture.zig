@@ -278,6 +278,14 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     var fetch_done: ?bool = null;
     var fetch_id: ?[]const u8 = null;
     var fetch_body: ?[]const u8 = null;
+    // The Fetch-API shape's hop PHASE (rove#930): each streamed hop is its
+    // own record with one fetch-response entry, so the entry's shape names
+    // the phase — `whole` (one buffered final event, seq 0), `headers`
+    // (settle-at-headers: not final, seq 0, headers, no bytes), `chunk`
+    // (not final, seq ≥ 1, bytes), `done` (stream terminal: final, seq ≥ 1,
+    // empty). The fold reads it to build the right settle.
+    var fetch_phase: ?[]const u8 = null;
+    var fetch_headers_json: ?[]const u8 = null;
     if (fetch_resp.len != 0) {
         // Every chunk contributes or the body is a LIE: a partly-spilled
         // multi-chunk fetch concatenated from the carried chunks alone is
@@ -297,7 +305,20 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         const last = fetch_resp[fetch_resp.len - 1];
         fetch_id = last.fetch_id;
         fetch_done = last.final;
-        if (last.final) fetch_status = last.terminal_status;
+        if (last.final) {
+            fetch_status = last.terminal_status;
+            // seq 0 final = the buffered whole-body settle (one hop); a
+            // later-seq final empty event is a stream's terminal.
+            fetch_phase = if (last.seq == 0) "whole" else "done";
+        } else if (last.seq == 0 and last.body_ref_len == 0 and
+            last.headers.len > 0 and !std.mem.eql(u8, last.headers, "{}"))
+        {
+            fetch_phase = "headers";
+            fetch_status = last.terminal_status;
+            fetch_headers_json = last.headers;
+        } else {
+            fetch_phase = "chunk";
+        }
     }
     // The trigger_payload entry: an inbound activation's request body, else a
     // resume's `{"ctx":…}` envelope. Null when the entry names bytes that are
@@ -435,7 +456,16 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     // (freeform — the epilogue's synthesized fetch bag merges around it).
     if (std.mem.eql(u8, activation, "fetch_chunk")) {
         if (settled_promise) |sp| {
-            try w.print(",\n    \"activation\": {{ \"kind\": \"fetch_chunk\", \"settledPromise\": {d} }}", .{sp});
+            try w.print(",\n    \"activation\": {{ \"kind\": \"fetch_chunk\", \"settledPromise\": {d}", .{sp});
+            if (fetch_phase) |ph| {
+                try w.writeAll(", \"fetchPhase\": ");
+                try jsonStr(w, ph);
+            }
+            if (fetch_headers_json) |hj| {
+                try w.writeAll(", \"fetchHeaders\": ");
+                try w.writeAll(hj); // already a JSON object
+            }
+            try w.writeAll(" }");
         }
     }
     // wake batch → request.activation {kind:"wake_batch", wakes:[…]}
@@ -987,9 +1017,26 @@ pub fn assembleChain(
                 std.log.warn("assembleChain: hop {d} fetch resume has no _settled/settledPromise — record predates the settle-choice tape, or rode the export flow", .{k});
                 return Error.BadFixture;
             };
+            // The hop PHASE (rove#930), from the bag: `headers` / `chunk` /
+            // `done` for a streamed fetch, else the buffered whole-body
+            // settle (no phase — runSettle's default fetch arm). Chunk/done
+            // settle the outstanding pull (addressed by the single
+            // __rove_fetch_pull, so no act/idx needed); headers/whole settle
+            // the fetch promise (act/idx).
+            const phase: ?[]const u8 = blk: {
+                const b = bag orelse break :blk null;
+                const v = b.get("fetchPhase") orelse break :blk null;
+                break :blk if (v == .string) v.string else null;
+            };
             try w.print("{{\"kind\":\"fetch\",\"act\":{d},\"idx\":{d}", .{ k - 1, sp });
+            if (phase) |ph| {
+                try w.writeAll(",\"phase\":");
+                try jsonStr(w, ph);
+            }
             if (req) |r| {
                 if (r.get("status")) |sv| if (sv == .integer) try w.print(",\"status\":{d}", .{sv.integer});
+                // A chunk hop carries its bytes; headers/whole/done carry none
+                // here (headers/done have no body; whole's body is below).
                 if (r.get("bodyB64")) |bv| {
                     if (bv == .string) {
                         try w.writeAll(",\"bodyB64\":");
@@ -1000,6 +1047,13 @@ pub fn assembleChain(
                     try jsonStr(w, bv.string);
                 };
                 if (r.get("bodyTruncated")) |tv| if (tv == .bool and tv.bool) try w.writeAll(",\"truncated\":true");
+            }
+            // Settle-at-headers carries the parsed response headers.
+            if (bag) |b| {
+                if (b.get("fetchHeaders")) |hv| if (hv == .object) {
+                    try w.writeAll(",\"headers\":");
+                    try std.json.Stringify.value(hv, .{}, w);
+                };
             }
             try w.writeAll("}");
         } else if (std.mem.eql(u8, kind, "ws_message")) {

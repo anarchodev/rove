@@ -65,9 +65,12 @@ def _run(args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
 
 
 def fetch_saga(c, tenant: str, saga_id: str, want_hops: int, tries: int = 60):
-    """Poll the log-server until the saga shows `want_hops` stamped hops
-    (flushes are async); returns the full per-hop RECORDS in exec_seq order,
-    or None. Refuses a saga with unplaced hops (no exec_seq → no order)."""
+    """Poll the log-server until the saga is COMPLETE — at least `want_hops`
+    stamped hops AND the last hop reached a terminal status (non-zero; a
+    held hop records 0). A fixed count would truncate a chain whose chunk
+    count varies (a streamed fetch splits into however many writebacks).
+    Returns the full per-hop RECORDS in exec_seq order, or None. Refuses a
+    saga with unplaced hops (no exec_seq → no order)."""
     for _ in range(tries):
         sr = c.log_get(f"{tenant}/saga/{saga_id}")
         if sr.status == 200:
@@ -75,7 +78,8 @@ def fetch_saga(c, tenant: str, saga_id: str, want_hops: int, tries: int = 60):
             if body.get("unplaced"):
                 return None
             hops = body.get("hops", [])
-            if len(hops) >= want_hops:
+            done = hops and (hops[-1].get("status") or 0) != 0
+            if len(hops) >= want_hops and done:
                 recs = []
                 for h in hops:
                     rid = h.get("request_id")

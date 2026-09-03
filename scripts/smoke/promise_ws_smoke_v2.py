@@ -190,20 +190,16 @@ def main() -> int:
         # pinned id. Pull it, fold it offline, compare per hop: the frames,
         # the mid-loop timer settle, the fetch settle (via _settled), and
         # the close all replay from the record alone.
-        # NOTE: the WS-conversation fold is pending rove#930 step 3. Under
-        # the Fetch-API shape the `putfetch` frame's fetch settles at
-        # headers and STREAMS its body (a no-content-length upstream), so
-        # the conversation now contains a streamed-fetch hop
-        # (headers→chunk→done) the replay transcode's fetch model cannot
-        # yet fold (it still reduces a fetch to one final event — the
-        # phase mapping is the #930 step-3 item). Every LIVE hop above is
-        # asserted; the promise-flow FOLD is covered by fold-watch in
-        # promise_wake. A pinned drive + record so the follow-up has a
-        # real conversation to fold:
+        # The whole conversation — open, frames, the mid-loop timer, the
+        # streamed write-then-fetch (headers→chunk→done, rove#930 step 3),
+        # close — is ONE saga. Pull it, fold it offline, compare per hop.
         c.spawn_log_server()
         recs = fetch_saga(c, "acme", ws_saga, want_hops=11)
-        check("ws saga recorded (fold pending rove#930 step 3)",
-              bool(recs) and len(recs) >= 11, f"got {len(recs) if recs else 0} hops")
+        check("ws saga recorded", bool(recs) and len(recs) >= 11,
+              f"got {len(recs) if recs else 0} hops")
+        if recs:
+            hops = fold_saga(recs, "acme", {"index.mjs": ITER_SRC})
+            check_fold(check, "fold-ws", recs, hops)
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
