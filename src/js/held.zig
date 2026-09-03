@@ -70,7 +70,7 @@ pub const SettleFetch = struct {
 };
 
 /// The next connection input for a handler iterating `request.messages`
-/// (`for await`): a WS frame resolves the pull promise with
+/// or `request.chunks` (`for await`): a WS frame resolves the pull promise with
 /// `{value: {opcode, bytes, text}, done: false}`; end-of-input
 /// (client close) resolves `{done: true}` so the loop exits and the
 /// handler runs on to its terminal return.
@@ -78,6 +78,11 @@ pub const SettleInput = struct {
     idx: u32,
     payload: union(enum) {
         frame: struct { opcode: u8, bytes: []const u8 },
+        /// A streamed inbound body chunk (rove#931): the body crossed
+        /// the size cap, so `default` runs held and `request.chunks`
+        /// pulls it chunk by chunk — resolves
+        /// `{value: {bytes, text}, done: false}`.
+        chunk: []const u8,
         eof,
     },
 };

@@ -1081,6 +1081,11 @@ fn pullWorld(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: 
                 w.writeAll(",\"settled_promise\":") catch c.oom();
                 emitStr(w, sv);
             }
+            // `_streamed` (rove#931): the inbound body streamed — the
+            // transcode builds the hop-0 world with `streamedBody`.
+            if (jStrM(tv.object, "_streamed")) |_| {
+                w.writeAll(",\"streamed_body\":true") catch c.oom();
+            }
         }
     }
     w.writeAll(",\"entry\":\"index.mjs\",\"request\":{\"method\":") catch c.oom();

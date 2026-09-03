@@ -3585,6 +3585,37 @@ pub fn Worker(comptime opts: Options) type {
             return job;
         }
 
+        /// Streamed-held delivery of a body already fully in hand
+        /// (rove#931): h1 / END_STREAM-with-HEADERS / the classic
+        /// buffering path's undeclared crossing — the stream already
+        /// delivered everything, so there is nothing to attach a sink
+        /// to. The job is fed the whole body up front (one push +
+        /// finish) and the pump slices + settles it like any sink-fed
+        /// upload. No h2 sink reference exists; the worker map holds
+        /// the only one.
+        pub fn armInboundChunkComplete(
+            self: *Self,
+            ent: rove.Entity,
+            cap: u64,
+            tenant_hash: u64,
+            body: []const u8,
+        ) ?*inbound_chunk_mod.Job {
+            const job = inbound_chunk_mod.Job.create(self.allocator, cap, REQUEST_BODY_CAP, tenant_hash) catch
+                return null;
+            job.unref(); // no sink side — drop the create-time sink ref
+            job.held_mode = true;
+            if (body.len > 0 and !inbound_chunk_mod.Sink.push(job, body)) {
+                job.unref();
+                return null;
+            }
+            inbound_chunk_mod.Sink.finish(job);
+            self.inbound_chunk_jobs.put(self.allocator, ent, job) catch {
+                job.unref();
+                return null;
+            };
+            return job;
+        }
+
         /// Attach a streamed-snapshot `BodySink` (ctx = the heap
         /// `box`, refcounted: this sink ref + the `SnapshotStream` component
         /// ref) and park the request entity in `snapshot_streams`. The box is

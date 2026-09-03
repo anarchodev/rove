@@ -479,6 +479,15 @@ pub const Request = struct {
     /// What caused this activation + its per-source payload.
     activation: Activation = .inbound,
 
+    /// The inbound body streams (rove#931): it crossed the plan's size
+    /// cap, so it was never buffered — `default` runs held with an
+    /// empty `body`, the request carries `__rove_streamed` (so
+    /// `request.chunks` pulls chunk by chunk), and the whole-body
+    /// accessors (`bytes`/`text`/`json`) throw a 413-class TypeError
+    /// naming the iterable, never a silent prefix. Meaningful only with
+    /// the `.inbound` activation.
+    streamed_body: bool = false,
+
     /// Rate-limit / plan inputs.
     plan: PlanLimits = .{},
     /// Tracing + tape-replay metadata.

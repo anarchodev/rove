@@ -117,6 +117,18 @@ pub const Job = struct {
     /// Probe miss (`no_onchunk`) on a complete ≤cap body: the head
     /// payload re-dispatches as a classic `.inbound` instead.
     classic_fallback: bool = false,
+    /// Streamed-held delivery (rove#931): the module has no `onChunk` /
+    /// `onHeaders` and the body crossed the cap, so `default` runs HELD
+    /// and each prepared fire settles the chain's `request.chunks` pull
+    /// (`held.SettleInput.chunk`) instead of firing a named export. The
+    /// dispatch walk never consumes the head (`first_fired` stays
+    /// false); the pump owns every settle.
+    held_mode: bool = false,
+    /// Held-mode terminal bookkeeping: the last BYTES fire (done=true,
+    /// non-empty) settled a chunk pull, so the iterator's `{done:true}`
+    /// is still owed — delivered on the NEXT pull, after which the job
+    /// detaches.
+    eof_owed: bool = false,
     /// Dispatch-dead (terminal sent / 413 / fallback consumed): sink
     /// pushes drain so the closing stream can't wedge; nothing fires.
     dead: bool = false,

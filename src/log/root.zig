@@ -60,10 +60,10 @@ pub const Tag = struct {
 pub const MAX_TAGS: usize = 4;
 /// Max ENGINE-populated tags per record, on top of `MAX_TAGS` — the
 /// defensive cap downstream copies apply is `MAX_RECORD_TAGS`, so
-/// engine tags can never silently evict a user's fourth tag. Two:
-/// `_parent` (cross-saga provenance) and `_settled` (a promise
-/// resume's settle choice).
-pub const MAX_ENGINE_TAGS: usize = 2;
+/// engine tags can never silently evict a user's fourth tag. Three:
+/// `_parent` (cross-saga provenance), `_settled` (a promise resume's
+/// settle choice), and `_streamed` (the inbound body streamed).
+pub const MAX_ENGINE_TAGS: usize = 3;
 /// The record-level total: every consumer sizing or capping a record's
 /// tag list uses THIS, never `MAX_TAGS` alone (which bounds only what
 /// `tag` accepts).
@@ -86,6 +86,16 @@ pub const PARENT_SAGA_TAG = "_parent";
 /// off wake resumes. `_`-keys are rejected on the `tag` surface, so it
 /// cannot collide.
 pub const SETTLED_TAG = "_settled";
+
+/// Reserved engine tag: this inbound activation's body STREAMED
+/// (rove#931 — it crossed the plan cap, so `default` ran held with an
+/// empty body and consumed `request.chunks`). Value "1". The held-chain
+/// fold reads it to build the hop-0 world with `streamedBody` (whole-
+/// body accessors throw, `request.chunks` pulls) — without it a
+/// streamed hop-0 replays as an empty buffered body, which diverges the
+/// moment the handler touches the request payload. `_`-keys are
+/// rejected on the `tag` surface, so it cannot collide.
+pub const STREAMED_TAG = "_streamed";
 
 /// Whether a candidate `_parent` value may be stamped. `armed_by`
 /// transits customer-writable `_sched/` state, so an oversized or

@@ -145,6 +145,14 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         const sp = jStr(obj, "settled_promise") orelse break :blk null;
         break :blk std.fmt.parseInt(u32, sp, 10) catch null;
     };
+    // The record's `_streamed` tag (threaded by `rewind pull` as a bool):
+    // this inbound activation's body streamed (rove#931) — the world gets
+    // `request.streamedBody` so replay's whole-body accessors throw and
+    // `request.chunks` pulls, exactly as the live hop's did.
+    const streamed_body: bool = blk: {
+        const v = obj.get("streamed_body") orelse break :blk false;
+        break :blk v == .bool and v.bool;
+    };
 
     // ── KV: get(ok) → seed the map; prefix → seed the map with the returned
     // rows (so a replay-time re-scan finds them). Closed world: a not_found read
@@ -445,6 +453,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         try jsonStr(w, v);
     }
     if (is_root) |b| try w.writeAll(if (b) ",\n    \"isRoot\": true" else ",\n    \"isRoot\": false");
+    if (streamed_body) try w.writeAll(",\n    \"streamedBody\": true");
     // flattened fetch-result surface (fetch_chunk) — no `ok` (see above)
     if (fetch_status) |s| try w.print(",\n    \"status\": {d}", .{s});
     if (fetch_done) |b| try w.writeAll(if (b) ",\n    \"done\": true" else ",\n    \"done\": false");
@@ -466,6 +475,14 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
                 try w.writeAll(hj); // already a JSON object
             }
             try w.writeAll(" }");
+        }
+    }
+    // held-flow inbound chunk (rove#931): the settle choice rides the
+    // bag; its presence is also the held/export discriminator the chain
+    // assembly refuses export-flow (onChunk) hops by.
+    if (std.mem.eql(u8, activation, "inbound_chunk")) {
+        if (settled_promise) |sp| {
+            try w.print(",\n    \"activation\": {{ \"kind\": \"inbound_chunk\", \"settledPromise\": {d} }}", .{sp});
         }
     }
     // wake batch → request.activation {kind:"wake_batch", wakes:[…]}
@@ -953,7 +970,10 @@ test "transcode: wake_batch activation_bytes -> request.activation.wakes (issue 
 ///   - `fetch_chunk` → `{kind:"fetch"}` addressed by the record's
 ///     `_settled` tag (`settledPromise` on the bag), with the recorded
 ///     status/body/truncated as the resolve value;
-///   - `ws_message` → an input frame; `disconnect` → input eof.
+///   - `ws_message` → an input frame; `inbound_chunk` → an input chunk
+///     (rove#931 — bytes from the hop's transcoded body, held-flow only:
+///     the `_settled`-derived bag is the discriminator);
+///     `disconnect` → input eof.
 /// A hop the promise flow cannot express — an export-flow wake entry
 /// (no `promiseIdx`), a fetch resume with no `_settled` — fails LOUD:
 /// folding it as a guess would replay a chain prod never ran.
@@ -1073,6 +1093,37 @@ pub fn assembleChain(
                 try jsonStr(w, dv.string);
             };
             try w.writeAll("}}");
+        } else if (std.mem.eql(u8, kind, "inbound_chunk")) {
+            // Held-flow only (rove#931): the `_settled` tag is the
+            // discriminator — an export-flow onChunk hop cannot fold.
+            const has_sp = blk: {
+                const b = bag orelse break :blk false;
+                const v = b.get("settledPromise") orelse break :blk false;
+                break :blk v == .integer;
+            };
+            if (!has_sp) {
+                std.log.warn("assembleChain: hop {d} inbound_chunk has no _settled/settledPromise — an export-flow (onChunk) hop; the chain fold covers the promise flow only", .{k});
+                return Error.BadFixture;
+            }
+            // The chunk bytes are the hop's request body (the transcode's
+            // trigger_payload lift); settle the outstanding pull with them.
+            try w.writeAll("{\"kind\":\"input\",\"chunk\":{");
+            var wrote_bytes = false;
+            if (req) |r| {
+                if (r.get("bodyB64")) |bv| {
+                    if (bv == .string) {
+                        try w.writeAll("\"bytesB64\":");
+                        try jsonStr(w, bv.string);
+                        wrote_bytes = true;
+                    }
+                } else if (r.get("body")) |bv| if (bv == .string) {
+                    try w.writeAll("\"text\":");
+                    try jsonStr(w, bv.string);
+                    wrote_bytes = true;
+                };
+            }
+            if (!wrote_bytes) try w.writeAll("\"text\":\"\"");
+            try w.writeAll("}}");
         } else if (std.mem.eql(u8, kind, "disconnect")) {
             try w.writeAll("{\"kind\":\"input\",\"eof\":true}");
         } else {
@@ -1134,6 +1185,35 @@ test "assembleChain: inbound + wake_batch(promiseIdx) + ws frame + eof -> settle
     try testing.expectEqualStrings("hi", st2.get("frame").?.object.get("text").?.string);
     const st3 = chain[3].object.get("settle").?.object;
     try testing.expect(st3.get("eof").?.bool);
+}
+
+test "assembleChain: streamed inbound chunk hops -> input chunk settles" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w0 = "{\"entry\":\"index.mjs\",\"activation\":\"inbound\",\"seed\":1,\"now_ms\":1000,\"request\":{\"method\":\"POST\",\"path\":\"/up\",\"streamedBody\":true}}";
+    const w1 = "{\"activation\":\"inbound_chunk\",\"seed\":2,\"now_ms\":1100,\"request\":{\"body\":\"abc\",\"activation\":{\"kind\":\"inbound_chunk\",\"settledPromise\":0}}}";
+    const w2 = "{\"activation\":\"disconnect\",\"seed\":3,\"now_ms\":1200}";
+    var out = std.ArrayList(u8){};
+    try assembleChain(a, &.{ w0, w1, w2 }, &out);
+    const p = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    const chain = p.value.object.get("chain").?.array.items;
+    try testing.expectEqual(@as(usize, 3), chain.len);
+    const h1 = chain[1].object.get("settle").?.object;
+    try testing.expectEqualStrings("input", h1.get("kind").?.string);
+    try testing.expectEqualStrings("abc", h1.get("chunk").?.object.get("text").?.string);
+    const h2j = chain[2].object.get("settle").?.object;
+    try testing.expectEqual(true, h2j.get("eof").?.bool);
+}
+
+test "assembleChain: an export-flow inbound_chunk hop (no settle tag) refuses loud" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w0 = "{\"entry\":\"index.mjs\",\"activation\":\"inbound\",\"seed\":1,\"now_ms\":1000}";
+    const w1 = "{\"activation\":\"inbound_chunk\",\"seed\":2,\"now_ms\":1100,\"request\":{\"body\":\"abc\"}}";
+    var out = std.ArrayList(u8){};
+    try testing.expectError(Error.BadFixture, assembleChain(a, &.{ w0, w1 }, &out));
 }
 
 test "assembleChain: an export-flow wake entry (no promiseIdx) refuses loud" {

@@ -630,6 +630,10 @@ pub const DispatchState = struct {
     /// handler can `await`. Null ⇒ the arms are not awaitable here
     /// (connectionless, or a path without the promise model).
     host_promises: ?*std.ArrayListUnmanaged(held_mod.HostPromise) = null,
+    /// The inbound body streamed (rove#931): mirrored from
+    /// `Request.streamed_body` so the dispatcher can stamp the
+    /// `_streamed` record tag post-handler (the fold's hop-0 marker).
+    streamed_body: bool = false,
     /// The resolver index of THIS activation's `request.messages` pull
     /// (`_system.held.nextInput`), if the handler made one. Read by the
     /// dispatcher into `HeldOutcome.input_promise`.

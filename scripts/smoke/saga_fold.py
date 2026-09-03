@@ -57,6 +57,10 @@ def _fixture(rec: dict, tenant: str, sources: dict[str, str], entry: str) -> dic
     settled = (rec.get("tags") or {}).get("_settled")
     if settled is not None:
         fx["settled_promise"] = str(settled)
+    # `_streamed` (rove#931): the hop-0 body streamed — the transcode
+    # builds its world with `request.streamedBody`.
+    if (rec.get("tags") or {}).get("_streamed") is not None:
+        fx["streamed_body"] = True
     return fx
 
 
@@ -108,14 +112,44 @@ def fetch_saga(c, tenant: str, saga_id: str, want_hops: int, tries: int = 60):
     return None
 
 
+def _resolve_bodies(c, tenant: str, rec: dict) -> dict:
+    """Out-of-line payload resolution — the `rewind pull` door
+    (`GET /v1/{tenant}/body/{request_id}/{channel}/{index}`), smoke-side.
+    A payload over the inline tape cap (a streamed-inbound chunk fire, a
+    large body) lives in the pool; without this the transcode emits a
+    world that REFUSES the input. Best-effort like pull: a refusal
+    leaves the payload out, never fakes it empty."""
+    out: dict = {}
+    rid = rec.get("request_id")
+    for channel in ("trigger_payload",):
+        rr = c.log_get(f"{tenant}/body/{rid}/{channel}/0")
+        if rr.status != 200:
+            continue
+        try:
+            b64 = json.loads(rr.body).get("bytes_b64")
+        except ValueError:
+            b64 = None
+        if b64:
+            out[channel] = {"0": b64}
+    return out
+
+
 def fold_saga(recs: list[dict], tenant: str, sources: dict[str, str],
-              entry: str = "index.mjs") -> list[dict] | None:
-    """Compose → transcode → assemble → fold. Returns the per-hop bundles."""
+              entry: str = "index.mjs", c=None) -> list[dict] | None:
+    """Compose → transcode → assemble → fold. Returns the per-hop bundles.
+    Pass the cluster as `c` to resolve out-of-line payloads through the
+    log-server door (required when any hop's input exceeded the inline
+    tape cap — e.g. streamed-inbound chunk fires)."""
     tmp = Path(tempfile.mkdtemp(prefix="sagafold-"))
     worlds = []
     for i, rec in enumerate(recs):
         fx_path = tmp / f"fx{i}.json"
-        fx_path.write_text(json.dumps(_fixture(rec, tenant, sources, entry)))
+        fx = _fixture(rec, tenant, sources, entry)
+        if c is not None:
+            rb = _resolve_bodies(c, tenant, rec)
+            if rb:
+                fx["resolved_bodies"] = rb
+        fx_path.write_text(json.dumps(fx))
         exp = _run(["export-fixture", str(fx_path)])
         if exp.returncode != 0:
             print(f"  saga-fold: export-fixture hop {i} failed: {exp.stderr.strip()[:300]}")

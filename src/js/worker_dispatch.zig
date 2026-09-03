@@ -632,16 +632,21 @@ fn captureSuccess(
     /// for the read-only commit path (no propose, no seq) and for
     /// the propose-fail downgrade (entry never made it to raft).
     raft_seq: u64,
+    /// Tags for the log: from the continuation when this is a held /
+    /// next() park, else the terminal tags owned by the SuccessRec.
+    /// The CALLER snapshots this BEFORE the park helpers consume
+    /// `s.cont` (they move it onto the entity's ContDescriptor, whose
+    /// storage — or the deferred destroy funnel on the failed-delivery
+    /// arm — keeps the bytes alive until this capture dupes them).
+    /// Deriving it here read `s.cont` after that consumption, so a
+    /// held park's own record captured tag-less and the engine's
+    /// `_streamed`/`_parent` provenance never reached hop 0.
+    tags_for_log: []const log_mod.Tag,
 ) void {
     const console_owned = s.console_owned;
     const exception_owned = s.exception_owned;
     s.console_owned = &.{};
     s.exception_owned = &.{};
-    // Tags for the log: from the continuation if this is a held
-    // next() hop, else the terminal tags owned by the SuccessRec.
-    // BORROWED into the record (duped); we free the terminal copy
-    // after (the continuation copy is freed via `s.cont.deinit`).
-    const tags_for_log: []const log_mod.Tag = if (s.cont) |*ct| ct.tags else s.tags;
     worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, status, outcome, console_owned, exception_owned, s.tapes, s.saga_id, tags_for_log, .inbound, raft_seq, s.exec_seq);
     if (s.cont == null) {
         for (s.tags) |t| {
@@ -720,6 +725,9 @@ fn parkSuccessesOnSiblings(
         // `s.stream` (contRecordIfAny:307 / streamRecordIfAnyAt:421);
         // the move must see the pre-record outcome.
         const route = ParkRoute.of(s);
+        // Snapshot the record's tags while `s.cont` still holds them
+        // (see `captureSuccess`'s tags_for_log contract).
+        const tags_for_log: []const log_mod.Tag = if (s.cont) |*ct| ct.tags else s.tags;
         // The batch propose was ALREADY accepted, so this success's writes
         // commit no matter what happens to its h2 entity — from here the
         // log record is owed unconditionally: the log is the replay/audit
@@ -745,7 +753,7 @@ fn parkSuccessesOnSiblings(
             // handler). The funnel is a no-op on an already-dead entity.
             server.destroyEntity(s.ent) catch {};
         }
-        captureSuccess(worker, anchor_id, s, s.status_code, .ok, seq);
+        captureSuccess(worker, anchor_id, s, s.status_code, .ok, seq, tags_for_log);
     }
     return successes.items.len;
 }
@@ -916,7 +924,7 @@ fn finalizeBatch(
                         "tenant={s} err={s}",
                         .{ anchor_id, @errorName(e2) },
                     );
-                    captureSuccess(worker, anchor_id, s, if (too_large) 413 else 421, .fault, 0);
+                    captureSuccess(worker, anchor_id, s, if (too_large) 413 else 421, .fault, 0, s.tags);
                     processed += 1;
                 }
                 successes.clearRetainingCapacity();
@@ -1038,11 +1046,14 @@ fn finalizeBatch(
             batch_pending_fetches.clearRetainingCapacity();
         }
         for (successes.items) |*s| {
+            // Snapshot the record's tags while `s.cont` still holds
+            // them (see `captureSuccess`'s tags_for_log contract).
+            const tags_for_log: []const log_mod.Tag = if (s.cont) |*ct| ct.tags else s.tags;
             // Trampoline: committed read-only continuation → park,
             // not respond. captured as parked (status 0).
             if (try contParkIfAny(worker, server, allocator, anchor_id, s)) {
                 // Read-only commit — no propose, no seq.
-                captureSuccess(worker, anchor_id, s, 0, .ok, 0);
+                captureSuccess(worker, anchor_id, s, 0, .ok, 0, tags_for_log);
                 processed += 1;
                 continue;
             }
@@ -1052,7 +1063,7 @@ fn finalizeBatch(
             // captured as parked (status 0, same shape as the cont
             // park).
             if (try streamParkIfAny(worker, server, anchor_id, s)) {
-                captureSuccess(worker, anchor_id, s, 0, .ok, 0);
+                captureSuccess(worker, anchor_id, s, 0, .ok, 0, tags_for_log);
                 processed += 1;
                 continue;
             }
@@ -1061,7 +1072,7 @@ fn finalizeBatch(
                 "tenant={s} err={s}",
                 .{ anchor_id, @errorName(err) },
             );
-            captureSuccess(worker, anchor_id, s, s.status_code, .ok, 0);
+            captureSuccess(worker, anchor_id, s, s.status_code, .ok, 0, tags_for_log);
             processed += 1;
         }
         successes.clearRetainingCapacity();
@@ -1101,7 +1112,7 @@ fn finalizeBatch(
                     "tenant={s} err={s}",
                     .{ anchor_id, @errorName(e2) },
                 );
-                captureSuccess(worker, anchor_id, s, 507, .kv_error, 0);
+                captureSuccess(worker, anchor_id, s, 507, .kv_error, 0, s.tags);
                 processed += 1;
             }
             successes.clearRetainingCapacity();
@@ -1161,7 +1172,7 @@ fn finalizeBatch(
             );
             // Propose failed — no raft seq to stamp; the entry never
             // made it to the log.
-            captureSuccess(worker, anchor_id, s, if (too_large) 413 else 421, .fault, 0);
+            captureSuccess(worker, anchor_id, s, if (too_large) 413 else 421, .fault, 0, s.tags);
             processed += 1;
         }
         successes.clearRetainingCapacity();
@@ -2193,6 +2204,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         //     re-open the window and re-dispatch body-complete later.
         var headers_first_dispatch = false;
         var chunk_dispatch = false;
+        // Streamed-held inbound (rove#931): the module has neither
+        // `onHeaders` nor `onChunk` and the body crossed (or declares
+        // past) the plan cap — instead of the old 413, `default` runs
+        // HELD with an empty body and the streamed marker; the sink
+        // feeds the pump, whose settles deliver the body through
+        // `request.chunks`.
+        var streamed_dispatch = false;
         if (body_inbound.receiving) {
             const cached = worker_mod.onHeadersLookup(worker, dep_id, route.module_base);
             if (cached orelse true) {
@@ -2221,7 +2239,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                         processed += 1;
                         continue;
                     };
-                if (job.classic_fallback) {
+                if (job.held_mode) {
+                    // Streamed-held (rove#931): the pump owns every
+                    // byte (settles, not export fires) — nothing is
+                    // consumed on this walk; dispatch `default` held
+                    // with the streamed marker below.
+                    streamed_dispatch = true;
+                } else if (job.classic_fallback) {
                     // `no_onchunk` probe miss on a complete ≤cap body:
                     // dispatch classic with the prepared payload (the
                     // sink consumed the bytes, so h2 can't re-buffer).
@@ -2247,16 +2271,27 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                         continue;
                     }
                 }
-            } else {
-                // Classic buffered path. Pre-buffer reject on the
-                // declared length (the relocated half of the old
-                // up-front 413) so a declared-huge body never buffers.
-                if (declared_len > body_cap) {
-                    try respb.setSimpleResponse(server, ent, sid, sess, 413, "payload too large\n", allocator);
-                    worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0, 0);
+            } else if (declared_len > body_cap) {
+                // Size decides (rove#931): a body declared past the cap
+                // never buffers — arm the sink in held mode and run
+                // `default` held; `request.chunks` consumes the bytes
+                // as they arrive (the buffered prefix first). The old
+                // pre-buffer 413 retires with `onChunk` at S5.
+                const job = worker.armInboundChunkSink(
+                    ent,
+                    sess.entity,
+                    sid.id,
+                    body_cap,
+                    kv_mod.hashStoreId(scope_inst.id),
+                ) orelse {
+                    try respb.setSimpleResponse(server, ent, sid, sess, 503, "client disconnected before body completed\n", allocator);
                     processed += 1;
                     continue;
-                }
+                };
+                job.held_mode = true;
+                streamed_dispatch = true;
+            } else {
+                // Classic buffered path (declared ≤ cap).
                 try server.reg.set(ent, server.coll(.request_out), worker_mod.BodyInbound, .{ .receiving = false });
                 switch (server.requestBodyBuffer(ent)) {
                     .body_complete => {
@@ -2284,16 +2319,26 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // classic). Single fire with the whole body, `done = true`.
         // Decided OUTSIDE the receiving branch so it also covers
         // bodies that arrived complete (h1, END_STREAM-with-HEADERS).
-        if (!headers_first_dispatch and !chunk_dispatch and body.len > 0) {
+        if (!headers_first_dispatch and !chunk_dispatch and !streamed_dispatch and body.len > 0) {
             chunk_dispatch = worker_mod.onChunkLookup(worker, dep_id, route.module_base) orelse true;
         }
-        // The buffered-length half of the relocated 413: applies to
-        // every non-chunk dispatch (chunk handlers take any size).
-        if (!headers_first_dispatch and !chunk_dispatch and (declared_len > body_cap or body.len > body_cap)) {
-            try respb.setSimpleResponse(server, ent, sid, sess, 413, "payload too large\n", allocator);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0, 0);
-            processed += 1;
-            continue;
+        // Size decides, complete-in-hand half (rove#931): a body that
+        // arrived whole but past the cap (h1, END_STREAM-with-HEADERS,
+        // the classic path's undeclared crossing) streams too — there
+        // is no live stream to attach a sink to, so a sinkless job is
+        // fed the whole body and the pump slices + settles it. A
+        // declared length over the cap whose actual body stayed under
+        // serves classic: the ACTUAL size decides, not the declaration.
+        if (!headers_first_dispatch and !chunk_dispatch and !streamed_dispatch and body.len > body_cap) {
+            _ = worker.inbound_chunk_jobs.get(ent) orelse
+                worker.armInboundChunkComplete(ent, body_cap, kv_mod.hashStoreId(scope_inst.id), body) orelse
+                {
+                    try respb.setSimpleResponse(server, ent, sid, sess, 503, "body handoff failed\n", allocator);
+                    processed += 1;
+                    continue;
+                };
+            body = "";
+            streamed_dispatch = true;
         }
 
         // This is a handler-bound request. Either establish the
@@ -2660,6 +2705,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 }
                 break :blk dispatcher_mod.Activation{ .inbound_chunk = .{ .seq = 0, .byte_offset = 0, .done = true } };
             } else .inbound,
+            .streamed_body = streamed_dispatch,
             .activation_entity = ent,
             .trace = .{
                 .readset = &readset,
@@ -2897,10 +2943,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     if (job.eof and !job.firing) {
                         job.classic_fallback = true;
                     } else {
-                        worker_mod.releaseInboundChunkParks(worker, job);
-                        job.kill();
-                        try respb.setSimpleResponse(server, ent, sid, sess, 413, "payload too large\n", allocator);
-                        worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0, exec_seq);
+                        // Size decides (rove#931): the module has no
+                        // `onChunk` and the body crossed the cap — the
+                        // next walk re-dispatches `default` HELD and the
+                        // pump settles `request.chunks`. In-flight
+                        // durability parks stay valid (the pump keeps
+                        // polling them).
+                        job.held_mode = true;
                     }
                 }
                 processed += 1;

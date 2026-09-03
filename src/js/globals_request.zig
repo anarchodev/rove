@@ -187,7 +187,14 @@ pub fn installRequest(
     // property in its arm below; the remaining kinds carry an internal
     // ctx envelope (or nothing) in `Request.body`, which must NOT leak
     // through a payload surface — they get no `bytes` at all.
-    if (request.activation == .inbound or request.activation == .inbound_headers) {
+    if (request.activation == .inbound and request.streamed_body) {
+        // Streamed inbound (rove#931): the body crossed the size cap and
+        // was never buffered. Mark the request so held.js's `chunks`
+        // pulls per chunk, and make `bytes` throw — `text`/`json` on the
+        // shared prototype (globals/request.js) check the same marker.
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "__rove_streamed", js_true);
+        definePropertyGetter(ctx, req_obj, "bytes", c.JS_NewCFunction2(ctx, @ptrCast(&jsStreamedBytesThrow), "bytes", 0, c.JS_CFUNC_getter_magic, 0));
+    } else if (request.activation == .inbound or request.activation == .inbound_headers) {
         definePropertyGetter(ctx, req_obj, "bytes", c.JS_NewCFunction2(ctx, @ptrCast(&jsBytesGetter), "bytes", 0, c.JS_CFUNC_getter_magic, 0));
     }
     if (request.query) |q| {
@@ -991,6 +998,20 @@ fn jsBytesGetter(
     recordRequestRead(state, .body_read, "", "");
     const bytes_val = c.JS_NewUint8ArrayCopy(ctx, state.req_body.ptr, state.req_body.len);
     return selfReplaceWithValue(ctx, this_val, "bytes", bytes_val);
+}
+
+/// `request.bytes` on a STREAMED inbound body (rove#931): the body was
+/// never buffered, so a whole-body read cannot be honored — throw the
+/// same 413-class TypeError the shared prototype's `text`/`json` throw,
+/// naming the iterable. Never a silent prefix.
+fn jsStreamedBytesThrow(
+    ctx: ?*c.JSContext,
+    this_val: c.JSValue,
+    magic: c_int,
+) callconv(.c) c.JSValue {
+    _ = this_val;
+    _ = magic;
+    return c.JS_ThrowTypeError(ctx, "request body is streamed (over the size cap) — iterate `request.chunks`; `request.bytes` is unavailable");
 }
 
 /// `request.cookies` accessor: counts as a read of the whole

@@ -270,6 +270,7 @@ pub const Dispatcher = struct {
             .plan_gen = request.plan.plan_gen,
             .blob_cfg = request.plan.blob_cfg,
             .saga_id = request.trace.saga_id orelse "",
+            .streamed_body = request.streamed_body,
             .platform_caps = request.admin.platform_caps,
             .resume_if_bound = request.trampolines.resume_if_bound,
             .cancel_fetch = request.trampolines.cancel_fetch,
@@ -718,6 +719,16 @@ pub const Dispatcher = struct {
                         _ = c.JS_SetPropertyStr(ctx.raw, obj, "value", val);
                         _ = c.JS_SetPropertyStr(ctx.raw, obj, "done", globals.js_false);
                     },
+                    .chunk => |bytes| {
+                        // A streamed inbound body chunk (rove#931):
+                        // {bytes, text}, no opcode — the shape the sim's
+                        // chain fold settles with.
+                        const val = c.JS_NewObject(ctx.raw);
+                        _ = c.JS_SetPropertyStr(ctx.raw, val, "bytes", c.JS_NewUint8ArrayCopy(ctx.raw, bytes.ptr, bytes.len));
+                        _ = c.JS_SetPropertyStr(ctx.raw, val, "text", c.JS_NewStringLen(ctx.raw, bytes.ptr, bytes.len));
+                        _ = c.JS_SetPropertyStr(ctx.raw, obj, "value", val);
+                        _ = c.JS_SetPropertyStr(ctx.raw, obj, "done", globals.js_false);
+                    },
                     .eof => {
                         _ = c.JS_SetPropertyStr(ctx.raw, obj, "done", globals.js_true);
                     },
@@ -1076,6 +1087,22 @@ fn finishResponse(
     if (state.settled_promise) |sp| stamp: {
         const k = d.allocator.dupe(u8, log_mod.SETTLED_TAG) catch break :stamp;
         const v = std.fmt.allocPrint(d.allocator, "{d}", .{sp}) catch {
+            d.allocator.free(k);
+            break :stamp;
+        };
+        tags_buf.append(d.allocator, .{ .key = k, .value = v }) catch {
+            d.allocator.free(k);
+            d.allocator.free(v);
+        };
+    }
+
+    // Engine provenance, streamed inbound (rove#931): the hop-0 record
+    // of a streamed body carries `_streamed` so the held-chain fold
+    // rebuilds its world with the streamed request surface. Same
+    // post-handler quota posture and drop-never-fail as `_parent`.
+    if (state.streamed_body) stamp: {
+        const k = d.allocator.dupe(u8, log_mod.STREAMED_TAG) catch break :stamp;
+        const v = d.allocator.dupe(u8, "1") catch {
             d.allocator.free(k);
             break :stamp;
         };

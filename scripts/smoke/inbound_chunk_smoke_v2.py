@@ -14,7 +14,8 @@ front-door streaming proxy landed 2026-06-11):
      response reports exact byte count + fires == lastSeq + 1
   3. probe fallback: a default-only module still serves a small POST
      classically (the first request probes onChunk, misses, re-walks)
-  4. classic cap: a default-only module + a > cap body → 413
+  4. size decides (rove#931): a default-only module + a > cap body
+     STREAMS to `default`; a whole-body read there throws loud
   5. early terminal: an onChunk module that rejects on the first chunk
      answers while the body is still inbound
   8. client abort mid-upload: a throttled >cap upload severed while the
@@ -160,9 +161,13 @@ def main() -> int:
         check("classic POST → 200 classic:5", r.status == 200 and "classic:5" in r.body,
               f"got {r.status} {r.body[:80]!r}")
 
-        print("step 5: classic cap — default-only module, 5 MB body → 413")
+        print("step 5: default-only module, 5 MB body — STREAMS (rove#931), and a")
+        print("        whole-body read on the crossed body fails loud, never a prefix")
         r = c.node_request("/", method="POST", host=host, data=b"y" * (5 * 1024 * 1024))
-        check("classic >cap → 413", r.status == 413, f"got {r.status} {r.body[:80]!r}")
+        check("default + >cap body → loud throw (request.text on a streamed body)",
+              r.status == 500 and "request.chunks" in r.body,
+              f"got {r.status} {r.body[:120]!r}")
+        check("no silent prefix served", "classic:" not in r.body, f"got {r.body[:80]!r}")
 
         print("step 6: early terminal — reject on first chunk mid-upload")
         r = c.node_request("/reject", method="POST", host=host,

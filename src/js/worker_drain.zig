@@ -3776,12 +3776,19 @@ pub fn pumpInboundChunks(worker: anytype) void {
             }
             continue;
         }
-        if (!job.first_fired) continue; // dispatchOnce owns the probe fire
+        if (!job.held_mode and !job.first_fired) continue; // dispatchOnce owns the probe fire
         if (!server.reg.isInCollection(ent, worker.parked_continuations)) continue; // fire in flight
         // The prior fire fully resolved (commit included) — repay its
         // window so the client can send the next stretch.
         job.repayResolved();
         if (job.final_fired) {
+            // Streamed-held (rove#931): the last BYTES chunk settled a
+            // pull, so the iterator's `{done:true}` is still owed —
+            // deliver it on the next pull before detaching.
+            if (job.held_mode and job.eof_owed) {
+                if (resumeHeldInboundSettle(worker, ent, job, true)) job.eof_owed = false;
+                continue;
+            }
             // Upload complete; the chain lives on under the ordinary
             // continuation machinery (wakes, deadline). Detach early —
             // h2's sink reference releases at stream close.
@@ -3796,7 +3803,18 @@ pub fn pumpInboundChunks(worker: anytype) void {
         }
         const h = job.head() orelse continue; // nothing prepared yet
         if (h.coord != .inline_ok and h.coord != .resolved) continue; // durability pending
-        if (resumeInboundChunk(worker, ent, job)) job.fireDispatched();
+        if (job.held_mode) {
+            // Streamed-held (rove#931): the head settles the chain's
+            // `request.chunks` pull. A bytes-empty final fire IS the
+            // end of input — settle `{done:true}` directly; a
+            // bytes-carrying final fire settles as a chunk and leaves
+            // the `{done:true}` owed for the next pull.
+            const empty_final = h.done and h.bytes.len == 0;
+            if (resumeHeldInboundSettle(worker, ent, job, empty_final)) {
+                job.fireDispatched();
+                if (h.done and !empty_final) job.eof_owed = true;
+            }
+        } else if (resumeInboundChunk(worker, ent, job)) job.fireDispatched();
     }
     for (done.items) |ent| {
         if (worker.inbound_chunk_jobs.fetchRemove(ent)) |kv| kv.value.unref();
@@ -3996,6 +4014,188 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         .txn_owned = &txn_owned,
         .txn_done = &txn_done,
         .act = .inbound_chunk,
+        .pending_fetches = &pending_fetches,
+        .pending_wakes = &pending_wakes,
+        .tape_bytes = chunk_bytes,
+    });
+    return true;
+}
+
+/// Settle a streamed-held inbound chain's `request.chunks` pull
+/// (rove#931) — the cont-shaped `.input` sibling of `resumeHeldFetch`:
+/// the head fire's bytes settle the outstanding pull
+/// (`held.SettleInput.chunk`); `eof` resolves `{done:true}` so the
+/// `for await` ends and the handler runs on to its terminal. The chunk
+/// payload is this activation's Msg — taped through the chunk channel
+/// exactly as the export flow's fires are, so the fold replays the hop
+/// (an eof hop records as `.disconnect`, the end-of-input posture the
+/// WS close settle uses). Returns true iff the activation ran (the
+/// caller then advances the job's fire bookkeeping); no outstanding
+/// pull (the handler is mid-await on something else) or a transient
+/// pre-dispatch failure leaves the staged fire for the next tick.
+fn resumeHeldInboundSettle(worker: anytype, ent: rove.Entity, job: anytype, eof: bool) bool {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    if (!server.reg.isInCollection(ent, worker.parked_continuations)) return false;
+    const desc = server.reg.get(ent, worker.parked_continuations, components_mod.ContDescriptor) catch return false;
+    const chain = server.reg.get(ent, worker.parked_continuations, components_mod.ChainContext) catch return false;
+    const hr = server.reg.get(ent, worker.parked_continuations, components_mod.HeldRequest) catch return false;
+    const req_arena = hr.req orelse return false;
+    const c2 = desc.cont orelse return false;
+    const pull = hr.input_promise orelse return false; // handler not pulling yet
+    const head_fire = if (eof) null else (job.head() orelse return false);
+    const chunk_bytes: []const u8 = if (head_fire) |h| h.bytes else "";
+    const head_done = if (head_fire) |h| h.done else true;
+    const tenant_id = chain.tenant_id;
+    const saga_id = chain.saga_id;
+    const cont_path = c2.path;
+    const cont_path_log = allocator.dupe(u8, cont_path) catch &.{};
+    defer if (cont_path_log.len > 0) allocator.free(cont_path_log);
+    const act: log_mod.ActivationSource = if (eof) .disconnect else .inbound_chunk;
+    const sid_ptr = server.reg.get(ent, worker.parked_continuations, h2.StreamId) catch return false;
+    const sess_ptr = server.reg.get(ent, worker.parked_continuations, h2.Session) catch return false;
+    const sid = sid_ptr.*;
+    const sess = sess_ptr.*;
+    var dep = resolveDeployment(worker, allocator, tenant_id, cont_path) catch |err| {
+        std.log.warn("rove-js held-inbound-chunk: resolveDeployment tenant={s} module={s}: {s}", .{ tenant_id, cont_path, @errorName(err) });
+        return false;
+    };
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{cont_path}) catch return false;
+    defer allocator.free(spath);
+
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return false;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch |berr| {
+        // Transient (e.g. chain-head conflict with a just-committed
+        // hop): the staged fire stays unconsumed; next tick retries.
+        std.log.debug("rove-js held-inbound-chunk: beginTracked deferred: {s}", .{@errorName(berr)});
+        return false;
+    };
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
+    defer readset.deinit();
+    const request_id: u64 = worker_mod.mintRequestId(worker, inst);
+    const exec_seq: u64 = worker.raft.mintExecStampForTenant(inst.id);
+
+    const fetches_pending: u32 = blk: {
+        const cnt = server.reg.get(ent, worker.parked_continuations, components_mod.BoundFetchCount) catch break :blk 0;
+        break :blk cnt.pending;
+    };
+
+    // Chunk-tape: the settle's payload IS this activation's Msg — the
+    // same two-path trigger_payload rule as the export flow's fires
+    // (inline under the threshold, else the pump's materialized
+    // coordinator BodyRef). Never read-elided.
+    if (chunk_bytes.len > 0) readset.body_read = true;
+    if (chunk_bytes.len > 0 and chunk_bytes.len <= worker_mod.REQUEST_BODY_CAP) {
+        const inline_ref: bodies_mod.BodyRef = bodies_mod.BodyRef.carried(@intCast(chunk_bytes.len));
+        readset.trigger_payload.appendTriggerPayload(inline_ref, chunk_bytes) catch |err| {
+            std.log.warn("rove-js held-inbound-chunk: trigger_payload append (inline): {s}", .{@errorName(err)});
+        };
+    } else if (chunk_bytes.len > 0) {
+        readset.trigger_payload.appendTriggerPayload(head_fire.?.ref, "") catch |err| {
+            std.log.warn("rove-js held-inbound-chunk: trigger_payload append (ref): {s}", .{@errorName(err)});
+        };
+    }
+
+    var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stream_chunks.items) |ch| allocator.free(ch);
+        stream_chunks.deinit(allocator);
+    }
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
+    var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (pending_wakes.items) |*pw| pw.deinit(allocator);
+        pending_wakes.deinit(allocator);
+    }
+
+    // The inbound request's headers ride the held entity — every
+    // resume sees the same `request.headers` the first activation did.
+    const req_headers: ?h2.ReqHeaders = blk: {
+        const p = server.reg.get(ent, worker.parked_continuations, h2.ReqHeaders) catch break :blk null;
+        break :blk p.*;
+    };
+
+    const request: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = "",
+        .headers = req_headers,
+        .activation = if (eof)
+            .disconnect
+        else
+            .{ .inbound_chunk = .{
+                .seq = job.next_seq,
+                .byte_offset = job.fired_offset,
+                .done = head_done,
+            } },
+        .activation_entity = ent,
+        .activation_fetches_pending = fetches_pending,
+        .trace = .{ .readset = &readset, .request_id = request_id, .saga_id = saga_id, .exec_seq = exec_seq },
+        .plan = .{ .limiter = &worker.limiter, .storage = inst.storage, .plan_rate = tc.slot.effectivePlan().rate, .plan_gen = tc.slot.plan_gen.load(.acquire), .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
+        .trampolines = worker.trampolines(null),
+        .effects = .{
+            .pending_wakes = &pending_wakes,
+            .pending_stream_chunks = &stream_chunks,
+            .pending_fetches = &pending_fetches,
+        },
+    };
+
+    const settle: held_mod.Settle = if (eof)
+        .{ .input = .{ .idx = pull, .payload = .eof } }
+    else
+        .{ .input = .{ .idx = pull, .payload = .{ .chunk = chunk_bytes } } };
+
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    var oc = worker_mod.runResumeHeld(worker, inst, tc, txn, &ws, request, &budget, .{ .req = req_arena, .outer = hr.outer, .resolvers = hr.resolvers }, settle) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "held handler error\n") catch {};
+        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), saga_id, &.{}, act, 0, exec_seq);
+        return true;
+    };
+    const wrote = ws.ops.items.len > 0;
+    finishContResume(worker, .{
+        .site = "held-inbound-chunk",
+        .noun = "held",
+        .cancel_binds = true,
+        .tape = .chunk,
+    }, &oc, .{
+        .ent = ent,
+        .sid = sid,
+        .sess = sess,
+        .ws = &ws,
+        .txn = txn,
+        .tenant_id = tenant_id,
+        .readset = &readset,
+        .cont_path = cont_path,
+        .cont_path_log = cont_path_log,
+        .saga_id = saga_id,
+        .request_id = request_id,
+        .exec_seq = exec_seq,
+        .now_ns = now_ns,
+        .deployment_id = tc.snap.deployment_id,
+        .wrote = wrote,
+        .txn_owned = &txn_owned,
+        .txn_done = &txn_done,
+        .act = act,
         .pending_fetches = &pending_fetches,
         .pending_wakes = &pending_wakes,
         .tape_bytes = chunk_bytes,

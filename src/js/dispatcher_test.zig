@@ -6606,6 +6606,98 @@ test "held request: an input settle stamps the `_settled` record tag (the settle
     try testing.expect(found);
 }
 
+test "streamed inbound: chunks pull-settle chain; hop 0 stamps `_streamed`" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    const bytecode = try compileModule(
+        \\export default async function () {
+        \\  let n = 0;
+        \\  let threw = false;
+        \\  try { void request.text; } catch (e) { threw = true; }
+        \\  for await (const c of request.chunks) n += c.bytes.length;
+        \\  return (threw ? "threw:" : "read:") + n;
+        \\}
+    );
+    defer testing.allocator.free(bytecode);
+
+    var wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (wakes.items) |*w| w.deinit(testing.allocator);
+        wakes.deinit(testing.allocator);
+    }
+    var txn1 = try kv.beginTrackedImmediate();
+    var txn1_open = true;
+    defer if (txn1_open) txn1.rollback() catch {};
+    var ws1 = kv_mod.WriteSet.init(testing.allocator);
+    defer ws1.deinit();
+    var budget1 = Budget.fromNow(Budget.default_duration_ns);
+    const oc1 = try d.runOutcome(kv, &txn1, &ws1, bytecode, null, null, null, null, 0, .{
+        .method = "POST",
+        .path = "/",
+        .streamed_body = true,
+        .effects = .{ .pending_wakes = &wakes },
+        .trace = .{ .request_id = 1 },
+    }, &budget1);
+    try testing.expect(oc1 == .held);
+    var held = oc1.held;
+    defer held.deinit(testing.allocator);
+    const req = held.req orelse return error.HeldWithoutArena;
+    defer d.snapshot.freeRequest(req) catch {};
+    // The handler pulled `request.chunks` (the whole-body accessors threw
+    // first — asserted via the terminal body below).
+    try testing.expectEqual(@as(?u32, 0), held.input_promise);
+    // Hop 0 of a streamed body records `_streamed` — the held-chain
+    // fold's marker for rebuilding the streamed request surface.
+    var found_streamed = false;
+    for (held.tags) |t| {
+        if (std.mem.eql(u8, t.key, log_mod.STREAMED_TAG)) {
+            try testing.expectEqualStrings("1", t.value);
+            found_streamed = true;
+        }
+    }
+    try testing.expect(found_streamed);
+    try txn1.commit();
+    txn1_open = false;
+
+    // Chunk settle: {value:{bytes,text},done:false} resumes the loop.
+    var txn2 = try kv.beginTrackedImmediate();
+    defer txn2.rollback() catch {};
+    var ws2 = kv_mod.WriteSet.init(testing.allocator);
+    defer ws2.deinit();
+    var budget2 = Budget.fromNow(Budget.default_duration_ns);
+    const oc2 = try d.resumeHeld(kv, &txn2, &ws2, null, null, null, null, 0, .{
+        .method = "POST",
+        .path = "/",
+        .trace = .{ .request_id = 2 },
+    }, &budget2, .{ .req = req, .outer = held.outer, .resolvers = held.resolvers }, .{ .input = .{ .idx = 0, .payload = .{ .chunk = "hello" } } });
+    try testing.expect(oc2 == .held);
+    var held2 = oc2.held;
+    defer held2.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u32, 0), held2.input_promise);
+
+    // End of input: {done:true} exits the loop; the handler returns.
+    var txn3 = try kv.beginTrackedImmediate();
+    defer txn3.rollback() catch {};
+    var ws3 = kv_mod.WriteSet.init(testing.allocator);
+    defer ws3.deinit();
+    var budget3 = Budget.fromNow(Budget.default_duration_ns);
+    var oc3 = try d.resumeHeld(kv, &txn3, &ws3, null, null, null, null, 0, .{
+        .method = "POST",
+        .path = "/",
+        .trace = .{ .request_id = 3 },
+    }, &budget3, .{ .req = req, .outer = held2.outer, .resolvers = held2.resolvers }, .{ .input = .{ .idx = 0, .payload = .eof } });
+    try testing.expect(oc3 == .terminal);
+    defer oc3.terminal.deinit(testing.allocator);
+    try testing.expectEqualStrings("threw:5", oc3.terminal.body);
+}
+
 test "held request: a second await re-holds the same arena; a rejection surfaces as the exception" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
