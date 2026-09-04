@@ -2178,6 +2178,22 @@ pub fn main() !void {
     };
     var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle, .reconcile_membership = reconcile_membership, .demote_grace_ns = demote_grace_ns, .public_suffix = getEnvCfg("REWIND_PUBLIC_SUFFIX"), .blob_cfg = if (blob_owned) |b| b.cfg else null, .sweep_cfg = sweep_cfg };
 
+    // rove#715: the per-cluster `__root__` ensure runs on its own thread —
+    // the CP loop never blocks (see `reconciler.RootEnsurer`). Needs the
+    // move secret (attach is a move-surface call); without one the thread
+    // stays down and multi-node root formation waits for an operator.
+    var root_ensurer = reconciler.RootEnsurer{
+        .allocator = allocator,
+        .move_secret = move_secret,
+        .directory = directory,
+    };
+    if (move_secret != null) {
+        try root_ensurer.start();
+    } else {
+        std.log.warn("rewind-cp: no REWIND_MOVE_SECRET — __root__ group ensure disabled (single-node workers self-birth; multi-node clusters need the secret)", .{});
+    }
+    defer root_ensurer.shutdown();
+
     // Periodic membership reconciliation on the directory leader (between
     // request batches). last=0 → the first iteration reconciles, so a CP
     // restart / failover converges membership within one tick. Period from

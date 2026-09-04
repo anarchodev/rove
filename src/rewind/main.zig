@@ -631,7 +631,13 @@ const PumpStores = struct {
             self.map.clearRetainingCapacity();
             self.deletion_gen = gen;
         }
-        if (id_str.len == 0) {
+        // `__root__` by NAME (rove#715: envelope-0 writesets addressed to
+        // the root group) and the retired type-2 spelling (empty id) both
+        // resolve the cluster root store. The name branch must come before
+        // the generic path below, which would otherwise CREATE an ordinary
+        // tenant instance called `__root__` with its own per-tenant store —
+        // a second, wrong home for routing state.
+        if (id_str.len == 0 or std.mem.eql(u8, id_str, tenant_mod.ROOT_INSTANCE_ID)) {
             if (self.root_handle) |h| return h;
             const h = kv.KvStore.attachSibling(
                 self.allocator,
@@ -1053,6 +1059,31 @@ pub fn main() !void {
         }
     }
     try bridge.startPump();
+    // The `__root__` group (rove#715): cluster routing state gets its OWN
+    // raft log instead of riding another tenant's as a type-2 inner.
+    //
+    // SINGLE-NODE ONLY here: a multi-node worker must NOT self-birth it. A
+    // wiped voter that recreates the group empty at boot panics raft-rs on
+    // the incumbent leader's first heartbeat (`to_commit out of range` —
+    // stale progress against a fresh log, the wiped-voter-rejoin hazard);
+    // group-less, the transport skips its messages safely until the CP
+    // re-attaches it. Multi-node birth and healing are the CP's
+    // (`reconciler.ensureRootGroups`: cold-multi attach with the cp-ssot
+    // voter set at genesis, the same fan-out a provision uses). A restarted
+    // node with an intact data dir re-stands the group from its manifest in
+    // the recovery scan above, single- and multi-node alike. AFTER
+    // startPump — group lifecycle ops relay through the pump's control
+    // inbox (`runControl` answers PumpNotRunning before it).
+    if (bridge.node.isSingleNode()) {
+        const root_gid = bridge.registerTenant(tenant_mod.ROOT_INSTANCE_ID) catch |err| blk: {
+            std.log.err("rewind: __root__ registerTenant failed: {s}", .{@errorName(err)});
+            break :blk 0;
+        };
+        if (root_gid != 0) bridge.createGroupEpoch(root_gid, 1, false, null, null) catch |err| switch (err) {
+            error.GroupExists => {},
+            else => std.log.err("rewind: __root__ group birth failed: {s}", .{@errorName(err)}),
+        };
+    }
 
     // Per-tenant request-log / tape batches → S3. The only tape-query surface,
     // `rewind-logs`, reads S3-only (its indexer LISTs + serves
