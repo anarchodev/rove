@@ -51,11 +51,11 @@ export default function () {
   });
 
   // Large-input round-trip: the encoders must be O(n), not O(n²).
-  // `+=` string-building allocates O(n²) bytes of intermediate strings,
-  // which exhausted the request arena above ~128 KiB — a big base64/hex
-  // then silently returned an EMPTY response, and it wedged the
-  // streaming upload. 128 KiB is just past that cliff; the array+join
-  // build handles it (and MiB-scale — smoke).
+  // `+=` string-building allocates O(n²) in the per-request bump arena
+  // (never freed until reset), which exhausted it above ~128 KiB — a
+  // big base64/hex then silently returned an EMPTY response, and it
+  // wedged the phase-D streaming upload. 128 KiB is just past that
+  // cliff; the array+join build handles it (and MiB-scale — smoke).
   check("base64url.encode", () => {
     const big = new Uint8Array(128 * 1024);
     for (let i = 0; i < big.length; i++) big[i] = (i * 31 + 7) & 0xff;

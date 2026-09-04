@@ -1146,6 +1146,7 @@ fn resumeStream(
         stream_chunks.deinit(allocator);
     }
     const request: Request = .{
+        .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -1173,7 +1174,7 @@ fn resumeStream(
         },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, request, &budget) catch {
+    const run_oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, request, &budget, path) catch {
         txn.rollback() catch {};
         txn_done = true;
         markStreamDraining(server, ent);
@@ -1367,6 +1368,7 @@ pub fn resumeBoundFetchStream(
         .content_hash = if (ev.content_hash) |*h| h[0..] else "",
     };
     const req: Request = .{
+        .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -1402,7 +1404,7 @@ pub fn resumeBoundFetchStream(
     };
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, req, &budget) catch {
+    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, req, &budget, path) catch {
         txn.rollback() catch {};
         txn_done = true;
         markStreamDrainingAnywhere(server, ent);
@@ -1777,9 +1779,13 @@ pub fn runFire(
     }
     var req_w = req;
     if (req_w.effects.pending_fetches == null) req_w.effects.pending_fetches = &pending_fetches;
+    // Known-churny handlers skip the doomed bump attempt (the module
+    // identity is the same log_path key the inbound path uses).
+    req_w.arena_mode = worker_mod.arenaModeFor(worker, tenant_id, dep_id, log_path);
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker_mod.runResume(worker, p.dep.inst, p.dep.tc, p.dep.bc, p.txn, &p.ws, req_w, &budget) catch {
+    const run_oc = worker_mod.runResume(worker, p.dep.inst, p.dep.tc, p.dep.bc, p.txn, &p.ws, req_w, &budget, log_path) catch {
+        worker_mod.noteChurnyOutcome(worker, tenant_id, dep_id, log_path);
         p.txn.rollback() catch {};
         p.txn_done = true;
         captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, fallback_tags, spec.act, 0, p.exec_seq);

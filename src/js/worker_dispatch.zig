@@ -2620,6 +2620,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         }
 
         const request: Request = .{
+            // Known-churny handlers (a prior dispatch OOMed the bump
+            // arena and re-executed under GC) skip the doomed bump
+            // attempt entirely.
+            .arena_mode = if (worker_mod.isChurny(worker, scope_inst.id, dep_id, route.module_base)) .gc else .auto,
             // From the DISPATCH DECISION, never the path: this arm of the
             // inbound path runs a baked module only when the engine itself
             // forced one (a `/_system/*` route resolving to an activation,
@@ -2734,7 +2738,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // the hop (see `cont_bound_sched_id` below). The customer
         // never sees the id (`http.send`'s value is unused by §6.4),
         // so the binding is runtime-internal.
-        const run_oc = worker_mod.runResume(worker, scope_inst, tc, bytecode, txn.?, &writeset, request, &budget) catch |err| {
+        const run_oc = worker_mod.runResume(worker, scope_inst, tc, bytecode, txn.?, &writeset, request, &budget, route.module_base) catch |err| {
+            if (worker.dispatcher.last_arena_gc_retry)
+                worker_mod.markChurny(worker, scope_inst.id, dep_id, route.module_base);
             txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
                 "dispatchOnce.rollbackTo(after_dispatch_error)",
                 "tenant={s} err={s}",

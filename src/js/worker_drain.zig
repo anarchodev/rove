@@ -2193,6 +2193,7 @@ fn resumeContinuation(
         stream_chunks.deinit(allocator);
     }
     const request: Request = .{
+        .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -2218,7 +2219,7 @@ fn resumeContinuation(
     };
     std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ saga_id orelse "(none)", request_id, inst.id });
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, request, &budget) catch {
+    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, request, &budget, path) catch {
         txn.rollback() catch {};
         txn_done = true;
         try resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "continuation handler error\n");
@@ -2428,6 +2429,7 @@ pub fn resumeBoundFetchChain(
         .content_hash = if (ev.content_hash) |*h| h[0..] else "",
     };
     const req: Request = .{
+        .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, cont_path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -2467,7 +2469,7 @@ pub fn resumeBoundFetchChain(
     const sess = sess_ptr.*;
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, req, &budget) catch {
+    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, req, &budget, cont_path) catch {
         txn.rollback() catch {};
         txn_done = true;
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "bound-fetch handler error\n") catch {};
@@ -3372,6 +3374,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     };
 
     const req: Request = .{
+        .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, cont_path),
         .method = "POST",
         .path = spath,
         .body = chunk_bytes,
@@ -3402,7 +3405,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     const sess = sess_ptr.*;
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, req, &budget) catch {
+    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, req, &budget, cont_path) catch {
         txn.rollback() catch {};
         txn_done = true;
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "inbound-chunk handler error\n") catch {};

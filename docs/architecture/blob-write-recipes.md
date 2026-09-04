@@ -414,9 +414,8 @@ activation is fine.
 The actual fault was a **base64url O(n²) arena blowup**, unrelated to
 fetches. `blob.write` stored each binary chunk as
 `base64url.encode(request.bytes)`; the encoder built its output with
-`out += …` in a per-byte loop, and under the bump allocator of the time
-every `+=` allocated a never-freed-until-reset string → O(n²) arena
-*volume* →
+`out += …` in a per-byte loop, and in the bump arena every `+=`
+allocates a never-freed-until-reset string → O(n²) arena *volume* →
 above ~128 KiB of output the arena exhausts and the handler silently
 returns an empty body (in Release) or the CPU-budget interrupt of the
 now-slow activation wedges the parked continuation (in Debug, 1 s

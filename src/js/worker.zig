@@ -1547,6 +1547,24 @@ pub fn Worker(comptime opts: Options) type {
         allocator: std.mem.Allocator,
         reg: *H2Type.Reg,
         h2: *H2Type,
+        /// Handlers that exhausted the bump request arena — the
+        /// dispatcher re-executed them under GC (`last_arena_gc_retry`)
+        /// and this map remembers, so their NEXT dispatch skips the
+        /// doomed bump attempt (`request.arena_mode = .gc`).
+        /// Worker-thread-local (no locking); keyed
+        /// "{tenant}\x00{dep_id:x}\x00{module_base}" — a redeploy mints
+        /// a new dep_id, so a fixed handler sheds the mark
+        /// automatically. In-memory only: worth one extra
+        /// double-execution per worker after a restart.
+        ///
+        /// The module identity DIFFERS by activation path (route
+        /// module_base for inbound, cont module_path / `{on}` target
+        /// for continuations) — DELIBERATELY: a module's activation
+        /// kinds are independent memory profiles (an inbound that
+        /// parses a big payload churns while its onWake reads one key,
+        /// or vice versa), so a mark taxes only the code path that
+        /// actually OOMed, not the module's cheap paths.
+        churny_handlers: std.StringHashMapUnmanaged(void) = .empty,
         /// Entities waiting on raft commit, destined for `response_in`
         /// (terminal response, no cont/stream chain). Stored on the
         /// Worker (not inside h2) because this is rove-js state, not
@@ -4136,18 +4154,46 @@ pub fn hostOnly(authority: []const u8) []const u8 {
     return authority[0..colon];
 }
 
+/// Look up handler bytecode for `module_base`, walking up the module
+/// tree if the exact path isn't deployed. So `tenant/instance/acme/index`
+/// falls back through `tenant/instance/index` → `tenant/index` →
+/// `index`, whichever exists first. This lets a single deployed file
+/// (`index.js` or `tenant/index.mjs`) catch every sub-path below it,
+/// which is exactly what the admin handler needs — one JS module
+/// does its own path-based dispatch.
+/// Churny-map key: "{tenant}\x00{dep_id}\x00{module_base}". Caller
+/// frees (markChurny keeps its own copy).
+fn churnyKey(allocator: std.mem.Allocator, tenant_id: []const u8, dep_id: u64, module_base: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}\x00{x}\x00{s}", .{ tenant_id, dep_id, module_base });
+}
+
+/// `Request.arena_mode` for a handler: `.gc` when the churny map says
+/// its bump attempt is doomed, else `.auto`. One call site per
+/// dispatch path, paired with `noteChurnyOutcome` after the run.
+pub fn arenaModeFor(worker: anytype, tenant_id: []const u8, dep_id: u64, module_base: []const u8) @FieldType(Request, "arena_mode") {
+    return if (isChurny(worker, tenant_id, dep_id, module_base)) .gc else .auto;
+}
+
+/// Post-dispatch pairing of `arenaModeFor`: if the run OOMed bump and
+/// re-executed under GC, remember the handler. Reads the dispatcher's
+/// last-run flag, so call it immediately after runOutcome (before any
+/// nested dispatch).
 /// The ONE invocation shape for re-entering the engine on a parked
 /// chain's deployment — every resume/fire activation family (HTTP
 /// continuation, bound fetch, inbound chunk, stream, WS message/wake/
 /// disconnect, connectionless fire) routes here instead of hand-rolling
 /// the 9-arg `Dispatcher.runOutcome` call. Folds the snapshot-derived
-/// args (bytecode cache, source hashes, deploy hooks). An error returns
-/// to the caller untouched: rollback + teardown legitimately differ per
-/// family (resolveParked vs stream-drain vs WS teardown), so the catch
-/// arm stays at the call site.
+/// args (bytecode cache, source hashes, deploy hooks) and the mandatory
+/// `noteChurnyOutcome` bookkeeping — a family that forgot the latter
+/// silently disabled the churny-arena optimization for its handlers.
+/// An error returns to the caller untouched: rollback + teardown
+/// legitimately differ per family (resolveParked vs stream-drain vs WS
+/// teardown), so the catch arm stays at the call site.
 ///
 /// `inst` is the tenant instance (`.kv`, `.id`); `tc` the deployment
-/// cache entry (`.snap`).
+/// cache entry (`.snap`); `churny_path` the module-base key the churny
+/// map is keyed on (the same one `arenaModeFor` was consulted with at
+/// request build).
 pub fn runResume(
     worker: anytype,
     inst: anytype,
@@ -4157,8 +4203,9 @@ pub fn runResume(
     ws: *kv_mod.WriteSet,
     request: dispatcher_mod.Request,
     budget: *dispatcher_mod.Budget,
+    churny_path: []const u8,
 ) dispatcher_mod.DispatchError!dispatcher_mod.RunOutcome {
-    return worker.dispatcher.runOutcome(
+    const oc = try worker.dispatcher.runOutcome(
         inst.kv,
         txn,
         ws,
@@ -4171,16 +4218,39 @@ pub fn runResume(
         request,
         budget,
     );
+    noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, churny_path);
+    return oc;
 }
 
+pub fn noteChurnyOutcome(worker: anytype, tenant_id: []const u8, dep_id: u64, module_base: []const u8) void {
+    if (worker.dispatcher.last_arena_gc_retry)
+        markChurny(worker, tenant_id, dep_id, module_base);
+}
 
-/// Look up handler bytecode for `module_base`, walking up the module
-/// tree if the exact path isn't deployed. So `tenant/instance/acme/index`
-/// falls back through `tenant/instance/index` → `tenant/index` →
-/// `index`, whichever exists first. This lets a single deployed file
-/// (`index.js` or `tenant/index.mjs`) catch every sub-path below it,
-/// which is exactly what the admin handler needs — one JS module
-/// does its own path-based dispatch.
+/// Should this handler skip the doomed bump attempt? Consulted at
+/// request build; see `Worker.churny_handlers`.
+pub fn isChurny(worker: anytype, tenant_id: []const u8, dep_id: u64, module_base: []const u8) bool {
+    var key_buf: [512]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}\x00{x}\x00{s}", .{ tenant_id, dep_id, module_base }) catch return false;
+    return worker.churny_handlers.contains(key);
+}
+
+/// Remember an arena-OOM-retried handler so its next dispatch goes
+/// straight to GC. Idempotent; allocation failure only forgoes the
+/// optimization (the per-request retry still guarantees correctness).
+pub fn markChurny(worker: anytype, tenant_id: []const u8, dep_id: u64, module_base: []const u8) void {
+    const key = churnyKey(worker.allocator, tenant_id, dep_id, module_base) catch return;
+    const gop = worker.churny_handlers.getOrPut(worker.allocator, key) catch {
+        worker.allocator.free(key);
+        return;
+    };
+    if (gop.found_existing) {
+        worker.allocator.free(key);
+        return;
+    }
+    std.log.warn("rove-js churny: tenant={s} dep={x} module={s} marked GC-mode after arena OOM retry", .{ tenant_id, dep_id, module_base });
+}
+
 pub fn findBytecode(
     tc: TenantFiles,
     module_base: []const u8,

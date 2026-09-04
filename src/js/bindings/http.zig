@@ -577,6 +577,7 @@ pub fn jsHttpCancelFetch(
     if (std.mem.startsWith(u8, id_slice, log_mod.FETCH_ID_PREFIX)) {
         id_slice = id_slice[log_mod.FETCH_ID_PREFIX.len..];
     }
+    if (state.side_effects_flag) |f| f.* = true;
     if (state.cancel_fetch) |fn_ptr| {
         const fn_ctx = state.worker_ctx orelse return js_undefined;
         fn_ptr(fn_ctx, id_slice);
