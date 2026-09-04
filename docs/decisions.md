@@ -1173,6 +1173,24 @@ one safe semantic, no unsafe default); persisting the churny map
 
 ## 5. Readset replication
 
+**Adopted-and-reverted: GC-only (2026-08-30 → 2026-09-04).** The
+always-GC rejection above was overturned once — every engine ran
+GC-only for five days (`gc-always`, the #926 window) — and this
+decision was then restored. The adoption's forcing reason was the
+same-connection promise model: a request's live heap spanning
+activations makes a cumulative bump ceiling untenable (a held
+connection's cursor only grows, and a mid-chain OOM cannot re-run
+prior activations). When that model was abandoned, the forcing reason
+went with it, and the regime's measured tax carried the reversion:
+−9% (one-`kv.get` handler) and −22% (allocation-heavy) on
+`arena_alloc_bench.py`, −6..−9% end-to-end on the sharded write
+bench. What GC-only bought and the reversion gives back up: one
+request-memory semantic on every engine. The offline sim stays
+GC-always (a bump OOM offline is a false failure the retry absorbs in
+prod), and replay keeps selecting the regime per record via the
+engine word's GC bit — prod's bump-first regime is exactly what those
+two already modeled.
+
 ### 4.13 kv subscriptions: durable coalesced level-trigger (2026-07-07)
 
 **Decision.** A kv-react subscription fire is a **coalesced level
