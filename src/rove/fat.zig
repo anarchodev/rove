@@ -338,10 +338,8 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             // table by far (the universe struct per entity), and this
             // is what keeps boot from committing it whole — physical
             // memory follows the entities that actually park. The
-            // metadata arrays above stay on the heap: they are bytes
-            // per entity, and walking them from separate page-aligned
-            // mappings costs the move hot path cache-set aliasing for
-            // no memory worth saving.
+            // metadata arrays above stay on the heap: at bytes per
+            // entity there is no memory worth reserving.
             const fat_table = try reserveTable(Fat, max);
 
             const column_fns = try allocator.alloc(?ColumnFn, MAX_COLLECTIONS * Universe.len);
