@@ -469,6 +469,17 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 .ptr = @ptrCast(coll),
             };
 
+            // A growable collection re-homes onto reserved storage at
+            // the structural bound — no single collection can hold
+            // more than max_entities entities — so it never
+            // reallocates mid-tick and its column bases are stable for
+            // the registry's lifetime. Fixed-capacity collections are
+            // untouched (their error.Full is admission policy). See
+            // `Collection.reserveMax`. Panic, not error: registration
+            // is boot, and a half-registered layer must not run.
+            coll.reserveMax(self.max_entities) catch
+                std.debug.panic("fat registry: could not reserve collection storage at registration", .{});
+
             inline for (Universe.types, 0..) |T, ci| {
                 if (comptime CollType.RowType.contains(T) and @sizeOf(T) > 0) {
                     self.column_fns[id * Universe.len + ci] = columnFn(CollType, T);

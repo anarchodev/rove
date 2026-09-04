@@ -19,6 +19,29 @@ fn toAlignment(comptime bytes: comptime_int) std.mem.Alignment {
     return @enumFromInt(std.math.log2_int(usize, bytes));
 }
 
+/// Reserve `len` bytes of zero-backed address space: one anonymous
+/// NORESERVE mapping, hugepage-advised (dense tables are walked by
+/// index; 2 MiB pages cut the TLB cost, and the advice is ignored where
+/// it cannot apply). The OS backs pages on first touch, so physical
+/// cost is the high-water mark at page granularity, and the mapping
+/// never moves. Release with `releaseBytes` only.
+pub fn reserveBytes(len: usize) error{OutOfMemory}![]align(std.heap.page_size_min) u8 {
+    const bytes = std.posix.mmap(
+        null,
+        len,
+        std.posix.PROT.READ | std.posix.PROT.WRITE,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true },
+        -1,
+        0,
+    ) catch return error.OutOfMemory;
+    _ = std.os.linux.madvise(bytes.ptr, bytes.len, std.os.linux.MADV.HUGEPAGE);
+    return bytes;
+}
+
+pub fn releaseBytes(bytes: []align(std.heap.page_size_min) u8) void {
+    std.posix.munmap(bytes);
+}
+
 pub const CollectionOptions = struct {
     /// Fixed capacity. When set, the collection pre-allocates at init and
     /// never grows. appendEntity returns error.Full when at capacity.
@@ -69,6 +92,11 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
         /// registration; the archetype registry leaves it 0.
         axis_index: u8 = 0,
 
+        /// Storage is one reserved mapping per column (see `reserveMax`)
+        /// rather than heap blocks: capacity is the registry's
+        /// max_entities and never changes again.
+        reserved: bool = false,
+
 
         /// Create a new collection. For fixed-capacity collections, this
         /// performs the single up-front allocation. For dynamic collections,
@@ -98,6 +126,21 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
             // sweep (h2's stream sweep, the worker's row sweeps) before
             // the registry dies.
 
+            if (self.reserved) {
+                if (self.entities) |e| {
+                    releaseBytes(mappedBytes(e, @as(usize, self.capacity) * @sizeOf(Entity)));
+                }
+                inline for (R.types, 0..) |T, i| {
+                    if (comptime @sizeOf(T) > 0) {
+                        if (self.columns[i]) |raw| {
+                            releaseBytes(mappedBytes(raw, @as(usize, self.capacity) * @sizeOf(T)));
+                        }
+                    }
+                }
+                self.* = undefined;
+                return;
+            }
+
             // Free entity array
             if (self.entities) |e| {
                 self.allocator.free(e[0..self.capacity]);
@@ -111,6 +154,47 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
             }
 
             self.* = undefined;
+        }
+
+        /// Re-home a GROWABLE collection's storage onto one reserved
+        /// mapping per column at `bound` capacity — the registry's
+        /// max_entities, which no single collection can exceed — so it
+        /// never reallocates again: no mid-tick whole-SoA copy, and
+        /// column base addresses are stable for the registry's
+        /// lifetime (slot CONTENTS still move on swap-remove). Called
+        /// at registration; idempotent. Comptime no-op for a
+        /// fixed-capacity collection: its heap block and its
+        /// error.Full stay — that refusal is admission policy, not a
+        /// growth artifact.
+        pub fn reserveMax(self: *Self, bound: u32) !void {
+            if (comptime options.capacity != null) return;
+            if (self.reserved) return;
+
+            const eb = try reserveBytes(@as(usize, bound) * @sizeOf(Entity));
+            const new_entities: [*]Entity = @ptrCast(@alignCast(eb.ptr));
+            if (self.entities) |old| {
+                @memcpy(new_entities[0..self.count], old[0..self.count]);
+                self.allocator.free(old[0..self.capacity]);
+            }
+            self.entities = new_entities;
+
+            inline for (R.types, 0..) |T, i| {
+                if (comptime @sizeOf(T) > 0) {
+                    const cb = try reserveBytes(@as(usize, bound) * @sizeOf(T));
+                    if (self.columns[i]) |old_raw| {
+                        @memcpy(alignedSlice(T, cb.ptr, self.count), alignedSlice(T, old_raw, self.count));
+                        freeColumn(T, self.allocator, old_raw, self.capacity);
+                    }
+                    self.columns[i] = cb.ptr;
+                } else if (self.columns[i] == null) {
+                    // ZST column: the dangling aligned marker the heap
+                    // path also uses — removeRun names every column.
+                    self.columns[i] = @ptrFromInt(effectiveAlign(T));
+                }
+            }
+
+            self.capacity = bound;
+            self.reserved = true;
         }
 
         /// Returns a typed, properly aligned slice for the given component.
@@ -240,6 +324,9 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
 
         /// Allocate (or reallocate) storage for `new_cap` entities.
         fn allocateStorage(self: *Self, new_cap: u32) !void {
+            // A reserved collection's capacity IS the structural bound;
+            // asking past it is a misuse the registry cannot produce.
+            if (self.reserved) return error.Full;
             const new_entities = try self.allocator.alloc(Entity, new_cap);
             if (self.entities) |old| {
                 @memcpy(new_entities[0..self.count], old[0..self.count]);
@@ -283,6 +370,13 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
 
         fn freeColumn(comptime T: type, allocator: std.mem.Allocator, raw: [*]u8, capacity: u32) void {
             allocator.free(alignedPtr(T, raw)[0..capacity]);
+        }
+
+        /// The byte view of a reserved mapping, as mmap'd — what
+        /// releaseBytes needs back.
+        fn mappedBytes(raw: anytype, len: usize) []align(std.heap.page_size_min) u8 {
+            const p: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(raw));
+            return p[0..len];
         }
 
         fn nextPow2(v: u32) u32 {
