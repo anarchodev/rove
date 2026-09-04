@@ -133,6 +133,15 @@ pub const Dispatcher = struct {
     /// `run`. Useful for tests and for the worker to log root causes.
     last_kv_error: ?anyerror = null,
 
+    /// Arena regime the most recent `runOutcome` COMPLETED under
+    /// (same read-after pattern as `last_kv_error`): `.gc` means either
+    /// the worker's churny hint or a bump-OOM retry. Stamped into the
+    /// LogRecord so replay re-runs under the same regime.
+    last_arena_mode: qjs.snap.ReqMode = .bump,
+    /// True iff the most recent `runOutcome` OOMed under bump and was
+    /// re-executed under GC — the worker's churny-map trigger.
+    last_arena_gc_retry: bool = false,
+
     fn snapshotInitFn(
         rt: *c.JSRuntime,
         ctx: *c.JSContext,
@@ -163,7 +172,8 @@ pub const Dispatcher = struct {
     }
 
     /// `init` with explicit arena sizes — tests exercising the arena
-    /// OOM path use a small request arena so exhausting it stays fast.
+    /// OOM/retry path use a small request arena so the churny loop
+    /// stays fast.
     pub fn initWithSizes(allocator: std.mem.Allocator, sizes: qjs.snap.Sizes) !Dispatcher {
         const snapshot = try qjs.Snapshot.create(sizes, snapshotInitFn, null);
         return .{
@@ -205,13 +215,14 @@ pub const Dispatcher = struct {
     /// (`*BlobBytes` from `worker.BytecodeCache`) used by the module
     /// loader to resolve `import` statements the entry module pulls
     /// in. `null` is valid if the entry has no imports.
-    /// The dispatch core — one run of the handler. `runOutcome` wraps
-    /// it with the arena-OOM fail-loud check; `run` (returns `Response`,
-    /// collapsing `.continuation`→501) wraps that; the continuation-aware
-    /// worker path calls `runOutcome` directly. The split keeps every
-    /// `run` call site unchanged while exposing the trampoline outcome
-    /// where it's needed.
-    fn runOutcomeOnce(
+    /// The dispatch core. `run` (returns `Response`, collapsing
+    /// `.continuation`→501) wraps this; the continuation-aware worker
+    /// path calls `runOutcome` directly. The split keeps every `run`
+    /// call site unchanged while exposing the trampoline outcome where
+    /// it's needed.
+    /// One dispatch attempt under an explicit arena regime. The
+    /// public `runOutcome` wraps this with the bump→GC OOM retry.
+    fn runOutcomeAttempt(
         self: *Dispatcher,
         kv: *kv_mod.KvStore,
         txn: *kv_mod.TrackedTxn,
@@ -224,6 +235,8 @@ pub const Dispatcher = struct {
         deployment_id: u64,
         request: Request,
         budget: *Budget,
+        mode: qjs.snap.ReqMode,
+        side_effects: *bool,
     ) DispatchError!RunOutcome {
         self.last_kv_error = null;
 
@@ -311,13 +324,15 @@ pub const Dispatcher = struct {
             .ws_frame_output = request.activation == .ws_message or
                 request.effects.pending_stream_chunk_opcodes != null,
             .is_system_module = request.is_system_module,
+            .side_effects_flag = side_effects,
             .parent_saga = request.trace.parent_saga,
         };
 
         // Reset the per-request arena and reseed time/random. The base
         // arena (runtime, intrinsics, globals) is shared in place across
-        // all requests on this thread — no memcpy, no relocation.
-        const restored = self.snapshot.restore();
+        // all requests on this thread — no memcpy, no relocation. The
+        // regime is per-attempt: bump for speed, GC for churny handlers.
+        const restored = self.snapshot.restoreMode(mode);
         var rt: qjs.Runtime = restored.runtime;
         var ctx: qjs.Context = restored.context;
         // Free any trigger-module namespaces we cached during this
@@ -412,14 +427,21 @@ pub const Dispatcher = struct {
         return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
     }
 
-    /// Run one activation. The request allocator is the GC regime
-    /// (`qjs.snap`), so the budget is the handler's peak live set. A run
-    /// that exhausts it produced a mangled outcome — discard it
-    /// wholesale (its readset tapes, effect accumulators, and its own
-    /// writeset contribution) and return a loud 500 terminal
-    /// (`decisions.md` §4.12; the fail-loud-on-resource-exhaustion
-    /// rule). The kv txn's staged writes are the caller's to roll back,
-    /// exactly as for any other handler error.
+    /// Run one activation, with the arena-OOM fallback: attempt under
+    /// the bump regime (or GC directly when the worker's churny map
+    /// says so via `request.arena_mode`); if the bump attempt exhausts
+    /// the request arena, discard it wholesale — savepoint-rolled kv
+    /// staging, attempt-scoped readset tapes, effect accumulators —
+    /// and re-execute once under GC (ceiling = peak live set instead
+    /// of cumulative allocation). Re-execution is safe because a
+    /// failed attempt is pre-commit and deterministic (same seed,
+    /// same pinned clock, same inputs); the ONE exception is an
+    /// attempt that fired an immediate worker-side effect
+    /// (blob streaming, cancel_fetch, fire_wake, resume_if_bound) —
+    /// those don't retry.
+    ///
+    /// After return, `last_arena_mode` / `last_arena_gc_retry` say
+    /// what happened (the worker's churny-map + LogRecord inputs).
     pub fn runOutcome(
         self: *Dispatcher,
         kv: *kv_mod.KvStore,
@@ -440,33 +462,99 @@ pub const Dispatcher = struct {
         request: Request,
         budget: *Budget,
     ) DispatchError!RunOutcome {
-        // The writeset is shared across a batch — a doomed run may only
-        // drop ITS OWN contribution.
+        self.last_arena_gc_retry = false;
+        const first_mode: qjs.snap.ReqMode = if (request.arena_mode == .gc) .gc else .bump;
+        self.last_arena_mode = first_mode;
+        // The writeset is shared across a batch — a discarded attempt
+        // may only drop ITS OWN contribution.
         const ws_ops_start = writeset.ops.items.len;
         const ws_owned_start = writeset.owned.items.len;
 
-        const outcome = self.runOutcomeOnce(kv, txn, writeset, bytecode, bytecodes, source_hashes, resolver, hooks, deployment_id, request, budget);
+        // Savepoint so a doomed bump attempt's staged kv writes drop
+        // wholesale (attempt 2 must not read attempt 1's writes — the
+        // read-your-writes overlay would corrupt e.g. counters). If the
+        // savepoint can't open, run single-attempt: correctness never
+        // depends on the retry.
+        var sp_open = true;
+        txn.savepoint() catch {
+            sp_open = false;
+        };
+
+        var side_effects = false;
+        const first = self.runOutcomeAttempt(kv, txn, writeset, bytecode, bytecodes, source_hashes, resolver, hooks, deployment_id, request, budget, first_mode, &side_effects);
 
         // The arena's exhaustion record is the capacity-vs-user-error
         // discriminator; it survives until the NEXT reset, so read it
-        // here, before any further restore. A run that hit it produced
-        // a mangled/empty outcome — never return that as a success.
-        if (self.snapshot.oomHit()) {
+        // here, before any further restore.
+        const oomed = self.snapshot.oomHit();
+        if (first_mode == .bump and oomed and sp_open and !side_effects) retry: {
             const stats = self.snapshot.oomStats();
+            // Roll the doomed attempt's staging back FIRST — if this
+            // fails we must return the original outcome untouched.
+            txn.rollbackTo() catch break :retry;
             std.log.warn(
-                "rove-js arena-oom: request arena exhausted (requested={d} used={d} limit={d}) — the handler's live set exceeds the budget; failing loud (500)",
+                "rove-js arena-oom: bump attempt exhausted the request arena (requested={d} used={d} limit={d}); re-executing under GC (churny handler)",
                 .{ stats.requested, stats.used, stats.limit },
             );
-            dropDoomedOutcome(self.allocator, outcome, request, writeset, ws_ops_start, ws_owned_start);
-            stampArenaRegime(request);
+            // Discard everything attempt 1 produced.
+            if (first) |*outcome_const| {
+                var outcome = outcome_const.*;
+                discardOutcome(self.allocator, &outcome);
+            } else |_| {}
+            if (request.trace.readset) |rs| rs.resetAttempt();
+            clearAttemptEffects(self.allocator, request);
+            writeset.truncateTo(ws_ops_start, ws_owned_start);
+
+            txn.savepoint() catch {
+                sp_open = false;
+            };
+            self.last_arena_mode = .gc;
+            self.last_arena_gc_retry = true;
+            var side_effects2 = false;
+            const second = self.runOutcomeAttempt(kv, txn, writeset, bytecode, bytecodes, source_hashes, resolver, hooks, deployment_id, request, budget, .gc, &side_effects2);
+            // Even the GC regime (ceiling = peak live set) can be too
+            // small for a genuinely huge request. If it OOM'd too, the
+            // outcome is a mangled/empty terminal — DON'T return it as a
+            // silent success; fail loud (decisions.md §4.12 + the
+            // fail-loud-on-resource-exhaustion rule).
+            if (self.snapshot.oomHit()) {
+                const stats2 = self.snapshot.oomStats();
+                std.log.warn(
+                    "rove-js arena-oom: GC re-execution ALSO exhausted the arena (requested={d} used={d} limit={d}) — failing loud (500)",
+                    .{ stats2.requested, stats2.used, stats2.limit },
+                );
+                dropDoomedOutcome(self.allocator, second, request, writeset, ws_ops_start, ws_owned_start);
+                if (sp_open) txn.release() catch {};
+                self.stampArenaMode(request);
+                return self.oomFailureOutcome();
+            }
+            if (sp_open) txn.release() catch {};
+            self.stampArenaMode(request);
+            return second;
+        }
+        if (oomed) {
+            // OOM that the GC retry couldn't rescue: the bump attempt
+            // fired an immediate worker-side effect (retry vetoed) or no
+            // savepoint was open. Its outcome is mangled/empty — surface
+            // a clean 500 rather than the silent empty body it would
+            // otherwise produce (the OOM-swallowing bug).
+            const stats = self.snapshot.oomStats();
+            std.log.warn(
+                "rove-js arena-oom: request arena exhausted (requested={d} used={d} limit={d}), not retryable (immediate side effects or no savepoint) — failing loud (500)",
+                .{ stats.requested, stats.used, stats.limit },
+            );
+            dropDoomedOutcome(self.allocator, first, request, writeset, ws_ops_start, ws_owned_start);
+            if (sp_open) txn.release() catch {};
+            self.stampArenaMode(request);
             return self.oomFailureOutcome();
         }
-        stampArenaRegime(request);
-        return outcome;
+        if (sp_open) txn.release() catch {};
+        self.stampArenaMode(request);
+        return first;
     }
 
     /// The loud terminal returned when the request arena is exhausted
-    /// (the handler's peak live set exceeds the budget). A
+    /// and neither the bump nor the GC regime could complete it. A
     /// non-empty `exception` makes every dispatch site emit a 5xx (the
     /// worker turns it into a 500) — never the silent empty 200 a
     /// mangled OOM outcome otherwise yields. Strings come from the
@@ -481,10 +569,10 @@ pub const Dispatcher = struct {
         } };
     }
 
-    /// Discard a doomed OOM run's outputs before returning a loud
-    /// failure: free the mangled outcome, drop the run's readset tapes
-    /// and effect accumulators, and truncate the batch-shared writeset
-    /// to this run's boundary (a wholesale clear would eat sibling
+    /// Discard a doomed OOM attempt's outputs before returning a loud
+    /// failure: free the mangled outcome, roll back the attempt-scoped
+    /// readset/effects, and truncate the batch-shared writeset to this
+    /// attempt's boundary (a wholesale clear would eat sibling
     /// handlers' ops).
     fn dropDoomedOutcome(
         allocator: std.mem.Allocator,
@@ -503,11 +591,11 @@ pub const Dispatcher = struct {
         writeset.truncateTo(ws_ops_start, ws_owned_start);
     }
 
-    /// Record on the readset's engine word that the request ran under
-    /// the GC arena regime (`ENGINE_ARENA_GC_BIT`) — the LogRecord /
-    /// bundle carry it, and a replayer that branches on it picks GC.
-    /// Unconditional: GC is the only regime (`qjs.snap`).
-    fn stampArenaRegime(request: Request) void {
+    /// Record the regime the request COMPLETED under on the readset's
+    /// engine word (`ENGINE_ARENA_GC_BIT`) — the LogRecord/bundle pick
+    /// it up from there and replay re-runs under the same regime.
+    fn stampArenaMode(self: *Dispatcher, request: Request) void {
+        if (self.last_arena_mode != .gc) return;
         if (request.trace.readset) |rs| {
             rs.js_engine_version |= qjs.ENGINE_ARENA_GC_BIT;
         }
@@ -523,9 +611,9 @@ pub const Dispatcher = struct {
         }
     }
 
-    /// Clear the caller-owned effect accumulators a doomed run pushed
-    /// into (the worker drains these post-outcome; a run the dispatcher
-    /// refused must leave nothing there).
+    /// Clear the caller-owned effect accumulators a discarded attempt
+    /// pushed into (the worker drains these post-outcome; a retry
+    /// must not double them).
     fn clearAttemptEffects(allocator: std.mem.Allocator, request: Request) void {
         if (request.effects.pending_fetches) |pf| {
             for (pf.items) |*item| item.deinit(allocator);

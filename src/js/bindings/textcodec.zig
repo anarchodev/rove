@@ -4,8 +4,8 @@
 //! (`_system.textcodec.*`).
 //!
 //! A byte-by-byte JS approach (`s += String.fromCharCode(b)`) costs
-//! ~N string reallocations — O(n²) bytes of intermediate garbage for
-//! the allocator to churn through (a ~139 KB decode was enough to
+//! ~N string reallocations of intermediate garbage, which a
+//! no-reclaim bump arena counts in full (a ~139 KB decode can
 //! exhaust a small request arena). Natively both directions are a
 //! single conversion: QuickJS strings construct FROM UTF-8
 //! (`JS_NewStringLen`) and convert TO UTF-8 (`JS_ToCStringLen`), so

@@ -70,16 +70,14 @@
 pub const JS_ENGINE_VERSION: u16 = 1;
 
 /// High bit of the engine-version word: the request executed under the
-/// GC arena regime (arenajs `JS_ARENA_REQ_MODE_GC`). Every current
-/// engine runs GC only (`snap.zig`; `decisions.md` §4.12), so the
-/// dispatcher sets this bit on every record — the allocator regime is
-/// part of the execution identity a replayer must reproduce (a request
-/// whose live set fits GC's peak ceiling can OOM under a cumulative
-/// bump ceiling), and a replayer that still branches on the bit picks
-/// GC. Records from before the regime was fixed carry it unset (they
-/// ran under bump) and replay as they ran. Riding the existing word
-/// keeps the frozen readset header / log-batch / bundle formats
-/// untouched. Bits 0–14 remain the monotonic engine version; mask with
+/// GC arena regime (arenajs 0.3 `JS_ARENA_REQ_MODE_GC` — the churny-
+/// handler fallback) instead of the default bump regime. Same-width
+/// interpretation switch rather than a new field: the allocator regime
+/// is part of the execution identity replay must reproduce (a
+/// GC-completed churny request OOMs under bump), and riding the
+/// existing word keeps the frozen readset header / log-batch / bundle
+/// formats untouched — old records have the bit unset = bump. Bits
+/// 0–14 remain the monotonic engine version; mask with
 /// `ENGINE_VERSION_MASK` before comparing versions.
 pub const ENGINE_ARENA_GC_BIT: u16 = 0x8000;
 pub const ENGINE_VERSION_MASK: u16 = 0x7FFF;

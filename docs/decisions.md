@@ -1128,64 +1128,68 @@ behavior, and what handler-shape.md promised). Three reasons:
 ---
 
 
-### 4.12 Per-request arena regime: GC only (2026-08-30; supersedes bump-first + GC fallback, 2026-07-07)
+### 4.12 Per-request arena regime: bump-first with a GC fallback (2026-07-07)
 
-**Decision.** Every engine that executes customer handlers — the worker,
-the offline sim, the browser replay arena — runs the request allocator
-in arenajs's GC regime (dlmalloc mspace + refcount/cycle GC; budget =
-PEAK live set). There is no bump regime, no bump→GC retry, no
-per-handler "churny" map, and no per-request mode selection. A run
-that exhausts the arena has a live set that genuinely does not fit:
-the dispatcher discards its outputs (readset tapes, effect
-accumulators, its own writeset contribution) and returns a terminal
-carrying a non-empty `exception` ("handler exhausted the request memory
-arena (OOM)") → every dispatch site emits a **500** (the
-fail-loud-on-resource-exhaustion rule: an infallibility violation must
-be a loud 5xx, never a plausible success). The kv txn's staged writes
-are the caller's to roll back, as for any handler error.
+**Decision.** Handlers run on arenajs's bump allocator (ceiling =
+CUMULATIVE allocation, ~3-instruction allocs, O(1) reset). When a
+request exhausts the arena (`js_dual_arena_oom_hit` — the
+capacity-vs-user-error discriminator), the dispatcher discards the
+attempt wholesale — savepoint-rolled kv staging, attempt-scoped
+readset tapes, effect accumulators, writeset contribution — and
+re-executes ONCE under the GC regime (dlmalloc mspace +
+refcount/cycle GC; ceiling = PEAK live set; ~20-30% slower). The
+worker's in-memory churny map (keyed tenant + dep_id + module, so a
+redeploy sheds the mark) routes known-churny handlers straight to GC.
+Re-execution is safe because a failed attempt is pre-commit and
+deterministic (same seed, same pinned clock, same inputs); an attempt
+that fired an immediate worker-side effect (blob streaming,
+cancel_fetch, fire_wake, resume_if_bound) is NOT retried.
 
-**Why.** (1) *Prod now matches the engine we already trust.* The sim
-went GC-always first because it cannot model a bump OOM faithfully;
-until this decision prod ran a regime the replay engine deliberately
-refused to reproduce, and a bump-only OOM was a prod-visible failure
-no fixture could show. (2) *Held requests make bump untenable.* The
-same-connection promise model (arenajs ≥ 0.6.0 requests-as-objects,
-`JS_NewRequest` / `Enter` / `Leave`) keeps a request's memory alive
-across activations; a bump cursor is cumulative for the life of the
-request, so a WebSocket held for an hour never reclaims a frame's
-garbage, and a mid-chain OOM cannot be retried (activation N cannot
-re-run 1..N−1). (3) *The retry was the complexity.* Bump-first bought a
-second execution path — savepoint + wholesale discard + the
-`side_effects_flag` veto for immediate effects + a per-thread
-churny map keyed on activation path — all of it subtractive once the
-regime is fixed. (4) *The tax is measured, not assumed.* Same box,
-ReleaseFast, 1 worker, node port direct, 20k requests × 3 rounds
-(`scripts/smoke/bench/arena_alloc_bench.py`), on the same arenajs
-(0.6.0) so the regime is the only variable: an allocation-heavy handler
-(500 objects + a JSON round trip per request) ran at 397 req/s under
-bump and 308 under GC (−22%); a one-`kv.get` handler ran at 45.4k req/s
-under bump and 41.2k under GC (−9%). Against the previous pin (arenajs
-0.4.0, bump: 444 / 48.5k) the pin bump itself costs a further −11% /
-−6% — an arenajs-side finding, not part of this decision. The regime's
-tax is paid on every request; what it buys is one execution path, one
-memory semantic on every engine, and the held-request model at all.
+**An unrecoverable OOM fails LOUD, never silently.** When the GC
+re-execution ALSO exhausts the arena (a genuinely too-large request),
+or the OOM was non-retryable (immediate side effect, or no savepoint),
+the dispatcher discards the doomed attempt's outputs and returns a
+terminal carrying a non-empty `exception` ("handler exhausted the
+request memory arena (OOM)") → every dispatch site emits a **500**.
+This closes the pre-existing swallow bug where a mangled OOM outcome
+surfaced as a silent empty 200 (the fail-loud-on-resource-exhaustion
+rule: an infallibility violation must be a loud 5xx, not a plausible
+success). The error strings come from the worker allocator, not the
+exhausted JS arena.
 
-**Replay.** The readset's engine word keeps the GC high bit
-(`ENGINE_ARENA_GC_BIT`), now set on every record: a replayer that
-branches on it (the browser cursor) picks GC, and records from before
-the regime was fixed carry it unset and replay under bump as they ran.
-No format bump — the bit was already defined, and allocator regime is
-on the engine-version SOP's do-not-bump list. `world.json` no longer
-carries `arena_gc`; the driver runs GC unconditionally.
+**Replay.** The regime is part of the execution identity (a
+GC-completed churny request OOMs under bump), stamped as the HIGH BIT
+of the readset's `js_engine_version` word (same-width interpretation
+per the wire-width rule — zero frozen-format changes; old records
+read as bump). `export-fixture` carries it into world.json
+(`arena_gc`); the native driver sets the reactor mode per run; the
+WASM shell errors clearly until its artifact is rebuilt from
+arenajs ≥ 0.3.2.
 
-**Rejected:** keeping bump for run-to-completion handlers and GC only
-for held ones (mode binds at request creation, before the handler
-reveals whether it will await — a misprediction is a held bump request
-with a cumulative ceiling and no retry); a per-module "holds" bit
-learned like the churny map (the same second path, re-grown); a
-customer-visible mode knob (one safe semantic, no unsafe default).
+**Rejected:** always-GC (a 20-30% tax on every handler for the rare
+churny one); a customer-visible mode knob (the platform can learn it —
+one safe semantic, no unsafe default); persisting the churny map
+(a restart re-learns for the cost of one retry).
 
 ## 5. Readset replication
+
+**Adopted-and-reverted: GC-only (2026-08-30 → 2026-09-04).** The
+always-GC rejection above was overturned once — every engine ran
+GC-only for five days (`gc-always`, the #926 window) — and this
+decision was then restored. The adoption's forcing reason was the
+same-connection promise model: a request's live heap spanning
+activations makes a cumulative bump ceiling untenable (a held
+connection's cursor only grows, and a mid-chain OOM cannot re-run
+prior activations). When that model was abandoned, the forcing reason
+went with it, and the regime's measured tax carried the reversion:
+−9% (one-`kv.get` handler) and −22% (allocation-heavy) on
+`arena_alloc_bench.py`, −6..−9% end-to-end on the sharded write
+bench. What GC-only bought and the reversion gives back up: one
+request-memory semantic on every engine. The offline sim stays
+GC-always (a bump OOM offline is a false failure the retry absorbs in
+prod), and replay keeps selecting the regime per record via the
+engine word's GC bit — prod's bump-first regime is exactly what those
+two already modeled.
 
 ### 4.13 kv subscriptions: durable coalesced level-trigger (2026-07-07)
 
