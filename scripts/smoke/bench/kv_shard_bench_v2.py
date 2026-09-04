@@ -176,13 +176,22 @@ def main() -> int:
                 return 1
             if BALANCE and NODES > 1:
                 cap = -(-TENANTS // NODES)  # ceil
-                for _ in range(4 * TENANTS):
+                for rnd in range(4 * TENANTS):
                     loads = {n: sum(1 for v in target.values() if v == n)
                              for n in range(NODES)}
                     heavy = max(loads, key=lambda n: loads[n])
                     if loads[heavy] <= cap:
                         break
-                    shed = next(t for t in tenants if target[t] == heavy)
+                    # Rotate the shed pick across rounds: the handoff target
+                    # is raft's choice (most caught-up follower), so shedding
+                    # the same group every round can ping-pong between two
+                    # loaded nodes and never touch the light one. A different
+                    # group re-rolls that choice.
+                    on_heavy = [t for t in tenants if target[t] == heavy]
+                    shed = on_heavy[rnd % len(on_heavy)]
+                    print(f"    balance round {rnd}: loads="
+                          f"{[loads[n] for n in range(NODES)]} "
+                          f"shed {shed} off n{heavy}")
                     _curl(f"{c.node_url(heavy)}/_system/v2-transfer-leadership"
                           f"?tenant={shed}", method="POST",
                           headers={"X-Rewind-Move-Secret": MOVE_SECRET})
