@@ -308,6 +308,7 @@ pub fn jsContinuationResumeIfBound(
     // anonymous paths the field is null — the call is a no-op (returns
     // false), matching the "no parked continuations to match" outcome.
     const fn_ptr = state.resume_if_bound orelse return globals.js_false;
+    if (state.side_effects_flag) |f| f.* = true;
     const fn_ctx = state.worker_ctx orelse return globals.js_false;
     const matched = fn_ptr(fn_ctx, state.instance_id, send_id, event_json);
     return if (matched) globals.js_true else globals.js_false;

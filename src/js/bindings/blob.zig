@@ -218,6 +218,7 @@ pub fn jsBlobWrite(
     argv: [*c]c.JSValue,
 ) callconv(.c) c.JSValue {
     const state = globals.getState(ctx);
+    if (state.side_effects_flag) |f| f.* = true;
     const write_fn = state.blob_write orelse {
         _ = c.JS_ThrowTypeError(ctx, "blob.write: not supported in this context");
         return js_exception;
@@ -267,6 +268,7 @@ pub fn jsBlobSeal(
     argv: [*c]c.JSValue,
 ) callconv(.c) c.JSValue {
     const state = globals.getState(ctx);
+    if (state.side_effects_flag) |f| f.* = true;
     const seal_fn = state.blob_seal orelse {
         _ = c.JS_ThrowTypeError(ctx, "blob.seal: not supported in this context");
         return js_exception;
