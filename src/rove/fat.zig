@@ -331,11 +331,16 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 offsets[i] = @intCast(i);
             }
 
-            const fat_table = try allocator.alloc(Fat, max);
-            // Headers only: gen 0 + empty mask reads as "nothing written"
-            // for every generation, including 0. Component bytes stay
-            // untouched until first park/materialize.
-            for (fat_table) |*f| f.hdr = .{};
+            // The shadow store rides reserved zero pages and is never
+            // initialized: a zero header is gen 0 + empty mask, which
+            // reads as "nothing written" for every generation, so a
+            // fresh page IS a fresh slot. It is the registry's largest
+            // table by far (the universe struct per entity), and this
+            // is what keeps boot from committing it whole — physical
+            // memory follows the entities that actually park. The
+            // metadata arrays above stay on the heap: at bytes per
+            // entity there is no memory worth reserving.
+            const fat_table = try reserveTable(Fat, max);
 
             const column_fns = try allocator.alloc(?ColumnFn, MAX_COLLECTIONS * Universe.len);
             @memset(column_fns, null);
@@ -382,7 +387,7 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
                 self.allocator.free(self.partial_ids[k]);
                 self.allocator.free(self.partial_offsets[k]);
             }
-            self.allocator.free(self.fat_table);
+            releaseTable(Fat, self.fat_table);
             self.allocator.free(self.column_fns);
             self.allocator.free(self.generations);
             self.allocator.free(self.collection_ids);
@@ -390,7 +395,7 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
             self.allocator.free(self.flags);
             self.allocator.free(self.null_pool);
             for (&self.queues) |*q| {
-                if (q.ops.len > 0) std.posix.munmap(queueBytes(q.ops));
+                if (q.ops.len > 0) releaseTable(DeferredOp, q.ops);
             }
             if (self.late_ops.len > 0) self.allocator.free(self.late_ops);
             self.* = undefined;
@@ -1177,27 +1182,41 @@ pub fn FatRegistryAxes(comptime Universe: type, comptime axes_spec: AxesSpec) ty
 
         /// The byte view of a queue's reserved region, as mmap'd —
         /// what munmap needs back.
-        fn queueBytes(ops: []DeferredOp) []align(std.heap.page_size_min) u8 {
-            const p: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(ops.ptr));
-            return p[0 .. ops.len * @sizeOf(DeferredOp)];
-        }
-
-        /// Reserve a source's queue: address space for the structural
-        /// maximum (one op per resident entity ⇒ max_entities), in one
+        /// Reserve an entity-indexed table: `n` elements of T in one
         /// anonymous NORESERVE mapping. The OS backs pages on first
-        /// touch, so physical cost is the queue's high-water mark at
-        /// page granularity, and the array never moves.
-        fn reserveQueue(self: *Self, q: *CollQueue) error{OutOfMemory}!void {
-            @branchHint(.cold);
+        /// touch and every page starts zero, so a table whose zero
+        /// element means "fresh" needs no init pass at all and costs
+        /// physical memory only where entities have actually reached —
+        /// the whole shadow store rides on this. The mapping never
+        /// moves for the registry's lifetime.
+        fn reserveTable(comptime T: type, n: usize) error{OutOfMemory}![]T {
             const bytes = std.posix.mmap(
                 null,
-                @as(usize, self.max_entities) * @sizeOf(DeferredOp),
+                n * @sizeOf(T),
                 std.posix.PROT.READ | std.posix.PROT.WRITE,
                 .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true },
                 -1,
                 0,
             ) catch return error.OutOfMemory;
-            q.ops = @as([*]DeferredOp, @ptrCast(@alignCast(bytes.ptr)))[0..self.max_entities];
+            // Hugepage-eligible: the table is walked by entity index, so
+            // 2 MiB pages cut TLB misses across the registry; under
+            // NORESERVE only the huge pages actually touched commit.
+            // Advisory — a kernel that declines leaves the mapping as is.
+            _ = std.os.linux.madvise(bytes.ptr, bytes.len, std.os.linux.MADV.HUGEPAGE);
+            return @as([*]T, @ptrCast(@alignCast(bytes.ptr)))[0..n];
+        }
+
+        fn releaseTable(comptime T: type, table: []T) void {
+            const p: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(table.ptr));
+            std.posix.munmap(p[0 .. table.len * @sizeOf(T)]);
+        }
+
+        /// Reserve a source's queue at the structural maximum: one op
+        /// per resident entity ⇒ max_entities. Physical cost is the
+        /// queue's high-water mark at page granularity.
+        fn reserveQueue(self: *Self, q: *CollQueue) error{OutOfMemory}!void {
+            @branchHint(.cold);
+            q.ops = try reserveTable(DeferredOp, self.max_entities);
         }
 
         fn opOrder(_: void, a: DeferredOp, b: DeferredOp) bool {
