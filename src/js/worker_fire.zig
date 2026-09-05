@@ -29,6 +29,7 @@ const components_mod = @import("components.zig");
 const effect_mod = @import("effect/root.zig");
 const builtin_modules_mod = @import("builtin_modules.zig");
 const deployment_cache = @import("deployment_cache.zig");
+const kv_export_mod = @import("kv_export.zig");
 
 const kv_mod = @import("raft-kv");
 const worker_mod = @import("worker.zig");
@@ -592,6 +593,34 @@ pub fn fireDispatchActivation(
     const allocator = worker.allocator;
     const tenant_id = pd.tenant_id;
     const module_path = pd.module_path;
+
+    // A dispatch may target a tenant no activation has touched since boot —
+    // registry-known (a root `instance/{id}` row) but with no deploy slot
+    // yet. Materialize the slot the way inbound traffic would, so "known to
+    // the platform" and "fireable" stay one question; without this,
+    // firePrep's slot lookup skips the fire and the caller's watchdog
+    // re-fires a permanently unfireable dispatch forever.
+    //
+    // ONLY for a tenant whose raft group this node hosts. A registry row
+    // alone (the operator-raw createInstance) is not a serving tenant: a
+    // fire there would run, answer, and then have its writes evaporate on
+    // the forgetful propose ("group not hosted") — a completed result
+    // claiming work that never committed. No group ⇒ no fire; the caller's
+    // watchdog re-fires, which is also the safe direction while a
+    // provision or move is in flight.
+    const hosted = blk: {
+        const gid = worker.raft.gidForTenant(tenant_id) orelse break :blk false;
+        break :blk worker.raft.sigFor(gid) != null;
+    };
+    if (hosted) {
+        if (worker.node.tenant.getInstance(tenant_id) catch null) |inst| {
+            _ = worker.node.deploy.getOrOpenTenantSlot(inst) catch |err| std.log.warn(
+                "rove-js platform-dispatch: tenant={s} slot open failed: {s}",
+                .{ tenant_id, @errorName(err) },
+            );
+        }
+    }
+
     var p = firePrep(worker, tenant_id, module_path, "platform-dispatch") orelse return;
     defer p.deinit(allocator);
 
@@ -623,6 +652,7 @@ pub fn fireDispatchActivation(
         .on_stream = .warn,
         .readonly_cont_commits = true,
         .tape = .callback,
+        .capture_terminal = true,
     }, module_path, corr_full, module_path, "");
 
     // The return path. The target cannot write into the origin's store —
@@ -639,8 +669,22 @@ pub fn fireDispatchActivation(
     if (!p.completed_ok) return;
     if (pd.origin_tenant.len == 0 or pd.dispatch_id.len == 0) return;
 
-    const result_ctx = std.fmt.allocPrint(allocator, "{{\"id\":\"{s}\"}}", .{pd.dispatch_id}) catch return;
-    defer allocator.free(result_ctx);
+    // The result carries the target's committed terminal outcome — status +
+    // body — alongside the id. The body is arbitrary bytes from another
+    // tenant's code: byte-escaped here, and treated by the origin with the
+    // same posture as a request body (untrusted data, never trusted shape).
+    // `overflow` says the `TERMINAL_CAPTURE_MAX` cap truncated it; the
+    // origin sees an incomplete payload flagged, never silently clipped.
+    var result_buf: std.ArrayList(u8) = .empty;
+    defer result_buf.deinit(allocator);
+    const head = std.fmt.allocPrint(allocator, "{{\"id\":\"{s}\",\"status\":{d},\"overflow\":{},\"body\":", .{
+        pd.dispatch_id, p.terminal_status, p.terminal_overflow,
+    }) catch return;
+    defer allocator.free(head);
+    result_buf.appendSlice(allocator, head) catch return;
+    kv_export_mod.appendJsonString(allocator, &result_buf, p.terminal_body) catch return;
+    result_buf.append(allocator, '}') catch return;
+    const result_ctx = result_buf.items;
     // Engine-originated, so platform-bound by construction: this hop is not a
     // tenant asking to reach another scope, it is the engine closing a loop it
     // opened. It carries NO origin of its own — a result that produced a
