@@ -115,6 +115,37 @@ def main() -> int:
         check("dashboard-app deployment serves", got.status == 200 and '"ok":true' in got.body,
               f"{got.status} {got.body[:120]!r}")
 
+        # 5. Admin root writes are dispatched activations: the raw
+        #    operator createInstance and the domain assign each dispatch
+        #    __system/root_kv_install against __root__ and PARK on the owed
+        #    marker's resolution — the 201 is released only once the root
+        #    write committed, and __root__'s log carries the activation.
+        import json as _json
+        import time as _time
+        from smoke_lib_v2 import _curl
+        node = c.node_url(0)
+        auth = {"Authorization": f"Bearer {c.root_token}", "Host": c.admin_host(0)}
+        r = _curl(f"{node}/v1/instances/rootwrite-probe", method="PUT", headers=auth)
+        check("raw createInstance → 201 (parked on the root activation)",
+              r.status == 201, f"got {r.status} {r.body[:160]!r}")
+        r = _curl(f"{node}/v1/domains/rootwrite.example", method="PUT",
+                  headers={**auth, "Content-Type": "application/json"},
+                  data=_json.dumps({"instance_id": "rootwrite-probe"}))
+        check("assignDomain → 201", r.status == 201, f"got {r.status} {r.body[:160]!r}")
+        c.spawn_log_server()
+        found = None
+        deadline = _time.time() + 20.0
+        while _time.time() < deadline:
+            lr = c.log_get("__root__/list")
+            if lr.status == 200 and "root_kv_install" in lr.body:
+                found = lr
+                break
+            _time.sleep(0.5)
+        check("the root writes landed as activations in __root__'s log",
+              found is not None,
+              "present" if found is not None
+              else "absent after 20s — the writes left no account of themselves")
+
     print()
     if failures:
         print(f"FAILURES ({len(failures)}): " + ", ".join(failures))

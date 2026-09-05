@@ -3,7 +3,7 @@
 // all succeed. `platform.compile` is ungated in both (door-side check in prod).
 import { scenario, expect } from "rewind:test";
 
-const GATED = ["scope", "root", "instances", "releases"];
+const GATED = ["scope", "root", "releases"];
 const NOT_ADMIN = /only available on the admin handler/;
 
 // Non-admin (default): the gated methods throw, compile still emits.
@@ -29,4 +29,3 @@ expect(ok.effects.some((e) => e.kind === "platform" && e.op === "scope")).toBe(t
 // The recorders carry their real arguments — the effect log distinguishes which
 // deployment was published on which tenant, and which instance was created.
 expect(ok.effects.some((e) => e.op === "releases.publish" && e.tenant === "acme" && e.depId === "0123456789abcdef")).toBe(true);
-expect(ok.effects.some((e) => e.op === "instances.create" && e.name === "x")).toBe(true);

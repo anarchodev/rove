@@ -142,6 +142,15 @@ const MODULES = [_]struct {
         .src = @embedFile("builtin_config_install_mjs"),
     },
     .{
+        // root-scope kv writes (`instance/{id}` create, domain
+        // assigns, deletes) — dispatched by the admin app via
+        // platform.dispatch against `__root__`. No targetable flags: the
+        // platform-dispatch funnel is admin-gated and takes any baked
+        // module; the customer-armable routes cannot name this.
+        .path = "__system/root_kv_install.mjs",
+        .src = @embedFile("builtin_root_kv_install_mjs"),
+    },
+    .{
         // rove#715: a `domain/{host}` alias, written by `__root__` in its
         // own scope — dispatched by `/_system/v2-domain` after the CP
         // authenticates; cluster routing state stops riding another

@@ -525,6 +525,10 @@ pub fn installRequest(
         request.activation == .disconnect or
         request.activation == .kv_wake or
         request.activation == .wake_batch or
+        // A platform dispatch's body IS the synthesized `{"ctx":…}` envelope
+        // (worker_fire's `synthCtxBody`) — the target reads its payload from
+        // `request.ctx` like every other chained activation.
+        request.activation == .platform_dispatch or
         request.activation == .timer)
     {
         liftThreadedCtx(ctx, req_obj, request.body, state.allocator);

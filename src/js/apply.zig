@@ -87,11 +87,15 @@ pub const EnvelopeType = enum(u8) {
     /// Numbered to match `kv.cluster.ENVELOPE_TYPE_MULTI` (the shared
     /// Cluster library; raft-kv-design.md step 4).
     multi = 1,
-    root_writeset = 2,
     // RETIRED SLOTS (not enum variants ⇒ `decodeEnvelope` rejects
     // them as `UnknownEnvelopeType`, so any stale raft-log entry
     // trips the apply panic at startup instead of silently
     // mis-applying — deliberate; every migration window predates 1.0):
+    //   2        root_writeset — the cluster root is a TENANT now:
+    //            `__root__` has its own group, and its
+    //            writes are ordinary type-0 writesets produced by
+    //            dispatched activations in root scope. Nothing rides
+    //            another tenant's log.
     //   3        files_writeset — manifests live in a per-tenant
     //            deployments/ BlobBackend, `_deploy/current` rides
     //            envelope 0.
@@ -135,24 +139,6 @@ pub fn encodeWriteSetEnvelope(
     return encodeTyped(allocator, .writeset, id, payload);
 }
 
-/// Build a root writeset envelope. type=2, no per-tenant id (id_len=0).
-/// Applied to `{data_dir}/__root__.db` on followers. Used for writes
-/// that update platform-level tables (tenant registry, domain
-/// mappings) — signup's `tenant.createInstance` and the admin JS
-/// handler's `platform.root.set/delete` collect their ops here.
-///
-/// Type 2 stays writeset-only — its producers include non-handler
-/// flows (ACME cert renewal in `acme.zig`) that have no readset to
-/// attach. The handler-originated producers (signup, admin
-/// `platform.root.*`) ride alongside type-0 envelopes in a batched
-/// propose, and the readset lives on the anchor type-0 of the same
-/// batch — same dispatch, same readset.
-pub fn encodeRootWriteSetEnvelope(
-    allocator: std.mem.Allocator,
-    ws_bytes: []const u8,
-) ![]u8 {
-    return encodeTyped(allocator, .root_writeset, "", ws_bytes);
-}
 
 
 /// Build a multi-envelope wrapper (type=1) carrying `inner` as already-
@@ -256,7 +242,6 @@ pub fn forEachWriteSetEnvelope(
                 // nested multi + root_writeset carry no readset: skip.
             }
         },
-        .root_writeset => {},
     }
 }
 
@@ -293,15 +278,15 @@ test "writeset envelope encode/decode round trip (with readset)" {
     try testing.expectEqualStrings(rs, payload.rs_bytes);
 }
 
-test "root writeset envelope encode/decode round trip" {
-    const ws = "root ws bytes";
-    const enc = try encodeRootWriteSetEnvelope(testing.allocator, ws);
-    defer testing.allocator.free(enc);
-
-    const dec = try decodeEnvelope(enc);
-    try testing.expectEqual(EnvelopeType.root_writeset, dec.type);
-    try testing.expectEqualStrings("", dec.instance_id);
-    try testing.expectEqualStrings(ws, dec.payload);
+test "decodeEnvelope rejects the retired root_writeset type byte loudly" {
+    // Type 2 joined the retired list: the cluster root is a
+    // tenant, its writes ride ordinary type-0 writesets in `__root__`'s own
+    // group. A stale raft-log entry carrying the old byte must surface at
+    // apply instead of silently mis-applying.
+    try testing.expectError(
+        Error.UnknownEnvelopeType,
+        decodeEnvelope(&[_]u8{ 2, 0x00, 0x00 }),
+    );
 }
 
 test "decodeEnvelope rejects truncated input" {
@@ -339,10 +324,10 @@ test "multi envelope wraps + unwraps several inner envelopes" {
     const a = testing.allocator;
     const inner_ws = try encodeWriteSetEnvelope(a, "acme", "ws bytes", "");
     defer a.free(inner_ws);
-    const inner_root = try encodeRootWriteSetEnvelope(a, "root bytes");
-    defer a.free(inner_root);
+    const inner_two = try encodeWriteSetEnvelope(a, "globex", "more bytes", "");
+    defer a.free(inner_two);
 
-    const wrapped = try encodeMultiEnvelope(a, &.{ inner_ws, inner_root });
+    const wrapped = try encodeMultiEnvelope(a, &.{ inner_ws, inner_two });
     defer a.free(wrapped);
 
     const outer = try decodeEnvelope(wrapped);
@@ -361,9 +346,10 @@ test "multi envelope wraps + unwraps several inner envelopes" {
     try testing.expectEqual(@as(usize, 0), p0.rs_bytes.len);
 
     const e1 = try decodeEnvelope(inner[1]);
-    try testing.expectEqual(EnvelopeType.root_writeset, e1.type);
-    try testing.expectEqualStrings("", e1.instance_id);
-    try testing.expectEqualStrings("root bytes", e1.payload);
+    try testing.expectEqual(EnvelopeType.writeset, e1.type);
+    try testing.expectEqualStrings("globex", e1.instance_id);
+    const p1 = try decodeWriteSetPayload(e1.payload);
+    try testing.expectEqualStrings("more bytes", p1.ws_bytes);
 }
 
 test "multi envelope with empty inner list" {

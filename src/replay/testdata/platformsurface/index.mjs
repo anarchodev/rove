@@ -4,7 +4,6 @@ export default function ({ platform }) {
   response.status = 200;
   return {
     surface: { http: typeof http, platform: typeof platform, browser: typeof browser },
-    created: platform.instances.create("acme"), // prod returns undefined; records the effect
     rootRead: platform.root.get("cfg/x"),                // reads the isolated root store
   };
 }

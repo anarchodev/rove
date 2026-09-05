@@ -1670,12 +1670,12 @@ test "two tenants get independent stores on the same node" {
     try testing.expectEqualStrings("bob", b_who);
 }
 
-test "multi: inner writesets route by INNER id (cross-tenant + root) through the resolver" {
+test "multi: inner writesets route by INNER id (cross-tenant) through the resolver" {
     // The admin-batch shape (`raft_propose.zig proposeBatch`): one multi
     // through the ANCHOR tenant's group carrying [anchor ws, cross-tenant
-    // target ws, root ws]. Apply must route each inner by ITS id: slot-routed
+    // target ws]. Apply must route each inner by ITS id: slot-routed
     // apply would write the target's keys into the anchor's store on a
-    // follower (cross-tenant corruption) and error on the root inner.
+    // follower (cross-tenant corruption).
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1685,7 +1685,7 @@ test "multi: inner writesets route by INNER id (cross-tenant + root) through the
     const node = try Node.initSingleNode(a, dir);
     defer node.deinit();
 
-    // Simulated worker stores: anchor ("admin"), target ("acme"), root ("").
+    // Simulated worker stores: anchor ("admin"), target ("acme").
     const open = struct {
         fn open(alloc: std.mem.Allocator, base: []const u8, name: []const u8) !*KvStore {
             const p = try std.fmt.allocPrintSentinel(alloc, "{s}/{s}.db", .{ base, name }, 0);
@@ -1697,29 +1697,24 @@ test "multi: inner writesets route by INNER id (cross-tenant + root) through the
     defer anchor_store.close();
     const target_store = try open(a, dir, "w-acme");
     defer target_store.close();
-    const root_store = try open(a, dir, "w-root");
-    defer root_store.close();
-
     const Resolver = struct {
         anchor: *KvStore,
         target: *KvStore,
-        root: *KvStore,
         fn resolve(ctx: *anyopaque, group_id: u64, id_str: []const u8) ?*KvStore {
             _ = group_id;
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (id_str.len == 0) return self.root;
             if (std.mem.eql(u8, id_str, "admin")) return self.anchor;
             if (std.mem.eql(u8, id_str, "acme")) return self.target;
             return null;
         }
     };
-    var res: Resolver = .{ .anchor = anchor_store, .target = target_store, .root = root_store };
+    var res: Resolver = .{ .anchor = anchor_store, .target = target_store };
     node.apply.store_resolver = .{ .ctx = &res, .func = Resolver.resolve };
 
     const gid: u64 = 77;
     const slot = try node.ensureGroup(gid, "admin");
 
-    // Build the three inners.
+    // Build the two inners.
     var ws_a = WriteSet.init(a);
     defer ws_a.deinit();
     try ws_a.addPut("anchor-key", "anchor-val");
@@ -1736,15 +1731,7 @@ test "multi: inner writesets route by INNER id (cross-tenant + root) through the
     const e_target = try envelope.encodeWriteSet(a, "acme", ws_t_bytes);
     defer a.free(e_target);
 
-    var ws_r = WriteSet.init(a);
-    defer ws_r.deinit();
-    try ws_r.addPut("instance/acme", "1");
-    const ws_r_bytes = try ws_r.encode(a);
-    defer a.free(ws_r_bytes);
-    const e_root = try envelope.encodeRootWriteSet(a, ws_r_bytes);
-    defer a.free(e_root);
-
-    const multi = try envelope.encodeMulti(a, &.{ e_anchor, e_target, e_root });
+    const multi = try envelope.encodeMulti(a, &.{ e_anchor, e_target });
     defer a.free(multi);
 
     const before = slot.applied_idx;
@@ -1762,13 +1749,8 @@ test "multi: inner writesets route by INNER id (cross-tenant + root) through the
     const tv = try target_store.get("target-key");
     defer a.free(tv);
     try testing.expectEqualStrings("target-val", tv);
-    const rv = try root_store.get("instance/acme");
-    defer a.free(rv);
-    try testing.expectEqualStrings("1", rv);
-
     // …and did NOT leak into the anchor's store (the cross-tenant corruption).
     try testing.expectError(Error.NotFound, anchor_store.get("target-key"));
-    try testing.expectError(Error.NotFound, anchor_store.get("instance/acme"));
 }
 
 test "multi: a cross-tenant inner with no resolver fails loud (UnroutedApply)" {

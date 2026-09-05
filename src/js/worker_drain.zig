@@ -559,7 +559,17 @@ pub fn resolveDeployment(
     module_path: []const u8,
 ) !ChainDeployment {
     const slot = worker.node.deploy.tenant_files_map.get(tenant_id) orelse return error.ResumeNoTenant;
-    const snap = slot.pinCurrent() orelse return error.ResumeNoDeployment;
+    const snap = slot.pinCurrent() orelse blk: {
+        // A baked module needs no deployment (rove#843): the scope may have
+        // none at all — `__root__` never does (a platform dispatch into root
+        // scope ) — and the empty snapshot is the correct world for
+        // code resolved from the binary. A TENANT module without a
+        // deployment still refuses: "not deployed" must not quietly become
+        // "ran something else".
+        if (builtin_modules_mod.isBuiltinPath(module_path))
+            break :blk slot.pinForBaked() catch return error.ResumeNoDeployment;
+        return error.ResumeNoDeployment;
+    };
     var tc = TenantFiles{ .slot = slot, .snap = snap };
     errdefer tc.release();
     const inst = (worker.node.tenant.getInstance(tenant_id) catch return error.ResumeNoInstance) orelse

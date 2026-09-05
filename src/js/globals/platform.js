@@ -291,24 +291,6 @@
         return sys.root.get(key);
       },
       /**
-       * Write to the root store. Replicates via the root writeset.
-       * @param {string} key
-       * @param {string} value
-       * @returns {void}
-       * @example platform.root.set(`domain/${host}`, JSON.stringify(rec));
-       */
-      set(key, value) {
-        return sys.root.set(key, value);
-      },
-      /**
-       * @param {string} key
-       * @returns {void}
-       * @example platform.root.delete(`domain/${host}`);
-       */
-      delete(key) {
-        return sys.root.delete(key);
-      },
-      /**
        * Prefix scan of the root store. Same pagination contract as
        * {@link kv.prefix} (limit default 100, max 1000).
        * @param {string} prefix
@@ -328,18 +310,6 @@
      * @namespace platform.instances
      */
     instances: {
-      /**
-       * Create an instance: its directory + `app.db`, the local
-       * `instance/{name}` marker, and the replicated root marker.
-       * Idempotent. Throws `Error{code:"InvalidName"}` on a bad name.
-       *
-       * @param {string} name - Instance id.
-       * @returns {void}
-       * @example platform.instances.create("acme-prod");
-       */
-      create(name) {
-        return sys.instances.create(name);
-      },
       /**
        * Deploy the platform-baked starter app (`index.mjs` +
        * `_static/index.html`) into `name` and flip
@@ -464,8 +434,15 @@
       // marker before firing: an attempt that escaped a rolled-back
       // activation would be an effect the cluster never agreed to.
       kv.set("_dispatch/owed/" + id, JSON.stringify(marker));
+      // The FIRST fire arms at now — the durable wake IS the fire path, so
+      // an initial arm at the watchdog distance would make every dispatch
+      // wait out the recovery interval (measured: a caller parked on the
+      // marker's resolution timed out at 15s against a 40s first fire).
+      // `dispatch_fire` re-arms its own +WATCHDOG per attempt under the
+      // same idempotency key, so recovery pacing is unchanged after the
+      // first attempt.
       sysSched(
-        { in: DISPATCH_WATCHDOG_MS },
+        { in: 0 },
         "__system/dispatch_fire",
         { id: id },
         { key: "_dispatch/" + id },

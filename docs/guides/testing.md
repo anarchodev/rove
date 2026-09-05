@@ -522,20 +522,23 @@ never bleed into one another. Seed the other stores on the scenario, and read
 their post-state back with `instanceKv` / `rootKv`:
 
 Declaring an instance also makes it **resolvable**: `platform.scope(id)`
-resolves eagerly, so an id the scenario didn't declare (and the run didn't
-`instances.create`) throws `Error{code:"InstanceNotFound"}` at the call site —
-the same ghost-id behavior as production.
+resolves eagerly, so an id the scenario didn't declare throws
+`Error{code:"InstanceNotFound"}` at the call site — the same ghost-id behavior
+as production. (Creating an instance is not an in-handler verb: root writes are
+dispatched activations against the `__root__` group, so a scenario *seeds* the
+instances and root rows its handler expects.)
 
 ```js
 const s = scenario({
   admin: true,                                    // platform.* is admin-only
   isRoot: true,                                   // arrived with the operator credential
   instances: { acme: { kv: { profile: "{}" } } }, // seed acme's isolated store
+  root: { kv: { "instance/acme": "{}" } },        // seed the root store
 });
 
 const r = s.inbound({ method: "POST", path: "/provision" });
 expect(r.instanceKv("acme", "profile")).toEqual({ plan: "pro" });  // a platform.scope write
-expect(r.rootKv("instance/acme")).toEqual({ created: true });      // a platform.root write
+expect(r.body.known).toBe(true);                                   // a platform.root read
 
 // The un-credentialed path is a scenario, not a header: auth is a property of
 // the activation, so both branches are testable without a token anywhere.
@@ -544,8 +547,9 @@ const denied = scenario({ admin: true, isRoot: false })
 expect(denied.status).toBe(403);
 ```
 
-The handler behind this writes into the scoped and root stores and gates on the
-engine-computed verdict:
+The handler behind this writes into the scoped store, reads the root store,
+and gates on the engine-computed verdict (root *writes* aren't a sync verb —
+they're dispatched activations against `__root__`, parked on the owed marker):
 
 ```js
 export default function () {
@@ -553,8 +557,7 @@ export default function () {
     response.status = 403; return "forbidden";
   }
   platform.scope("acme").kv.set("profile", JSON.stringify({ plan: "pro" }));
-  platform.root.set("instance/acme", JSON.stringify({ created: true }));
-  return { ok: true };
+  return { ok: true, known: platform.root.get("instance/acme") !== null };
 }
 ```
 

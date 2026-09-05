@@ -271,7 +271,6 @@ pub const Dispatcher = struct {
             // retry recaptures the same baseline.
             .ws_base = writeset.ops.items.len,
             .deployment_id = deployment_id,
-            .root_ws_base = if (request.admin.root_writeset) |rws| rws.ops.items.len else 0,
             .console = &console_buf,
             .tags = &tags_buf,
             .shred_key = &shred_key_cell,
@@ -287,7 +286,6 @@ pub const Dispatcher = struct {
             .request_id = request.trace.request_id,
             .session_id = request.session_id,
             .platform = request.admin.platform,
-            .root_writeset = request.admin.root_writeset,
             .triggers = if (hooks) |h| h.triggers else null,
             .subscriptions = if (hooks) |h| h.subscriptions else &.{},
             .bytecodes = bytecodes,

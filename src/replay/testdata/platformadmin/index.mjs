@@ -12,7 +12,6 @@ export default function ({ platform }) {
   };
   probe("scope", () => platform.scope("acme").kv.get("x"));
   probe("root", () => platform.root.get("x"));
-  probe("instances", () => platform.instances.create("x"));
   probe("releases", () => platform.releases.publish("acme", "0123456789abcdef"));
   // `request.rewind` is not gated — it simply doesn't EXIST off a
   // platform-bound handler, so the probe reports presence rather than a throw.

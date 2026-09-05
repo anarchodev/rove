@@ -40,16 +40,16 @@ frame V2 as a throughput win.
 ## What replicates through raft (envelopes)
 
 A raft entry is a typed byte blob (`src/consensus/envelope.zig`,
-`src/kv/envelope_codec.zig`). Three type bytes are live:
+`src/kv/envelope_codec.zig`). Two type bytes are live:
 
 | Type | Name | Target store | Producer |
 |---|---|---|---|
-| `0` | `writeset` | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset; `_deploy/current`; the `webhook.send`/`email.send` owed-markers (ordinary kv writes). |
+| `0` | `writeset` | `{data_dir}/{id}/app.db` — or the cluster root store when the tenant is `__root__` | Customer handler `kv.*` via `TrackedTxn` + writeset; `_deploy/current`; the `webhook.send`/`email.send` owed-markers (ordinary kv writes). Cluster routing state (`instance/{id}`, `domain/{host}`) is the same shape: `__root__` is a raft group like any tenant, and root writes are dispatched activations against it. |
 | `1` | `multi` | per-inner-envelope target | Worker dispatcher — atomically bundles several writeset envelopes into one entry. |
-| `2` | `root_writeset` | `{data_dir}/__root__.db` | `provisionInstance` / admin `createInstance`; ACME `cert/{host}`. |
 
-Retired type bytes are rejected loudly by the decoder so a stale log entry
-surfaces rather than mis-applying. The full evolution table is in PLAN §10.2.
+Retired type bytes (including `root_writeset`, formerly `2`) are rejected
+loudly by the decoder so a stale log entry surfaces rather than mis-applying.
+The full evolution table is in PLAN §10.2.
 
 **Entry origin frame (load-bearing).** Every proposed entry is wrapped in a
 17-byte identity frame *before* the envelope: `[0xF7][origin u64][seq u64]`

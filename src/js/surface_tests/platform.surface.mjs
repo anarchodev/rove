@@ -12,22 +12,17 @@ export default function ({ platform }) {
     throws(() => platform.scope("some-tenant"), NOT_ADMIN);
   });
 
+  // root.set / root.delete / instances.create are GONE: root
+  // writes are dispatched activations in `__root__`'s own scope
+  // (platform.dispatch → __system/root_kv_install). The reads below are
+  // the whole remaining root surface.
   check("platform.root.get", () => {
     throws(() => platform.root.get("instance/x"), NOT_ADMIN);
-  });
-  check("platform.root.set", () => {
-    throws(() => platform.root.set("instance/x", "{}"), NOT_ADMIN);
-  });
-  check("platform.root.delete", () => {
-    throws(() => platform.root.delete("instance/x"), NOT_ADMIN);
   });
   check("platform.root.prefix", () => {
     throws(() => platform.root.prefix("instance/", null, 10), NOT_ADMIN);
   });
 
-  check("platform.instances.create", () => {
-    throws(() => platform.instances.create("acme"), NOT_ADMIN);
-  });
   check("platform.instances.deployStarter", () => {
     throws(() => platform.instances.deployStarter("acme"), NOT_ADMIN);
   });

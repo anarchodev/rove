@@ -1497,7 +1497,7 @@ pub fn parseReadset(bytes: []const u8) (ParseError || log_mod.LogHeaderParseErro
 ///
 /// Why an empty-bytes sentinel for count=0: non-handler producers
 /// (ACME, secondary inner envelopes of a batched propose,
-/// root_writeset) pass `rs_bytes = ""` already, and the apply path
+/// the retired root_writeset did) pass `rs_bytes = ""` already, and the apply path
 /// gates "has readset?" on `len > 0`. Keeping that contract means
 /// no churn in those callers.
 pub const ParsedReadsetList = struct {

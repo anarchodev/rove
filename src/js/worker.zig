@@ -679,7 +679,7 @@ const TargetWrite = struct {
 
 /// Per-dispatch-tick accumulator for the *side* effects an admin
 /// handler triggers beyond its own anchor app.db writeset:
-/// `platform.root.*` (→ `root_ws`, a type-2 root writeset) and the
+/// The cross-tenant scope writes and the
 /// cross-tenant trampolines `platform.scope(id).kv.*` /
 /// `platform.releases.publish` / signup→`deployStarter` (→ a
 /// per-target type-0 writeset). Option-A (the proposer fold-gate,
@@ -690,16 +690,8 @@ const TargetWrite = struct {
 /// `dispatchOnce` entry and at `finalizeBatch` exit. WriteSet copies
 /// bytes in, so accumulation is safe and `reset` frees everything.
 pub const BatchSideEffects = struct {
-    root_ws: ?kv_mod.WriteSet = null,
     targets: std.ArrayListUnmanaged(TargetWrite) = .empty,
 
-    /// Stable pointer to the batch root writeset, lazily created.
-    /// Called once per tick when the anchor is an admin handler so
-    /// `Request.root_writeset` has a stable address for the walk.
-    pub fn rootWs(self: *BatchSideEffects, allocator: std.mem.Allocator) *kv_mod.WriteSet {
-        if (self.root_ws == null) self.root_ws = kv_mod.WriteSet.init(allocator);
-        return &self.root_ws.?;
-    }
 
     /// Find-or-create the accumulator for `target_id` (writes to the
     /// same target across a batch merge into one inner). `target_id`
@@ -732,10 +724,6 @@ pub const BatchSideEffects = struct {
     /// activation produced it.
     pub fn wireBytes(self: *const BatchSideEffects) usize {
         var n: usize = 0;
-        if (self.root_ws) |*rw| {
-            if (rw.ops.items.len > 0)
-                n += sizing.MULTI_INNER_HDR_BYTES + sizing.rootEnvelopeBytes(rw.encodedSize());
-        }
         for (self.targets.items) |*t| {
             if (t.ws.ops.items.len == 0) continue;
             n += sizing.MULTI_INNER_HDR_BYTES +
@@ -747,14 +735,11 @@ pub const BatchSideEffects = struct {
     /// True iff nothing was accumulated this tick (so `finalizeBatch`
     /// may still take the read-only fast path).
     pub fn isEmpty(self: *const BatchSideEffects) bool {
-        if (self.root_ws) |rw| if (rw.ops.items.len > 0) return false;
         for (self.targets.items) |t| if (t.ws.ops.items.len > 0) return false;
         return true;
     }
 
     pub fn reset(self: *BatchSideEffects, allocator: std.mem.Allocator) void {
-        if (self.root_ws) |*rw| rw.deinit();
-        self.root_ws = null;
         for (self.targets.items) |*t| {
             t.ws.deinit();
             allocator.free(t.id);

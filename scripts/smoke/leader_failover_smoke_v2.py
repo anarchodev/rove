@@ -67,7 +67,10 @@ export function handler() {
 # Every raft group in this cluster: the test tenant + the standing deploy
 # app. A leader kill orphans every group the victim led, so the acquisition
 # accounting below has to know the full set (rove#374).
-GROUPS = ("acme", "__admin__")
+# `__root__` included: it is a standing per-cluster group like
+# any other, formed by the CP's ensurer at genesis — its failover is a real
+# re-election this smoke must expect, not a spurious extra.
+GROUPS = ("acme", "__admin__", "__root__")
 KEY = "failover/value"
 VALUE1 = "committed-before-kill"
 VALUE2 = "committed-after-failover"

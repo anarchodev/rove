@@ -78,7 +78,6 @@ fn proposeEncoded(
 
     const envelope = try switch (kind) {
         .writeset => apply_mod.encodeWriteSetEnvelope(allocator, instance_id, ws_bytes, rs_bytes),
-        .root_writeset => apply_mod.encodeRootWriteSetEnvelope(allocator, ws_bytes),
         .multi => unreachable,
     };
     defer allocator.free(envelope);
@@ -108,34 +107,11 @@ pub fn proposeWriteSet(
 
 // platform.root.* writes fold into the batch multi-envelope via
 // `proposeBatch`, so there is no general standalone root-writeset
-// proposer (the narrow `proposeRoot` below serves only the
+// proposer.
 // control-plane domain-alias write). The type-2 encoder
 // `apply.encodeRootWriteSetEnvelope` is used by `proposeBatch` and
 // `acme.zig` directly.
 
-/// Propose a single `__root__` writeset (type=2 → `{data_dir}/__root__.db`)
-/// through `anchor_id`'s raft group. Narrow standalone proposer for the
-/// control-plane domain-alias write (`/_system/v2-domain`, docs/architecture/auth-consolidation.md
-/// B3): the caller must have already committed the write to its root overlay
-/// speculatively (so the leader sees it; the durabilize floor folds it on the
-/// `noteWorkerCommitted` ack); followers apply this envelope. Returns the
-/// proposed group/seq for the caller to await.
-pub fn proposeRoot(
-    worker: anytype,
-    anchor_id: []const u8,
-    writeset: *const kv_mod.WriteSet,
-) !Proposed {
-    const allocator = worker.allocator;
-    const gid = try worker.raft.registerTenant(anchor_id);
-    const ws_bytes = try writeset.encode(allocator);
-    defer allocator.free(ws_bytes);
-    const root_env = try apply_mod.encodeRootWriteSetEnvelope(allocator, ws_bytes);
-    defer allocator.free(root_env);
-    // proposeMulti with a single inner does a bare propose (no multi wrapper)
-    // and does not take ownership of `root_env` — freed by the defer above
-    // after it returns.
-    return proposeMulti(worker, gid, &.{root_env});
-}
 
 /// Propose a dynamic list of already-encoded, **non-multi** inner
 /// envelopes. The multi wire format supports up to 255 inners (u8
@@ -257,7 +233,7 @@ pub fn proposeBatch(
     // transactional, so recovery is via idempotent replay, not
     // rollback.
     //
-    // Target + root envelopes carry empty rs_bytes — the readset
+    // Target envelopes carry empty rs_bytes — the readset
     // lives on the anchor envelope (inner[0]) above; one readset
     // per dispatch, not per envelope.
     for (worker.batch_side.targets.items) |*t| {
@@ -265,13 +241,6 @@ pub fn proposeBatch(
         const tb = try t.ws.encode(allocator);
         defer allocator.free(tb);
         try inner.append(allocator, try apply_mod.encodeWriteSetEnvelope(allocator, t.id, tb, ""));
-    }
-    if (worker.batch_side.root_ws) |*rw| {
-        if (rw.ops.items.len > 0) {
-            const rb = try rw.encode(allocator);
-            defer allocator.free(rb);
-            try inner.append(allocator, try apply_mod.encodeRootWriteSetEnvelope(allocator, rb));
-        }
     }
     return proposeMulti(worker, gid, inner.items);
 }
