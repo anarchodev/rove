@@ -857,7 +857,7 @@ tenants, not a privileged platform path (`architecture/auth-and-domains.md`).
 
 | Store | Scope | Replicated via | Owner / notes |
 |---|---|---|---|
-| `__root__.db` | per cluster | raft envelope 2 | routing + tenant registry (`domain/`, `instance/`); ACME `cert/{host}` |
+| cluster root store | per cluster | raft envelope 0 (the `__root__` group — root writes are dispatched activations) | routing + tenant registry (`domain/`, `instance/`) |
 | `{id}/app.db` | per tenant | raft envelope 0 | customer kv; `_deploy/current`; `_callback/{id}`; `_send/owed/{id}` markers; `_config/*` (deploy-mirrored, read-only to handlers) |
 | `__admin__` / `__auth__` / `__replay__` `app.db` | per cluster (system tenants) | raft envelope 0 | OIDC RP/IdP state, operator allowlist, account/instance ownership, platform config |
 | CP `__directory__` (kvexp) | CP cluster | CP raft (apply-observer projection on every node) | `cluster/{id}`, `placement/{tenant}`, `plan/{tenant}`, `host/{host}`, `cert/{host}` |
@@ -867,8 +867,8 @@ tenants, not a privileged platform path (`architecture/auth-and-domains.md`).
 | `{prefix}_logs/{node_id}/{batch_id}.ndjson` (+ sidecar) | per node, S3/fs | n/a (log-server polls + by-key push) | worker batches; log-server indexes |
 | `log_index.db` | log-server-local | rebuildable from S3 | log-server |
 
-Only three envelope types replicate through raft (`0` writeset, `1` multi,
-`2` root_writeset); the full evolution + the retired-and-rejected type bytes are
+Only two envelope types replicate through raft (`0` writeset, `1` multi);
+the full evolution + the retired-and-rejected type bytes are
 in §10.2 / `architecture/consensus-and-storage.md`. Blob bytes, deploy manifests,
 and logs all bypass raft (shared content-addressed store / S3).
 

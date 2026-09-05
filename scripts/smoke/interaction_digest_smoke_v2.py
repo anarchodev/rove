@@ -54,19 +54,21 @@ export default function () {
 
 
 # The privileged-surface twin (rove#413). Both modes return the same body and
-# read the same scoped value; they differ only in a ROOT WRITE's value and an
-# `instances.create` argument — interactions that were invisible to the digest
-# before, so two admin runs doing different things hashed alike.
+# read the same scoped value; they differ only in a scoped WRITE's key and
+# value — interactions that were invisible to the digest before, so two
+# admin runs doing different things hashed alike. (The original vehicles,
+# `platform.root.set` and `instances.create`, are retired — root writes are
+# dispatched activations now and the scoped write folds op +
+# target + key + value the same way.)
 PLATFORM_FIXTURE = {
     "index.mjs": """
 export default function () {
   const q = request.query || "";
   const mode = q.includes("mode=b") ? "b" : "a";
-  platform.root.set("_digest/probe", mode === "b" ? "B" : "A");
+  platform.scope("tgt").kv.set("_digest/probe-" + mode, mode === "b" ? "B" : "A");
   platform.root.get("_digest/absent");            // a not-found cross-store read
   platform.scope("tgt").kv.get("profile");        // a cross-tenant read
   platform.scope("tgt").kv.prefix("p/", "", 10);  // and a cross-tenant scan
-  platform.instances.create(mode === "b" ? "made-b" : "made-a");
   response.status = 200;
   return "same-body";
 }
@@ -255,7 +257,7 @@ def main() -> int:
         check("an admin record carries a digest", p1 is not None, f"got {p1!r}")
         check("identical privileged behaviour digests identically", p1 is not None and p1 == p2,
               f"{p1} vs {p2}")
-        check("a different root write + instances.create arg digests differently "
+        check("a different scoped write digests differently "
               "despite an identical response",
               p1 is not None and p3 is not None and p1 != p3,
               f"{p1} vs {p3} — the digest is still blind to the privileged surface")

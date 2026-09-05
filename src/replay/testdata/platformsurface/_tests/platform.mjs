@@ -6,8 +6,6 @@ expect(req.status).toBe(200);
 // browser is no longer an ambient global — it's the @rewind/browser package
 // (a handler must import it). http/platform stay ambient.
 expect(req.body.surface).toEqual({ http: "object", platform: "object", browser: "undefined" });
-expect(req.body.created).toBe(undefined); // prod's instances.create returns undefined
 expect(req.body.rootRead).toBe("hello");
 // The recorder carries the real argument (the instance name), so the effect log
 // distinguishes which instance was created.
-expect(req.effects.some((e) => e.kind === "platform" && e.op === "instances.create" && e.name === "acme")).toBe(true);

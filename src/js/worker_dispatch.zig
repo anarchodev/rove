@@ -839,7 +839,7 @@ fn finalizeBatch(
     // (`platform.root.*` + cross-tenant trampolines) are folded into
     // this batch's single raft entry by `proposeBatch`. Reset on
     // every exit: on the write/side paths proposeBatch has already
-    // encoded+consumed `targets`/`root_ws`; on the read-only path
+    // encoded+consumed `targets`; on the read-only path
     // `has_side` is false so there is nothing to free.
     defer worker.batch_side.reset(allocator);
     const has_side = !worker.batch_side.isEmpty();
@@ -2542,19 +2542,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // after a leadership acquisition, bounded by one pump refresh.
         const exec_seq: u64 = worker.raft.mintExecStampForTenant(scope_inst.id);
 
-        // Admin-handler `platform.root.set/delete` writes accumulate
-        // into the *batch* root writeset
-        // (the proposer / fold-gate invariant,
-        // `docs/architecture/consensus-robustness.md`) so they ride the
-        // batch's single atomic raft entry and the caller is parked
-        // on that seq — no per-request fire-and-forget. Stable
-        // pointer for the whole walk (worker-owned, reset at
-        // finalizeBatch). Customer-tenant requests have no
-        // `platform`, so they get null and skip this.
-        const root_ws_ptr: ?*kv_mod.WriteSet = if (handler_inst.platform != null)
-            worker.batch_side.rootWs(allocator)
-        else
-            null;
 
         // Resolve (or eagerly mint) the platform session cookie. Static
         // assets and /_system/* short-circuited above, so reaching here
@@ -2686,7 +2673,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // Non-null only when the handler-tenant is the admin
                 // singleton — gates installation of `platform.root.*`.
                 .platform = handler_inst.platform,
-                .root_writeset = root_ws_ptr,
                 // Admin-handler platform capabilities, all-or-nothing:
                 // present iff this is an admin-handler request. Customer
                 // requests get none, and the JS callables reject at the
@@ -3159,7 +3145,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         );
 
         // (The `platform.root.*` writes accumulate into
-        // worker.batch_side.root_ws and are proposed by
+        // worker.batch_side.targets and are proposed by
         // finalizeBatch as a type-2 inner of the batch's single
         // atomic raft entry — the calling admin request is parked on
         // that seq, so its response is gated on the root write

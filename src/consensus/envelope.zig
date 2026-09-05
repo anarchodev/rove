@@ -115,15 +115,18 @@ pub const Type = enum(u8) {
     /// `[u8 count]([u32 len LE][inner_envelope]){count}`. Inner
     /// envelopes apply in order; nesting panics (`NestedMulti`).
     multi = 1,
-    /// Root writeset — applied to the node-wide `__root__` store.
-    /// Producer is the control plane (provisionInstance / admin);
-    /// `node.zig`'s apply path routes it to the `__root__` store.
-    root_writeset = 2,
+    // RETIRED: 2 root_writeset — the cluster root is a TENANT
+    // now: `__root__` has its own group and its writes are ordinary
+    // `writeset` envelopes produced by dispatched activations in root
+    // scope. The decoder maps the stale byte to `UnknownEnvelopeType`, so
+    // a pre-retirement raft-log entry surfaces at apply instead of
+    // silently mis-applying (compaction erases them in practice; the
+    // deploy posture is the same as every prior retirement).
 };
 
 pub const Envelope = struct {
     type: Type,
-    /// Tenant store id for `writeset`; empty for `multi` / `root_writeset`.
+    /// Tenant store id for `writeset`; empty for `multi`.
     /// Borrowed slice into the decoded buffer.
     id: []const u8,
     /// Borrowed slice into the decoded buffer.
@@ -175,13 +178,6 @@ pub fn encodeWriteSet(
     return encodeTyped(allocator, .writeset, id, payload);
 }
 
-/// Build a type-2 root writeset envelope (no per-tenant id).
-pub fn encodeRootWriteSet(
-    allocator: std.mem.Allocator,
-    ws_bytes: []const u8,
-) Error![]u8 {
-    return encodeTyped(allocator, .root_writeset, "", ws_bytes);
-}
 
 /// Build a type-1 multi wrapper carrying `inner` already-encoded
 /// envelopes (shared codec; `codec.ENVELOPE_TYPE_MULTI` == `Type.multi`).
@@ -248,15 +244,10 @@ test "writeset payload carries a non-empty readset" {
     try testing.expectEqualStrings("READSET", wp.rs_bytes);
 }
 
-test "root writeset envelope round-trips with empty id" {
-    const a = testing.allocator;
-    const env = try encodeRootWriteSet(a, "ROOT");
-    defer a.free(env);
-
-    const dec = try decode(env);
-    try testing.expectEqual(Type.root_writeset, dec.type);
-    try testing.expectEqualStrings("", dec.id);
-    try testing.expectEqualStrings("ROOT", dec.payload);
+test "decode rejects the retired root_writeset byte" {
+    // type 2 is retired — root writes are ordinary writesets in
+    // `__root__`'s own group.
+    try testing.expectError(Error.UnknownEnvelopeType, decode(&[_]u8{ 2, 0, 0 }));
 }
 
 test "multi wrapper round-trips and unwraps inner envelopes in order" {

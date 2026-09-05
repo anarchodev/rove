@@ -302,14 +302,10 @@ pub fn jsPlatformRootGet(
     const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
     defer state.allocator.free(key);
 
-    // Read-your-write minimality, mirroring `globals_kv.zig`: a key this
-    // activation already wrote to the root store is reproduced offline by
-    // re-running the write into the same namespace, so it carries no replay
-    // information and stays off the tape.
-    const skip_tape = if (state.root_writeset) |ws|
-        ws.containsKeySince(state.root_ws_base, key)
-    else
-        false;
+    // Every root read tapes: an activation cannot WRITE the root store any
+    // more (root writes are dispatched activations in `__root__`'s own
+    // scope ), so there is no read-your-write case left to elide.
+    const skip_tape = false;
 
     const value = tenant.root.get(key) catch |err| switch (err) {
         error.NotFound => {
@@ -325,85 +321,6 @@ pub fn jsPlatformRootGet(
     defer state.allocator.free(value);
     recordStoreGet(state, "r", key, value, .ok, !skip_tape);
     return c.JS_NewStringLen(ctx, value.ptr, value.len);
-}
-
-pub fn jsPlatformRootSet(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 2) return js_undefined;
-    const state = getState(ctx);
-    const tenant = state.platform orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    };
-
-    const key = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
-    defer state.allocator.free(key);
-    const val = kvWriteArgToOwnedString(state, ctx, argv[1], "value") catch return js_exception;
-    defer state.allocator.free(val);
-
-    if (refusePlatformWrite(state, ctx, key, val)) |thrown| return thrown;
-
-    tenant.root.put(key, val) catch |err| {
-        state.pending_kv_error = err;
-    };
-    notePlatformWrite(state, key.len, val.len);
-    recordStoreWrite(state, "r", key, val);
-    // Mirror the write into the root writeset so the worker can
-    // propose it through raft. Admin handlers ALWAYS have this
-    // set (dispatcher init checks `platform != null`), so an unset
-    // field here means someone built a DispatchState by hand.
-    if (state.root_writeset) |ws| {
-        ws.addPut(key, val) catch |err| {
-            state.pending_kv_error = err;
-        };
-    }
-    return js_undefined;
-}
-
-pub fn jsPlatformRootDelete(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) return js_undefined;
-    const state = getState(ctx);
-    const tenant = state.platform orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    };
-
-    const key = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
-    defer state.allocator.free(key);
-
-    if (refusePlatformWrite(state, ctx, key, null)) |thrown| return thrown;
-
-    recordStoreWrite(state, "r", key, null);
-    tenant.root.delete(key) catch |err| switch (err) {
-        error.NotFound => {
-            // Still propagate the delete to followers so their state
-            // converges — a key that's missing locally might exist
-            // on other nodes if propose ordering skewed. The follower
-            // `applyEncodedWriteSet` treats NotFound as a no-op.
-        },
-        else => {
-            state.pending_kv_error = err;
-            return js_undefined;
-        },
-    };
-    // A delete of a key missing LOCALLY still propagates (the NotFound arm
-    // above), so it rides the entry and costs the budget like any other op.
-    notePlatformWrite(state, key.len, 0);
-    if (state.root_writeset) |ws| {
-        ws.addDelete(key) catch |err| {
-            state.pending_kv_error = err;
-        };
-    }
-    return js_undefined;
 }
 
 pub fn jsPlatformRootPrefix(
@@ -455,70 +372,6 @@ pub fn jsPlatformRootPrefix(
         _ = c.JS_SetPropertyUint32(ctx, arr, @intCast(i), obj);
     }
     return arr;
-}
-
-/// The operator-root check does NOT live here. A native taking the bearer
-/// would mean the handler holds the token, and a handler-held value arrives
-/// via `request.headers` — which the read-recorder TAPES. The verdict is
-/// computed in the engine and surfaces as `request.rewind.isRoot`
-/// (`globals_request.zig` `jsIsRootGetter`); the header itself is stripped on
-/// a platform-bound handler (`reserved_headers.zig`
-/// PLATFORM_CREDENTIAL_HEADERS). See `docs/architecture/control-plane.md` for
-/// the audit line and `docs/decisions.md` for the surface-minimization rule.
-/// `platform.instances.create(name)` — admin-only. Creates the
-/// instance directory, opens its app.db, writes the local
-/// `instance/{name}` marker, and mirrors the marker into the root
-/// writeset for raft replication. Idempotent: re-creating an already
-/// existing instance is a no-op (matches the underlying
-/// `tenant.createInstance`).
-///
-/// Throws `Error{code:"InvalidName"}` if the name fails validation
-/// (empty, too long, bad characters). Other errors land in
-/// `state.pending_kv_error` and surface as a 5xx.
-pub fn jsPlatformInstancesCreate(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) {
-        _ = c.JS_ThrowTypeError(ctx, "platform.instances.create requires (name)");
-        return js_exception;
-    }
-    const state = getState(ctx);
-    const tenant = state.platform orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    };
-
-    const name = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
-    defer state.allocator.free(name);
-
-    tenant.createInstance(name) catch |err| switch (err) {
-        error.InvalidInstanceId => {
-            const err_obj = c.JS_NewError(ctx);
-            if (c.JS_IsException(err_obj)) return err_obj;
-            _ = c.JS_SetPropertyStr(ctx, err_obj, "message", c.JS_NewStringLen(ctx, "invalid instance name", "invalid instance name".len));
-            _ = c.JS_SetPropertyStr(ctx, err_obj, "code", c.JS_NewStringLen(ctx, "InvalidName", "InvalidName".len));
-            return c.JS_Throw(ctx, err_obj);
-        },
-        else => {
-            state.pending_kv_error = err;
-            return js_undefined;
-        },
-    };
-
-    foldPlatformOp(state, "instances.create", name, "");
-
-    if (state.root_writeset) |ws| {
-        var key_buf: [16 + tenant_mod.MAX_INSTANCE_ID_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "instance/{s}", .{name}) catch
-            unreachable; // name was validated by createInstance above
-        ws.addPut(key, "") catch |err| {
-            state.pending_kv_error = err;
-        };
-    }
-    return js_undefined;
 }
 
 /// `platform.instances.usage(name)` — admin-only. This node's KV

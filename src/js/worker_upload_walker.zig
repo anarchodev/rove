@@ -419,12 +419,15 @@ test "hydrate: type-0 with empty rs_bytes → no records" {
     try testing.expectEqual(@as(usize, 0), records.len);
 }
 
-test "hydrate: root_writeset (type-2) is skipped" {
+test "hydrate: the retired root_writeset byte (type-2) is skipped" {
+    // The type byte is retired; a stale entry in an old log walks through
+    // hydrate as zero records rather than faulting the walker (the APPLY
+    // path is where retirement fails loud; the walker only mines records).
     const a = testing.allocator;
-    const env = try apply_mod.encodeRootWriteSetEnvelope(a, "root-bytes");
-    defer a.free(env);
+    // Hand-encoded [type=2][id_len=0 BE][payload] — the encoder is gone.
+    const env = [_]u8{ 2, 0, 0 } ++ "root-bytes".*;
 
-    const records = try hydrateRecordsFromEnvelope(a, env, 5);
+    const records = try hydrateRecordsFromEnvelope(a, &env, 5);
     defer freeRecords(a, records);
     try testing.expectEqual(@as(usize, 0), records.len);
 }

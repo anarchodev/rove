@@ -234,8 +234,9 @@ its own bearer. The investigation found the worker has **no CP fallback** for
 custom-host resolution (`resolveDomain` is local-only) and the CP **didn't
 propagate** the alias — so the CP, which already owns `host → tenant`, now does:
 - **worker**: new move-secret `/_system/v2-domain {host, tenant}` route
-  (`v2_move.zig`) proposes the `__root__/domain` alias (leader-gated type-2
-  root_writeset, via `raft_propose.proposeRoot`);
+  (`v2_move.zig`) dispatches the baked `__system/root_domain` activation
+  against the `__root__` group (an ordinary writeset in the root group's own
+  log);
 - **CP**: `handleHost` propagates the alias to the tenant's serving cluster
   (`pushDomainToServingCluster`, mirrors `pushPlanToServingCluster`) — **gated**
   (503 if it didn't land, so a half-mapped host can't report success);

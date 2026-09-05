@@ -674,16 +674,6 @@ pub const DispatchState = struct {
     /// iff this field is set. Regular tenants' handlers see
     /// `platform === undefined` in their runtime.
     platform: ?*tenant_mod.Tenant = null,
-    /// Raft writeset accumulating root-store writes the admin
-    /// handler makes via `platform.root.set` / `platform.root.delete`.
-    /// Dispatcher creates this alongside the per-tenant writeset
-    /// when `platform != null`; worker proposes it through raft as
-    /// a type=2 envelope after commit so followers' copies of
-    /// `__root__.db` stay in sync.
-    root_writeset: ?*kv_mod.WriteSet = null,
-    /// `root_writeset.ops` length when this activation began — the root
-    /// twin of `ws_base` (the root writeset is batch-scoped the same way).
-    root_ws_base: usize = 0,
     /// Trigger registry for the active deployment (PLAN §2.5).
     /// Sorted longest-prefix-first → forward iteration visits
     /// innermost (most-specific) triggers first; AFTER chain uses
@@ -1445,12 +1435,9 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     },
     .{ .path = &.{ "_system", "platform", "root" }, .fns = &.{
         .{ .name = "get", .cfunc = platform_bindings.jsPlatformRootGet, .argc = 1 },
-        .{ .name = "set", .cfunc = platform_bindings.jsPlatformRootSet, .argc = 2 },
-        .{ .name = "delete", .cfunc = platform_bindings.jsPlatformRootDelete, .argc = 1 },
         .{ .name = "prefix", .cfunc = platform_bindings.jsPlatformRootPrefix, .argc = 3 },
     } },
     .{ .path = &.{ "_system", "platform", "instances" }, .fns = &.{
-        .{ .name = "create", .cfunc = platform_bindings.jsPlatformInstancesCreate, .argc = 1 },
         .{ .name = "deployStarter", .cfunc = platform_bindings.jsPlatformInstancesDeployStarter, .argc = 1 },
         .{ .name = "usage", .cfunc = platform_bindings.jsPlatformInstancesUsage, .argc = 1 },
     } },

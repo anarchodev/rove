@@ -337,10 +337,6 @@ pub const Admin = struct {
     /// Non-null on admin-tenant requests — points back at the `Tenant` so
     /// the JS globals can install `platform.root.*`.
     platform: ?*tenant_mod.Tenant = null,
-    /// Collects `platform.root.*` writes for the worker to propose through
-    /// raft. Null = writes land locally only (fine for tests / single-node,
-    /// not multi-node correctness).
-    root_writeset: ?*kv_mod.WriteSet = null,
     /// Admin platform-capability trampolines (deployStarter /
     /// releases.publish / scope().kv), bundled all-or-nothing. See
     /// `globals.PlatformCaps`.

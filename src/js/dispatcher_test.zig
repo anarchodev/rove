@@ -4672,32 +4672,17 @@ test "dispatch: crypto.sha256 throws on missing arg" {
     try testing.expect(std.mem.startsWith(u8, resp.body, "threw:"));
 }
 
-test "dispatch: platform.instances.create throws on non-admin handler" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
+/// Find the taped kv entry for `key`, or null. Cross-store reads ride the kv
+/// channel under `__rove_store/{tag}/` (globals_platform.zig).
+fn tapedKv(rs: *tape_mod.Readset, key: []const u8) ?tape_mod.Entry.KvEntry {
+    for (rs.kv.entries.items) |e| {
+        if (std.mem.eql(u8, e.kv.key, key)) return e.kv;
     }
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    // state.platform is null in vanilla runOne — the C callback should
-    // throw a TypeError mentioning "admin handler".
-    var resp = try runOne(
-        &d,
-        kv,
-        \\try { platform.instances.create("acme"); return "no throw"; }
-        \\catch (e) { return "threw: " + e.message; }
-    ,
-        .{ .method = "GET", .path = "/" },
-    );
-    defer resp.deinit(testing.allocator);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "admin handler") != null);
+    return null;
 }
 
-/// Thin wrapper around tenant test setup. Used by platform.instances.*
-/// tests below to put a real `Tenant` behind `state.platform`.
+/// Thin wrapper around tenant test setup. Used by the platform tests below
+/// to put a real `Tenant` behind `state.platform`.
 const PlatformFixture = struct {
     allocator: std.mem.Allocator,
     tmp_dir: []u8,
@@ -4726,15 +4711,6 @@ const PlatformFixture = struct {
     }
 };
 
-/// Find the taped kv entry for `key`, or null. Cross-store reads ride the kv
-/// channel under `__rove_store/{tag}/` (globals_platform.zig).
-fn tapedKv(rs: *tape_mod.Readset, key: []const u8) ?tape_mod.Entry.KvEntry {
-    for (rs.kv.entries.items) |e| {
-        if (std.mem.eql(u8, e.kv.key, key)) return e.kv;
-    }
-    return null;
-}
-
 test "dispatch: platform.root + scope reads are taped under __rove_store/, keyed by store" {
     // #410: a cross-store read returns data to the handler, so it is an input
     // and must be recorded — the first input class that leaves the activation's
@@ -4761,8 +4737,6 @@ test "dispatch: platform.root + scope reads are taped under __rove_store/, keyed
 
     var rs = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
     defer rs.deinit();
-    var root_ws = kv_mod.WriteSet.init(testing.allocator);
-    defer root_ws.deinit();
 
     var resp = try runOne(
         &d,
@@ -4779,7 +4753,7 @@ test "dispatch: platform.root + scope reads are taped under __rove_store/, keyed
             .method = "GET",
             .path = "/",
             .trace = .{ .readset = &rs },
-            .admin = .{ .platform = pf.tenant, .root_writeset = &root_ws },
+            .admin = .{ .platform = pf.tenant },
         },
     );
     defer resp.deinit(testing.allocator);
@@ -4820,57 +4794,15 @@ test "dispatch: platform.root + scope reads are taped under __rove_store/, keyed
     }
 }
 
-test "dispatch: a root read-your-write stays off the tape (minimal readset)" {
-    // Mirrors the `globals_kv.zig` skip_tape rule: a key this activation wrote
-    // is reproduced offline by re-running the write into the same namespace, so
-    // it carries no replay information. Keeping it out also keeps the readset
-    // disjoint from the writeset.
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    var pf = try PlatformFixture.init(testing.allocator);
-    defer pf.deinit();
-    try pf.tenant.root.put("seen/by/nobody", "PRE");
-
-    var rs = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
-    defer rs.deinit();
-    var root_ws = kv_mod.WriteSet.init(testing.allocator);
-    defer root_ws.deinit();
-
-    var resp = try runOne(
-        &d,
-        kv,
-        \\platform.root.set("mine", "WROTE");
-        \\return platform.root.get("mine") + "|" + platform.root.get("seen/by/nobody");
-    ,
-        .{
-            .method = "GET",
-            .path = "/",
-            .trace = .{ .readset = &rs },
-            .admin = .{ .platform = pf.tenant, .root_writeset = &root_ws },
-        },
-    );
-    defer resp.deinit(testing.allocator);
-    try testing.expectEqualStrings("WROTE|PRE", resp.body);
-
-    // The read-your-write is absent; the foreign read is present.
-    try testing.expect(tapedKv(&rs, "__rove_store/r/mine") == null);
-    try testing.expect(tapedKv(&rs, "__rove_store/r/seen/by/nobody") != null);
-}
-
 test "dispatch: a platform write obeys the same kv rules a customer write does" {
-    // The privileged surface writes the root / target writeset directly rather
+    // The privileged surface writes the target writeset directly rather
     // than through `rove-binding`, so it has its own call into the one
     // authority (`rove-guards`). Its bytes ride the SAME raft entry as the
     // batch, which is why the size caps and the activation's write budget
     // apply here unchanged — the only exemption the surface needs is WHICH
-    // keys it may name, never how much one entry may carry.
+    // keys it may name, never how much one entry may carry. (The former
+    // vehicle, `platform.root.set`, is gone — root writes are dispatched
+    // activations so the scope write is the surface under test.)
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -4882,53 +4814,51 @@ test "dispatch: a platform write obeys the same kv rules a customer write does" 
 
     var pf = try PlatformFixture.init(testing.allocator);
     defer pf.deinit();
-
-    var root_ws = kv_mod.WriteSet.init(testing.allocator);
-    defer root_ws.deinit();
+    try pf.tenant.createInstance("acme");
+    // A no-op scope-write trampoline: the guards under test run BEFORE the
+    // caps trampoline fires, so accepting silently is exactly the harness
+    // this needs — the assertions are on the refusal codes alone.
+    const Noop = struct {
+        var sink: u8 = 0;
+        fn tramp(ctx_: *anyopaque, alloc_: std.mem.Allocator, target: []const u8, op: globals.ScopeKvOp, key: []const u8, value: []const u8) anyerror!void {
+            _ = ctx_;
+            _ = alloc_;
+            _ = target;
+            _ = op;
+            _ = key;
+            _ = value;
+        }
+    };
 
     var resp = try runOne(
         &d,
         kv,
+        \\const s = platform.scope("acme");
         \\// The exemption that survives: an admin handler names reserved keys.
         \\let reserved_ok = "yes";
-        \\try { platform.root.set("_deploy/current", "rel-1"); }
+        \\try { s.kv.set("_deploy/current", "rel-1"); }
         \\catch (e) { reserved_ok = e.code; }
-        \\// The rules that now apply: the value cap, then the budget.
+        \\// The rules that apply regardless: the value cap, then the budget.
         \\let oversize = "none";
-        \\try { platform.root.set("k", "x".repeat(400 * 1024)); }
+        \\try { s.kv.set("k", "x".repeat(400 * 1024)); }
         \\catch (e) { oversize = e.code; }
         \\let budget = "none";
-        \\try { for (let i = 0; i < 5; i++) platform.root.set("b/" + i, "y".repeat(100 * 1024)); }
+        \\try { for (let i = 0; i < 5; i++) s.kv.set("b/" + i, "y".repeat(100 * 1024)); }
         \\catch (e) { budget = e.code; }
-        \\return [reserved_ok, oversize, budget].join("|");
+        \\return reserved_ok + "|" + oversize + "|" + budget;
     ,
         .{
             .method = "GET",
             .path = "/",
-            .admin = .{ .platform = pf.tenant, .root_writeset = &root_ws },
+            .admin = .{ .platform = pf.tenant, .platform_caps = .{
+                .ctx = @ptrCast(&Noop.sink),
+                .scope_kv_write = &Noop.tramp,
+            } },
         },
     );
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("yes|value_too_large|writes_too_large", resp.body);
-
-    // A refused write never reaches the writeset — the entry carries only what
-    // the rules admitted, which is the whole point of refusing at the call
-    // site. The loop above spends the budget three times over before the
-    // fourth 100 KiB write is the one that cannot fit, so exactly three land.
-    var saw_reserved = false;
-    var budgeted_puts: usize = 0;
-    for (root_ws.ops.items) |op| switch (op) {
-        .put => |pp| {
-            try testing.expect(!std.mem.eql(u8, pp.key, "k"));
-            if (std.mem.startsWith(u8, pp.key, "b/")) budgeted_puts += 1;
-            if (std.mem.eql(u8, pp.key, "_deploy/current")) saw_reserved = true;
-        },
-        .delete => {},
-    };
-    try testing.expect(saw_reserved);
-    try testing.expectEqual(@as(usize, 3), budgeted_puts);
 }
-
 test "dispatch: a platform-bound handler cannot reach the root bearer, and the tape records only the verdict" {
     // The invariant behind the credential rule (docs/decisions.md §4.6b): on a
     // replay platform a handler-readable input is a RECORDED input, so the
@@ -5051,116 +4981,6 @@ test "dispatch: a non-platform handler still reads its own authorization header"
     try testing.expectEqualStrings("Bearer customer-token|undefined", resp.body);
 }
 
-test "dispatch: platform.instances.create creates instance and mirrors to root_writeset" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    var pf = try PlatformFixture.init(testing.allocator);
-    defer pf.deinit();
-    var root_ws = kv_mod.WriteSet.init(testing.allocator);
-    defer root_ws.deinit();
-
-    var resp = try runOne(
-        &d,
-        kv,
-        \\platform.instances.create("acme");
-        \\return "ok";
-    ,
-        .{
-            .method = "POST",
-            .path = "/",
-            .admin = .{ .platform = pf.tenant, .root_writeset = &root_ws },
-        },
-    );
-    defer resp.deinit(testing.allocator);
-    try testing.expectEqualStrings("ok", resp.body);
-
-    // Tenant has the instance in its in-memory map and root.db marker.
-    try testing.expect(pf.tenant.instances.get("acme") != null);
-    try testing.expectEqual(true, try pf.tenant.instanceExists("acme"));
-
-    // Root writeset got the matching put for raft replication.
-    try testing.expectEqual(@as(usize, 1), root_ws.ops.items.len);
-    switch (root_ws.ops.items[0]) {
-        .put => |p| {
-            try testing.expectEqualStrings("instance/acme", p.key);
-            try testing.expectEqualStrings("", p.value);
-        },
-        .delete => try testing.expect(false),
-    }
-}
-
-test "dispatch: platform.instances.create is idempotent on existing instance" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    var pf = try PlatformFixture.init(testing.allocator);
-    defer pf.deinit();
-    try pf.tenant.createInstance("acme"); // pre-existing
-    var root_ws = kv_mod.WriteSet.init(testing.allocator);
-    defer root_ws.deinit();
-
-    var resp = try runOne(
-        &d,
-        kv,
-        \\platform.instances.create("acme");
-        \\platform.instances.create("acme");
-        \\return "ok";
-    ,
-        .{
-            .method = "POST",
-            .path = "/",
-            .admin = .{ .platform = pf.tenant, .root_writeset = &root_ws },
-        },
-    );
-    defer resp.deinit(testing.allocator);
-    try testing.expectEqualStrings("ok", resp.body);
-}
-
-test "dispatch: platform.instances.create throws coded InvalidName on bad name" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    var pf = try PlatformFixture.init(testing.allocator);
-    defer pf.deinit();
-    var root_ws = kv_mod.WriteSet.init(testing.allocator);
-    defer root_ws.deinit();
-
-    var resp = try runOne(
-        &d,
-        kv,
-        \\try { platform.instances.create("has space"); return "no throw"; }
-        \\catch (e) { return "code=" + e.code; }
-    ,
-        .{
-            .method = "POST",
-            .path = "/",
-            .admin = .{ .platform = pf.tenant, .root_writeset = &root_ws },
-        },
-    );
-    defer resp.deinit(testing.allocator);
-    try testing.expectEqualStrings("code=InvalidName", resp.body);
-    try testing.expectEqual(@as(usize, 0), root_ws.ops.items.len);
-}
-
 /// Stub for `platform.instances.deployStarter`'s trampoline. Records
 /// the `target_id` it was called with and optionally fails with a
 /// pre-set error. Matches the `Request.deploy_starter` signature.
@@ -5224,8 +5044,6 @@ test "dispatch: platform.instances.deployStarter throws when trampoline not conf
 
     var pf = try PlatformFixture.init(testing.allocator);
     defer pf.deinit();
-    var root_ws = kv_mod.WriteSet.init(testing.allocator);
-    defer root_ws.deinit();
 
     // Admin platform set, but no deploy_starter fn pointer (test path
     // / library mode without a worker). Should throw a clear error
@@ -5239,7 +5057,7 @@ test "dispatch: platform.instances.deployStarter throws when trampoline not conf
         .{
             .method = "POST",
             .path = "/",
-            .admin = .{ .platform = pf.tenant, .root_writeset = &root_ws },
+            .admin = .{ .platform = pf.tenant },
         },
     );
     defer resp.deinit(testing.allocator);
@@ -5258,8 +5076,6 @@ test "dispatch: platform.instances.deployStarter invokes trampoline with name" {
 
     var pf = try PlatformFixture.init(testing.allocator);
     defer pf.deinit();
-    var root_ws = kv_mod.WriteSet.init(testing.allocator);
-    defer root_ws.deinit();
 
     var rec = DeployStarterRecorder{ .allocator = testing.allocator };
     defer rec.deinit();
@@ -5275,7 +5091,6 @@ test "dispatch: platform.instances.deployStarter invokes trampoline with name" {
             .path = "/",
             .admin = .{
                 .platform = pf.tenant,
-                .root_writeset = &root_ws,
                 .platform_caps = .{
                     .ctx = &rec,
                     .deploy_starter = &DeployStarterRecorder.trampoline,
@@ -5301,8 +5116,6 @@ test "dispatch: platform.instances.deployStarter throws coded InstanceNotFound" 
 
     var pf = try PlatformFixture.init(testing.allocator);
     defer pf.deinit();
-    var root_ws = kv_mod.WriteSet.init(testing.allocator);
-    defer root_ws.deinit();
 
     var rec = DeployStarterRecorder{
         .allocator = testing.allocator,
@@ -5321,7 +5134,6 @@ test "dispatch: platform.instances.deployStarter throws coded InstanceNotFound" 
             .path = "/",
             .admin = .{
                 .platform = pf.tenant,
-                .root_writeset = &root_ws,
                 .platform_caps = .{
                     .ctx = &rec,
                     .deploy_starter = &DeployStarterRecorder.trampoline,
@@ -6319,6 +6131,16 @@ test "interaction digest: a THROWN handler closes on its real 500, not (200, \"\
     try testing.expect(rs_a.interaction_digest != rs_d.interaction_digest);
 }
 
+var digest_noop_sink: u8 = 0;
+fn digestNoopScopeWrite(ctx_: *anyopaque, alloc_: std.mem.Allocator, target: []const u8, op: globals.ScopeKvOp, key: []const u8, value: []const u8) anyerror!void {
+    _ = ctx_;
+    _ = alloc_;
+    _ = target;
+    _ = op;
+    _ = key;
+    _ = value;
+}
+
 test "interaction digest: the privileged surface moves it, and a same-response admin run is not mistaken for identical" {
     // #413. Before this, `platform.*` was invisible to the digest: two admin
     // runs that read DIFFERENT tenants' state, or published DIFFERENT
@@ -6363,7 +6185,10 @@ test "interaction digest: the privileged surface moves it, and a same-response a
                 .method = "GET",
                 .path = "/",
                 .trace = .{ .request_id = rid, .readset = rs },
-                .admin = .{ .platform = pfx.tenant },
+                .admin = .{ .platform = pfx.tenant, .platform_caps = .{
+                    .ctx = @ptrCast(@constCast(&digest_noop_sink)),
+                    .scope_kv_write = &digestNoopScopeWrite,
+                } },
             });
         }
     }.go;
@@ -6386,19 +6211,20 @@ test "interaction digest: the privileged surface moves it, and a same-response a
     try testing.expectEqualStrings(r1.body, r3.body);
     try testing.expect(dg_acme != dg_other);
 
-    // A lifecycle op moves it too, and its ARGUMENTS show: two creates that
-    // differ only in the instance name must not digest alike. `instances.create`
-    // rather than `releases.publish` because it needs no worker trampoline —
-    // publish would throw "not configured" on this fixture and prove nothing.
+    // A WRITE op moves it too, and its ARGUMENTS show: two scope writes that
+    // differ only in the target must not digest alike. (`instances.create`,
+    // the old vehicle, is gone — root writes are dispatched activations,
+    // . The scope write folds op + target + key the same way and
+    // needs only the no-op caps trampoline.)
     var dg_c1: u64 = 0;
     var p1 = try run(&d, kv, &pf,
-        \\platform.instances.create("made-one");
+        \\platform.scope("acme").kv.set("probe", "1");
         \\return "ok";
     , 4, &dg_c1);
     defer p1.deinit(testing.allocator);
     var dg_c2: u64 = 0;
     var p2 = try run(&d, kv, &pf,
-        \\platform.instances.create("made-two");
+        \\platform.scope("other").kv.set("probe", "1");
         \\return "ok";
     , 5, &dg_c2);
     defer p2.deinit(testing.allocator);

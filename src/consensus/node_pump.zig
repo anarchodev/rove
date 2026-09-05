@@ -831,11 +831,9 @@ pub fn applyEntry(self: *Node, group_id: u64, index: u64, frame: envelope.EntryF
                             // skip rather than fault (the entry already
                             // applied through the worker's own txn).
                             .multi => {},
-                            .root_writeset => self.notifyApply(group_id, "", ie.payload, true),
                         }
                     }
                 },
-                .root_writeset => self.notifyApply(group_id, "", env.payload, true),
             }
         }
         if (self.groups.get(group_id)) |slot| {
@@ -874,25 +872,8 @@ pub fn applyEntry(self: *Node, group_id: u64, index: u64, frame: envelope.EntryF
                         self.notifyApply(group_id, ie.id, wp.ws_bytes, false);
                     },
                     .multi => return envelope.Error.NestedMulti,
-                    // A root inner (`platform.root.*` riding the admin
-                    // batch). Raw writeset payload — root envelopes
-                    // are not readset-framed.
-                    .root_writeset => {
-                        const store = self.storeFor(slot, "") orelse return Error.UnroutedApply;
-                        try writeset.applyEncodedDirect(store, index, ie.payload);
-                        self.notifyApply(group_id, "", ie.payload, false);
-                    },
                 }
             }
-        },
-        // A bare root writeset (rides the reserved root group, whose
-        // slot id is `""` — so the no-resolver fallback in `storeFor`
-        // routes it to that group's own slot store). Raw payload (no
-        // readset frame).
-        .root_writeset => {
-            const store = self.storeFor(slot, "") orelse return Error.UnroutedApply;
-            try writeset.applyEncodedDirect(store, index, env.payload);
-            self.notifyApply(group_id, "", env.payload, false);
         },
     }
     // One entry applied (all inners included): advance the group's

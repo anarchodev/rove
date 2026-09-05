@@ -14,8 +14,8 @@ export default function ({ kv, platform }) {
   platform.scope("beta").kv.set("shared", "beta");
 
   const rootSeed = platform.root.get("cfg"); // seeded in the root store
-  platform.root.set("cfg", "root-new");
-  platform.root.set("shared", "root");
+  // (root WRITES are dispatched activations, so the root store here is
+  // read-only surface; the isolation matrix covers the writable facades.)
 
   return {
     ownShared: kv.get("shared"),       // "own" — untouched by scoped/root "shared"

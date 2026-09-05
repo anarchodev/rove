@@ -509,9 +509,9 @@ different stores**, and they are not redundant —
 
 1. CP `/_control/host` → the **directory raft** (front-door host→cluster
    routing — which cluster owns the host), and
-2. worker `/ops/assign-domain` → the per-platform **`domain/{host}`
-   root_writeset** (the worker's host→tenant resolver — which tenant on that
-   cluster serves the host).
+2. the admin app's `assignDomain` → the per-platform **`domain/{host}` row
+   in the `__root__` group** (a dispatched root activation; the worker's
+   host→tenant resolver — which tenant on that cluster serves the host).
 
 That is the real reason `host add` is two calls today. It is also a concrete
 thing **Phase B's consolidated `host add` would hide behind one CP

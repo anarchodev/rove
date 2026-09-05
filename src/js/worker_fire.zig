@@ -312,6 +312,7 @@ pub fn fireBlobCompose(worker: anytype, pf_in: globals.PendingFetch) void {
         } },
         .trace = p.trace(corr_full, null),
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
+        .trampolines = worker.trampolines(p.dep.tc.slot),
         .admin = .{ .platform = p.dep.inst.platform },
     };
     runFire(worker, &p, req, .{
@@ -469,6 +470,7 @@ pub fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWak
         } },
         .trace = p.trace(corr_full, dw.armed_by),
         .plan = .{ .limiter = &worker.limiter, .storage = p.dep.inst.storage, .plan_rate = p.plan_rate, .plan_gen = p.plan_gen, .blob_cfg = &worker.node.blob_backend_cfg },
+        .trampolines = worker.trampolines(p.dep.tc.slot),
         .admin = .{ .platform = p.dep.inst.platform },
     };
 
