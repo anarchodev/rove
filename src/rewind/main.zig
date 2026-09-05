@@ -997,6 +997,13 @@ pub fn main() !void {
         break :blk b;
     } else try Bridge.initSingleNode(allocator, data_dir);
     defer bridge.deinit();
+    // The `__root__` group is pinned always-active on every path that
+    // stands it up (birth, attach, recovery): root is read-mostly, so
+    // nothing proposes to it during a failover, and a hibernated root
+    // group whose leader died would sit leaderless — its followers'
+    // election timers stopped — until an unrelated write woke it. Set
+    // before recoverGroups/startPump so no creation path races it.
+    bridge.pin_id_str = tenant_mod.ROOT_INSTANCE_ID;
     bridge.setWorkerOverlay();
     // Full-HA store unification: a FOLLOWER has no worker serving
     // this tenant, so its replicated writes must land in the SAME store a

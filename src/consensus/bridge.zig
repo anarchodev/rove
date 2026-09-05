@@ -426,6 +426,15 @@ pub const Bridge = struct {
     /// a sustained climb means clients keep aiming writes at a non-member
     /// (a wiped voter mid-heal, or stale routing). Pump-thread only.
     unhosted_propose_count: u64 = 0,
+    /// A tenant id whose group is pinned ALWAYS-active (`Node.pinActive`)
+    /// on EVERY creation path — control-inbox create (birth, v2-attach)
+    /// and `recoverGroups` alike. Set before `startPump`. The worker sets
+    /// the cluster-root tenant here: like the CP directory group, root is
+    /// read-mostly, so a read never proposes and a hibernated root group
+    /// whose leader died would never wake to re-elect — pinned, its
+    /// followers keep running their election timers. One group, so
+    /// always-ticking stays O(1).
+    pin_id_str: ?[]const u8 = null,
 
     /// Stand up a single-node bridge over a fresh single-voter `Node`.
     /// Does NOT start the pump thread — call `startPump` (production) or
@@ -1321,6 +1330,14 @@ pub const Bridge = struct {
                 std.log.warn("v2 bridge: recoverGroups group {s} failed: {s}", .{ g.id_str, @errorName(err) });
                 continue;
             };
+            // Pre-pump, so the direct pin is safe — same rule as the
+            // control-inbox create path: a pin-tenant group must never
+            // stand un-pinned.
+            if (self.pin_id_str) |p| {
+                if (std.mem.eql(u8, g.id_str, p)) self.node.pinActive(gid) catch |err| {
+                    std.log.err("v2 bridge: recoverGroups pin {s} failed: {s}", .{ g.id_str, @errorName(err) });
+                };
+            }
             n += 1;
             std.log.info("v2 bridge: recovered tenant group {s} (epoch {d})", .{ g.id_str, g.epoch });
         }
@@ -2416,6 +2433,45 @@ test "bridge: createGroupEpoch requires a running pump thread" {
     const gid = try bridge.registerTenant("x");
     // No startPump → control ops have no executor.
     try testing.expectError(Error.PumpNotRunning, bridge.createGroupEpoch(gid, 1, false, null, null));
+}
+
+test "bridge: pin_id_str pins the matching group on create AND on recovery" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    // Create path: the control-inbox create pins the matching tenant's
+    // group with the create, and only that tenant's.
+    {
+        const bridge = try Bridge.initSingleNode(a, dir);
+        defer bridge.deinit();
+        bridge.pin_id_str = "rooty";
+        const gid = try bridge.registerTenant("rooty");
+        const other = try bridge.registerTenant("plain");
+        try bridge.startPump();
+        try bridge.createGroupEpoch(gid, 1, false, null, null);
+        try bridge.createGroupEpoch(other, 1, false, null, null);
+        // Quiesce the pump before reading node state on this thread.
+        bridge.stopPump();
+        try testing.expect(bridge.node.groups.get(gid).?.hib.pinned);
+        try testing.expect(!bridge.node.groups.get(other).?.hib.pinned);
+    }
+
+    // Recovery path: a restart re-stands both groups from the manifest;
+    // the matching one comes back pinned (pre-pump direct pin).
+    {
+        const bridge = try Bridge.initSingleNode(a, dir);
+        defer bridge.deinit();
+        bridge.pin_id_str = "rooty";
+        const n = bridge.recoverGroups();
+        try testing.expectEqual(@as(usize, 2), n);
+        const gid = try bridge.registerTenant("rooty");
+        const other = try bridge.registerTenant("plain");
+        try testing.expect(bridge.node.groups.get(gid).?.hib.pinned);
+        try testing.expect(!bridge.node.groups.get(other).?.hib.pinned);
+    }
 }
 
 test "a multi-node propose for a locally-unhosted group faults — no husk is born" {
