@@ -18,6 +18,161 @@ const move = @import("move.zig");
 const Directory = @import("cp-directory").Directory;
 const BackendResp = bc.BackendResp;
 
+/// rove#715: every registered cluster carries a `__root__` group — the
+/// per-cluster raft log that orders routing state (`domain/{host}`), born
+/// via the SAME attach fan-out a provision uses (cold-multi, cp-ssot voter
+/// set). Runs every reconcile tick on the directory leader, unconditional —
+/// unlike the membership heal below, a missing root group is not an
+/// operator-opt-in concern, it is the cluster missing a limb.
+///
+/// A wiped node deliberately does NOT self-birth this group at boot
+/// (multi-node): a fresh empty group under an incumbent leader's stale
+/// progress panics raft on the first heartbeat (`to_commit out of range`) —
+/// the wiped-voter-rejoin hazard. It stays group-less (the transport skips
+/// unknown-group messages) until this pass, or the opt-in membership heal,
+/// re-attaches it properly.
+///
+/// Cheap in steady state: one v2-leader probe per cluster per tick, and a
+/// cluster is dropped from probing once its root group has answered
+/// (`router.root_ensured`); it re-enters only via CP restart, which
+/// re-verifies.
+/// rove#715: every registered cluster carries a `__root__` group — the
+/// per-cluster raft log that orders routing state (`domain/{host}`), born
+/// via the SAME attach fan-out a provision uses (cold-multi, cp-ssot voter
+/// set).
+///
+/// Runs on its OWN thread, never the CP poll loop. This was measured, not
+/// theorized: an on-loop version wedged the loop in 15s connect deadlines
+/// against down clusters (fronts served 503 for everything), and even a
+/// 500ms-budgeted, backed-off version flipped the timing-sensitive front
+/// smokes under full-suite load. The loop's rule is the front door's rule —
+/// it never blocks — and the opt-in membership heal above it stays the one
+/// deliberate exception. Everything this thread touches is cross-thread
+/// safe: the directory locks internally, `bc` builds a fresh curl handle
+/// per call, the CP allocator is `c_allocator`, and the ensured/backoff
+/// maps are owned by the thread alone.
+///
+/// A wiped node deliberately does NOT self-birth this group at boot
+/// (multi-node): a fresh empty group under an incumbent leader's stale
+/// progress panics raft on the first heartbeat (`to_commit out of range`) —
+/// the wiped-voter-rejoin hazard. It stays group-less (the transport skips
+/// unknown-group messages) until this thread, or the opt-in membership
+/// heal, re-attaches it properly.
+pub const RootEnsurer = struct {
+    allocator: std.mem.Allocator,
+    move_secret: ?[]const u8,
+    directory: *Directory,
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+    ensured: std.StringHashMapUnmanaged(void) = .empty,
+    last_attempt: std.StringHashMapUnmanaged(i128) = .empty,
+
+    const PROBE_TIMEOUT_MS: u32 = 500;
+    const ATTEMPT_BACKOFF_NS: i128 = 20 * std.time.ns_per_s;
+    const TICK_NS: u64 = 5 * std.time.ns_per_s;
+
+    pub fn start(self: *RootEnsurer) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    pub fn shutdown(self: *RootEnsurer) void {
+        self.stop.store(true, .release);
+        if (self.thread) |t| t.join();
+        const a = self.allocator;
+        var it = self.ensured.keyIterator();
+        while (it.next()) |k| a.free(k.*);
+        self.ensured.deinit(a);
+        var it2 = self.last_attempt.keyIterator();
+        while (it2.next()) |k| a.free(k.*);
+        self.last_attempt.deinit(a);
+    }
+
+    fn run(self: *RootEnsurer) void {
+        while (!self.stop.load(.acquire)) {
+            self.pass();
+            // Sleep in short slices so shutdown joins promptly.
+            var slept: u64 = 0;
+            while (slept < TICK_NS and !self.stop.load(.acquire)) {
+                std.Thread.sleep(200 * std.time.ns_per_ms);
+                slept += 200 * std.time.ns_per_ms;
+            }
+        }
+    }
+
+    fn pass(self: *RootEnsurer) void {
+        // One writer cluster-wide, same rule as every CP write: only the
+        // directory leader attaches. Followers idle here cheaply.
+        if (!self.directory.isLeader()) return;
+        const a = self.allocator;
+        const clusters = self.directory.listClustersOwned(a) catch return;
+        defer {
+            for (clusters) |*c| c.deinit(a);
+            a.free(clusters);
+        }
+        const now: i128 = std.time.nanoTimestamp();
+        for (clusters) |c| {
+            if (self.stop.load(.acquire)) return;
+            if (self.ensured.contains(c.id)) continue;
+            if (self.last_attempt.get(c.id)) |last| {
+                if (now - last < ATTEMPT_BACKOFF_NS) continue;
+            }
+            blk: {
+                const gop = self.last_attempt.getOrPut(a, c.id) catch break :blk;
+                if (!gop.found_existing) {
+                    gop.key_ptr.* = a.dupe(u8, c.id) catch {
+                        _ = self.last_attempt.remove(c.id);
+                        break :blk;
+                    };
+                }
+                gop.value_ptr.* = now;
+            }
+            // Probe every node. Any 200 = a leader exists (ensured); attach
+            // only fires when EVERY node answered, so a half-up cluster is
+            // left alone until it is whole — genesis wants the full set.
+            var has_leader = false;
+            var all_reachable = true;
+            for (c.nodes) |base| {
+                const resp = bc.callTimeout(self, base, "/_system/v2-leader?tenant=__root__", .GET, "", &.{}, PROBE_TIMEOUT_MS) catch {
+                    all_reachable = false;
+                    continue;
+                };
+                var r = resp;
+                defer r.deinit(a);
+                if (r.status == 200) {
+                    has_leader = true;
+                    break;
+                }
+            }
+            if (has_leader) {
+                const key = a.dupe(u8, c.id) catch continue;
+                self.ensured.put(a, key, {}) catch a.free(key);
+                continue;
+            }
+            if (!all_reachable) continue;
+            // Genesis (or all-lost): cold-multi attach on every node with
+            // the CP's node-id set, exactly like a provision birth. Not
+            // marked ensured — a later pass's probe confirms the election.
+            const addrs = self.directory.listClusterNodeAddrs(a, c.id) catch continue;
+            defer {
+                for (addrs) |*e| {
+                    var ent = e.*;
+                    ent.deinit(a);
+                }
+                a.free(addrs);
+            }
+            var voters: std.ArrayListUnmanaged(u64) = .empty;
+            defer voters.deinit(a);
+            for (addrs) |e| voters.append(a, e.id) catch break;
+            const birth_voters: ?[]const u64 = if (voters.items.len > 0) voters.items else null;
+            if (!move.attachToAll(self, c.nodes, "__root__", null, birth_voters, "", null)) {
+                std.log.warn("rewind-cp: __root__ attach fan-out on cluster {s} incomplete; retrying after backoff", .{c.id});
+            } else {
+                std.log.info("rewind-cp: __root__ group attached on cluster {s} ({d} node(s))", .{ c.id, c.nodes.len });
+            }
+        }
+    }
+};
+
 /// Additive membership reconciler (opt-in `reconcile_membership`).
 /// On the directory leader, converge each placed tenant's DP group
 /// membership to its cluster's node set: for the first not-caught-up node

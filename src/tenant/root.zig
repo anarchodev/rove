@@ -113,6 +113,13 @@ pub const MAX_HOST_LEN: usize = 253; // RFC 1035
 /// Every other instance has `platform = null`.
 pub const ADMIN_INSTANCE_ID = id_spec.ADMIN_INSTANCE_ID;
 
+/// The per-cluster root scope (rove#715). NOT in `RESERVED_INSTANCE_IDS`:
+/// it is not a provisionable tenant — it fails ordinary id validation, so
+/// no customer or provisioning path can create or name it. It exists only
+/// as the pseudo-instance `getInstance` answers for engine callers (the
+/// dispatch path scoping an activation at the cluster root store).
+pub const ROOT_INSTANCE_ID = "__root__";
+
 /// Reserved tenant id for the tape-replay browser page (PLAN §10.12).
 /// Bootstrapped as a regular instance — no `platform` capability, no
 /// special dispatch path. The only platform-special bit is the
@@ -224,7 +231,18 @@ pub const Tenant = struct {
     public_suffix: ?[]u8 = null,
     /// Canonical map: instance_id → *Instance. Values are heap-allocated
     /// and stay alive until `deinit` (or explicit delete).
+    ///
+    /// `ROOT_INSTANCE_ID` is deliberately NOT in this map: the root
+    /// pseudo-instance below must never appear in instance enumeration
+    /// (lists, sweeps, deprovision walks) — it is not a tenant, it is the
+    /// scope handle for activations that write cluster routing state.
     instances: std.StringHashMapUnmanaged(*Instance) = .empty,
+    /// Lazily-built pseudo-instance for `ROOT_INSTANCE_ID` (rove#715): id
+    /// `__root__`, `kv` = the cluster root store itself, no platform, no
+    /// per-tenant dir. `storage` is `.legacy` keyed on the id, so
+    /// `storage.storeId()` equals the cluster store's own
+    /// `hashStoreId("__root__")` — one identity, however derived.
+    root_instance: ?*Instance = null,
     /// Host → *Instance cache. Values point into `instances`; entries
     /// are dropped on any `Tenant` write (coarse but fine — root writes
     /// are rare bootstrap ops in M1).
@@ -312,6 +330,14 @@ pub const Tenant = struct {
             allocator.destroy(inst);
         }
         self.instances.deinit(allocator);
+        // The root pseudo-instance: free the handle only — `inst.kv` is the
+        // borrowed cluster store, which the CALLER closes (same contract as
+        // `self.root`), and `.legacy` incarnation owns nothing.
+        if (self.root_instance) |inst| {
+            allocator.free(inst.id);
+            allocator.free(inst.dir);
+            allocator.destroy(inst);
+        }
         if (self.public_suffix) |p| allocator.free(p);
         allocator.free(self.dir);
         allocator.destroy(self);
@@ -571,6 +597,12 @@ pub const Tenant = struct {
     /// Intended for admin surfaces that need to talk to an instance's
     /// `KvStore` without going through a host → instance lookup.
     pub fn getInstance(self: *Tenant, id: []const u8) Error!?*const Instance {
+        // The engine-only root scope. Answered before validation on
+        // purpose: `__root__` FAILS the id spec, which is what keeps every
+        // other path (provision, create, host resolution) from ever
+        // reaching it — only a caller that asks for it by this exact name
+        // gets the handle.
+        if (std.mem.eql(u8, id, ROOT_INSTANCE_ID)) return try self.rootInstance();
         try validateInstanceId(id);
         {
             self.maps_mutex.lock();
@@ -582,6 +614,27 @@ pub const Tenant = struct {
         defer self.maps_mutex.unlock();
         if (self.instances.get(id)) |inst| return inst;
         return try self.ensureOpenLocked(id);
+    }
+
+    /// The `ROOT_INSTANCE_ID` pseudo-instance, built on first ask.
+    fn rootInstance(self: *Tenant) Error!*const Instance {
+        self.maps_mutex.lock();
+        defer self.maps_mutex.unlock();
+        if (self.root_instance) |inst| return inst;
+        const inst = self.allocator.create(Instance) catch return Error.OutOfMemory;
+        errdefer self.allocator.destroy(inst);
+        const id = self.allocator.dupe(u8, ROOT_INSTANCE_ID) catch return Error.OutOfMemory;
+        errdefer self.allocator.free(id);
+        const dir = self.allocator.dupe(u8, "") catch return Error.OutOfMemory;
+        inst.* = .{
+            .id = id,
+            .dir = dir,
+            .kv = self.root,
+            .platform = null,
+            .storage = .{ .id = id, .incarnation = .legacy },
+        };
+        self.root_instance = inst;
+        return inst;
     }
 
     /// Enumerate every instance registered in the root store (up to

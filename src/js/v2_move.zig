@@ -100,6 +100,18 @@ const FORWARD_MARKER = "_move/forward";
 /// a `v2-*` move endpoint (and the response was finalized). `path` still
 /// carries the query string (the GET reader needs it); `sys_rest` is the
 /// path past `/_system/` with the query already stripped.
+/// What the v2 family decided. Mirrors `worker_system.Disposition`, stated
+/// here to keep the import one-directional: worker_system maps
+/// `.activation` onto its own `ForcedActivation`.
+pub const V2Result = union(enum) {
+    not_mine,
+    answered,
+    /// The route authenticated the caller and the WORK is an activation of
+    /// baked code in a named tenant's scope (rove#715: `v2-domain` writes
+    /// the cluster root through `__root__`'s own log).
+    activation: struct { tenant: []const u8, module_base: []const u8 },
+};
+
 pub fn tryHandleV2(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -112,18 +124,18 @@ pub fn tryHandleV2(
     path: []const u8,
     rh: h2.ReqHeaders,
     body: []const u8,
-) !bool {
-    if (!std.mem.startsWith(u8, sys_rest, "v2-")) return false;
+) !V2Result {
+    if (!std.mem.startsWith(u8, sys_rest, "v2-")) return .not_mine;
 
     // Auth on the dedicated move secret only (no CORS, no root bearer).
     const secret = worker.move_secret orelse {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "move surface disabled\n", allocator, null, null);
-        return true;
+        return .answered;
     };
     const presented = respb.findHeader(rh, MOVE_SECRET_HEADER) orelse "";
     if (!constantTimeEql(presented, secret)) {
         try respb.setSystemResponse(server, ent, sid, sess, 401, "bad move secret\n", allocator, null, null);
-        return true;
+        return .answered;
     }
 
     if (std.mem.eql(u8, sys_rest, "v2-kv")) {
@@ -149,7 +161,7 @@ pub fn tryHandleV2(
     } else if (std.mem.eql(u8, sys_rest, "v2-suspend")) {
         try handleSuspend(server, allocator, worker, ent, sid, sess, method, path, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-domain")) {
-        try handleDomain(server, allocator, worker, ent, sid, sess, method, body);
+        return try handleDomain(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-confchange")) {
         try handleConfChange(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-confstate")) {
@@ -169,7 +181,7 @@ pub fn tryHandleV2(
     } else {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown v2 move endpoint\n", allocator, null, null);
     }
-    return true;
+    return .answered;
 }
 
 // ── v2-kv: seed (PUT) / read (GET) a tenant store ────────────────────
@@ -326,8 +338,10 @@ fn commitWrite(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8
 // instance locally (`tenant.resolveDomain`). The CP owns host→tenant
 // end-to-end and propagates the worker alias (docs/architecture/auth-consolidation.md
 // B3), so `host add` is a single CP call and there's no second operator
-// secret. The alias is a `__root__` write — leader-gated, replicated as a
-// type-2 root_writeset (followers apply it).
+// secret. The alias is a `__root__` write — an ACTIVATION of baked
+// `__system/root_domain` in the root scope (rove#715), so it rides
+// `__root__`'s own log as an ordinary envelope-0 writeset and followers
+// apply it like any other.
 fn validHost(host: []const u8) bool {
     if (host.len == 0 or host.len > 253) return false;
     for (host) |b| {
@@ -336,40 +350,6 @@ fn validHost(host: []const u8) bool {
         if (!ok) return false;
     }
     return true;
-}
-
-fn commitRootDomain(worker: anytype, allocator: std.mem.Allocator, host: []const u8, tenant: []const u8) u16 {
-    // Leader gate (same convention as commitWrite): only the group leader may
-    // take the immediate-commit + propose; a follower would speculatively
-    // commit then fault the propose with no undo. 421 → the CP re-aims.
-    const gid = worker.raft.registerTenant(tenant_mod.ADMIN_INSTANCE_ID) catch return 500;
-    if (!worker.raft.isLeaderOf(gid)) {
-        // Wake a hibernated leaderless group toward re-election — a gate-
-        // rejected write never reaches the propose that would bump it awake.
-        worker.raft.requestWake(gid);
-        return 421;
-    }
-
-    const key = std.fmt.allocPrint(allocator, "domain/{s}", .{host}) catch return 500;
-    defer allocator.free(key);
-
-    var txn = worker.node.tenant.root.beginTrackedImmediate() catch return 500;
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    txn.put(key, tenant) catch {
-        txn.rollback() catch {};
-        return 500;
-    };
-    ws.addPut(key, tenant) catch {
-        txn.rollback() catch {};
-        return 500;
-    };
-    txn.commit() catch return 500;
-
-    const proposed = raft_propose.proposeRoot(worker, tenant_mod.ADMIN_INSTANCE_ID, &ws) catch return 503;
-    worker.raft.noteWorkerCommitted(proposed.group_id, proposed.seq);
-    if (!awaitCommit(worker, proposed.group_id, proposed.seq)) return 504;
-    return 0;
 }
 
 fn handleDomain(
@@ -381,18 +361,34 @@ fn handleDomain(
     sess: h2.Session,
     method: []const u8,
     body: []const u8,
-) !void {
-    if (!std.mem.eql(u8, method, "POST"))
-        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+) !V2Result {
+    _ = worker;
+    if (!std.mem.eql(u8, method, "POST")) {
+        try reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+        return .answered;
+    }
     const Body = struct { host: []const u8, tenant: []const u8 };
-    var parsed = std.json.parseFromSlice(Body, allocator, body, .{ .ignore_unknown_fields = true }) catch
-        return reply(server, allocator, ent, sid, sess, 400, "expected {\"host\",\"tenant\"}\n");
+    var parsed = std.json.parseFromSlice(Body, allocator, body, .{ .ignore_unknown_fields = true }) catch {
+        try reply(server, allocator, ent, sid, sess, 400, "expected {\"host\",\"tenant\"}\n");
+        return .answered;
+    };
     defer parsed.deinit();
-    if (!validHost(parsed.value.host) or parsed.value.tenant.len == 0)
-        return reply(server, allocator, ent, sid, sess, 400, "host = lowercase fqdn, tenant required\n");
-    const status = commitRootDomain(worker, allocator, parsed.value.host, parsed.value.tenant);
-    if (status == 0) return reply(server, allocator, ent, sid, sess, 204, "");
-    return reply(server, allocator, ent, sid, sess, status, "domain alias write failed\n");
+    if (!validHost(parsed.value.host) or parsed.value.tenant.len == 0) {
+        try reply(server, allocator, ent, sid, sess, 400, "host = lowercase fqdn, tenant required\n");
+        return .answered;
+    }
+    // The WRITE is an activation of baked `__system/root_domain` in
+    // `__root__`'s own scope (rove#715): the alias takes a position in the
+    // cluster root's log and leaves a record there, and the generic
+    // dispatch leader gate answers the 421-with-leader-hint the CP's
+    // re-aim loop expects — against the ROOT group, which is the one the
+    // write actually needs. The module re-parses {host, tenant} from the
+    // body it is handed (both are JSON strings, safe through
+    // request.json).
+    return .{ .activation = .{
+        .tenant = tenant_mod.ROOT_INSTANCE_ID,
+        .module_base = "__system/root_domain",
+    } };
 }
 
 // ── v2-attach: load bundle + stand up the group (destination) ─────────
@@ -448,9 +444,17 @@ fn handleAttach(
     // is insert-if-absent, so it never clobbers a forwarded newer key), and
     // a reconciler bootstrap idles as a born learner until the leader's
     // AddLearner reaches it.
+    // `__root__` (rove#715) is not a provisionable tenant: it HAS no
+    // per-tenant instance, keyring, or plan — its store is the cluster
+    // store the resolver routes by name, its writes are raw and unsealed,
+    // and its "membership" is the cluster's node set. An attach for it
+    // forms ONLY the group (the genesis/heal path the CP drives).
+    const is_root = std.mem.eql(u8, tenant, tenant_mod.ROOT_INSTANCE_ID);
     const incarnation = tenant_mod.Incarnation.fromMarker(dec.incarnation);
-    _ = ensureInstanceWithIncarnation(worker, tenant, incarnation) catch
-        return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
+    if (!is_root) {
+        _ = ensureInstanceWithIncarnation(worker, tenant, incarnation) catch
+            return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
+    }
 
     // The keyring root secret rides a BIRTH attach only, and this is the
     // one moment it exists outside a node: the CP mints it, fans the same
@@ -459,7 +463,7 @@ fn handleAttach(
     // attach carries none — that node's keyring arrives from a peer as
     // KEK-sealed ciphertext, the same operation as an ordinary shard
     // update.
-    if (dec.secret) |sec| {
+    if (dec.secret) |sec| if (!is_root) {
         createKeyringAtBirth(worker, allocator, tenant, sec) catch |err| {
             // Fail the attach. A tenant born without a shreddable root
             // looks completely healthy until the first seal needs a key
@@ -467,17 +471,17 @@ fn handleAttach(
             std.log.warn("v2-attach {s}: keyring create failed: {s}", .{ tenant, @errorName(err) });
             return reply(server, allocator, ent, sid, sess, 500, "keyring create failed\n");
         };
-    }
+    };
 
     // The tenant's plan rides the attach handshake (operational state,
     // docs/architecture/control-plane.md): cache the resolved limits on its slot so enforcement is local
     // from the first post-move request. Non-fatal — a bad/absent plan leaves
     // the tenant on the free tier until a live push corrects it; it must not
     // fail the move.
-    if (dec.plan) |plan_blob| {
+    if (dec.plan) |plan_blob| if (!is_root) {
         applyPlanBlob(worker, allocator, tenant, plan_blob) catch |err|
             std.log.warn("v2-attach: applyPlanBlob({s}) failed: {s}", .{ tenant, @errorName(err) });
-    }
+    };
 
     // Genesis §4d (attach-carry): learn the existing members' raft addresses
     // BEFORE the group is created, so the moment the leader's first append lands

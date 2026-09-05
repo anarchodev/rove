@@ -114,8 +114,12 @@ pub fn tryHandleSystem(
     // carries its own `move_secret` auth (the front door holds it, not the
     // operator root bearer) and no CORS, so it short-circuits before the
     // admin-auth gate below. Disabled (404) when no move secret is set.
-    if (try v2_move.tryHandleV2(server, allocator, worker, ent, sid, sess, method, sys_rest, path, rh, body)) {
-        return .answered;
+    switch (try v2_move.tryHandleV2(server, allocator, worker, ent, sid, sess, method, sys_rest, path, rh, body)) {
+        .answered => return .answered,
+        // v2-domain (rove#715): the alias write is an activation in
+        // `__root__`'s scope; both names are static strings.
+        .activation => |a| return .{ .activation = .{ .tenant = a.tenant, .module_base = a.module_base } },
+        .not_mine => {},
     }
 
     // Liveness probe for load balancers / systemd-style supervisors.

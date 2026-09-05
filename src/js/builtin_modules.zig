@@ -142,6 +142,14 @@ const MODULES = [_]struct {
         .src = @embedFile("builtin_config_install_mjs"),
     },
     .{
+        // rove#715: a `domain/{host}` alias, written by `__root__` in its
+        // own scope — dispatched by `/_system/v2-domain` after the CP
+        // authenticates; cluster routing state stops riding another
+        // tenant's log.
+        .path = "__system/root_domain.mjs",
+        .src = @embedFile("builtin_root_domain_mjs"),
+    },
+    .{
         // rove#719: the release flip — `_deploy/current` + `_release/{ts}` —
         // written by the target tenant in its own scope. Dispatched by the
         // `/_system/release` route after it authenticates the operator; the

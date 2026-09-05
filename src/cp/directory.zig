@@ -1071,6 +1071,30 @@ pub const Directory = struct {
         return self.clusters.items[p.cluster_idx].id;
     }
 
+    /// Every registered cluster with its node URL set — owned; caller
+    /// `deinit`s each entry and frees the slice. The reconciler's per-CLUSTER
+    /// walk (rove#715: `__root__` is per-cluster state, so its group is
+    /// ensured against the cluster list, not the placement list).
+    pub fn listClustersOwned(self: *Directory, a: std.mem.Allocator) Error![]OwnedCluster {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var out: std.ArrayListUnmanaged(OwnedCluster) = .empty;
+        errdefer {
+            for (out.items) |*c| c.deinit(a);
+            out.deinit(a);
+        }
+        for (self.clusters.items) |c| {
+            const id = a.dupe(u8, c.id) catch return Error.OutOfMemory;
+            errdefer a.free(id);
+            const nodes = dupeNodes(a, c.nodes) catch return Error.OutOfMemory;
+            out.append(a, .{ .id = id, .nodes = nodes }) catch {
+                freeNodes(a, nodes);
+                return Error.OutOfMemory;
+            };
+        }
+        return out.toOwnedSlice(a) catch return Error.OutOfMemory;
+    }
+
     /// The cluster currently serving a tenant, or null if the tenant has no
     /// placement (the front door 404s / 421-misdirects). Owned — caller
     /// `deinit`s.

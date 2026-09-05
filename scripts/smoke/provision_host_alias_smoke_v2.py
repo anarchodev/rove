@@ -78,6 +78,24 @@ def main() -> int:
                 r = c.get("aliasten", "/?fn=handler", host=CUSTOM_HOST)
             check("custom-host serve -> 200 alias-ok (no manual host add)",
                   r.status == 200 and "alias-ok" in r.body, f"got {r.status} {r.body!r}")
+
+            # rove#715 acceptance: the alias write is an ACTIVATION in the
+            # cluster root's own log — `__root__` has its own group now, and
+            # the v2-domain push dispatches `__system/root_domain` against
+            # it, so the record must be there.
+            c.spawn_log_server()
+            found = None
+            deadline = _t.time() + 20.0
+            while _t.time() < deadline:
+                lr = c.log_get("__root__/list")
+                if lr.status == 200 and "/_system/v2-domain" in lr.body:
+                    found = lr
+                    break
+                _t.sleep(0.5)
+            check("the alias landed as an activation in __root__'s log",
+                  found is not None,
+                  "present" if found is not None
+                  else "absent after 20s — the alias left no account of itself")
             if r.status != 200:
                 c.dump_node_log(grep=["domain", "alias", "resolve", "host", "404", "tenant"])
                 cp_log = c.log_paths.get("cp")
