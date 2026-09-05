@@ -33,7 +33,13 @@ One sentence per piece:
   state) plus a column projection (the row), physically maintained: moving
   an entity copies shared columns view-to-view, *parks* dropped columns in
   the base table, *unparks* gained ones. Move copies are incremental view
-  maintenance, nothing more.
+  maintenance, nothing more. A growable collection's columns are reserved
+  at registration to the registry's max_entities — the bound no single
+  collection can exceed — so storage never reallocates: no mid-tick
+  whole-SoA copy, and column base addresses are stable for the registry's
+  lifetime (slot contents still move on swap-remove). A fixed-capacity
+  collection keeps its heap block and its `error.Full` — that refusal is
+  admission policy.
 - **Total moves.** Any collection to any collection, no row-subset
   requirement, lossless by construction. A component's value is
   path-independent: always the last value a system wrote, never a function
