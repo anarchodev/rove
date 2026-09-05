@@ -142,6 +142,16 @@ const MODULES = [_]struct {
         .src = @embedFile("builtin_config_install_mjs"),
     },
     .{
+        // Scoped kv (reads + named-view writes) in the TARGET tenant's own
+        // scope — dispatched by
+        // the admin app via platform.dispatch; the terminal body rides the
+        // engine's dispatch result back to the caller. No targetable
+        // flags: the platform-dispatch funnel is admin-gated and takes any
+        // baked module; the customer-armable routes cannot name this.
+        .path = "__system/scope_kv.mjs",
+        .src = @embedFile("builtin_scope_kv_mjs"),
+    },
+    .{
         // root-scope kv writes (`instance/{id}` create, domain
         // assigns, deletes) — dispatched by the admin app via
         // platform.dispatch against `__root__`. No targetable flags: the

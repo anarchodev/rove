@@ -1267,6 +1267,7 @@ pub const RecordVersions = struct {
     pub const send_owed: i32 = 1;
     pub const blob_owed: i32 = 1;
     pub const dispatch_owed: i32 = 1;
+    pub const dispatch_result: i32 = 1;
     pub const seg_idx: i32 = 1;
     pub const export_rec: i32 = 1;
 };
@@ -1279,6 +1280,7 @@ pub const FORMAT_CONSTS = [_]ConstBinding{
     .{ .name = "sendOwed", .value = RecordVersions.send_owed },
     .{ .name = "blobOwed", .value = RecordVersions.blob_owed },
     .{ .name = "dispatchOwed", .value = RecordVersions.dispatch_owed },
+    .{ .name = "dispatchResult", .value = RecordVersions.dispatch_result },
     .{ .name = "segIdx", .value = RecordVersions.seg_idx },
     .{ .name = "exportRec", .value = RecordVersions.export_rec },
 };
