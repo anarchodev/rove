@@ -498,6 +498,20 @@ pub fn build(b: *std.Build) void {
     const access_bench_step = b.step("access-bench", "Run the access-pattern microbenchmark (ReleaseFast)");
     access_bench_step.dependOn(&b.addRunArtifact(access_bench).step);
 
+    // flush-bench: FatRegistry deferred-queue machinery — empty/small-batch
+    // flush calls (the per-poll-iteration hot path) and teardown-shaped
+    // sweeps (coalesced vs interleaved vs shuffled). Same ReleaseFast
+    // isolation as fat-bench; the gate compiles it, only the step runs it.
+    const flush_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/rove/flush_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const flush_bench = b.addExecutable(.{ .name = "flush-bench", .root_module = flush_bench_mod });
+    test_step.dependOn(&flush_bench.step);
+    const flush_bench_step = b.step("flush-bench", "Run the deferred-queue flush microbenchmark (ReleaseFast)");
+    flush_bench_step.dependOn(&b.addRunArtifact(flush_bench).step);
+
     // rove-io tests
     const io_tests = b.addTest(.{ .root_module = io_mod });
     test_step.dependOn(&b.addRunArtifact(io_tests).step);

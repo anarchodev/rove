@@ -69,7 +69,6 @@ pub fn main() !void {
 
     var reg = try MyIo.Reg.init(alloc, .{
         .max_entities = 4096,
-        .deferred_queue_capacity = 1024,
     });
     defer reg.deinit();
 

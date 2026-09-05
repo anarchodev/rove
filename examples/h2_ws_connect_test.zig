@@ -98,7 +98,7 @@ pub fn main() !void {
     const alloc = gpa.allocator();
 
     // ── Server (worker-shaped: headers_first + extended_connect) ──────
-    var sreg = try ServerH2.Reg.init(alloc, .{ .max_entities = 4096, .deferred_queue_capacity = 1024 });
+    var sreg = try ServerH2.Reg.init(alloc, .{ .max_entities = 4096 });
     const server = try ServerH2.create(&sreg, alloc, std.net.Address.initIp4(.{ 127, 0, 0, 1 }, PORT), .{
         .max_connections = 64,
         .buf_count = 64,
@@ -111,7 +111,7 @@ pub fn main() !void {
     defer server.destroy();
 
     // ── Client (front-shaped: client_headers_first) ───────────────────
-    var creg = try ClientH2.Reg.init(alloc, .{ .max_entities = 4096, .deferred_queue_capacity = 1024 });
+    var creg = try ClientH2.Reg.init(alloc, .{ .max_entities = 4096 });
     const client = try ClientH2.create(&creg, alloc, std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0), .{
         .max_connections = 64,
         .buf_count = 64,

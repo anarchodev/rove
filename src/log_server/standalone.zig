@@ -186,7 +186,6 @@ fn runThread(h: *Handle) !void {
 
     var reg = LogH2.Reg.init(allocator, .{
         .max_entities = 1024,
-        .deferred_queue_capacity = 256,
     }) catch |err| {
         h.bind_err = err;
         h.ready.set();

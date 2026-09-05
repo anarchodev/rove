@@ -14,7 +14,6 @@ pub fn main() !void {
 
     var reg = try MyH2.Reg.init(alloc, .{
         .max_entities = 4096,
-        .deferred_queue_capacity = 1024,
     });
 
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);

@@ -362,7 +362,6 @@ fn workerMain(args: *WorkerCtx) !void {
     // type — prod's N shared-nothing workers are N values of it.
     var reg = try Worker.H2.Reg.init(allocator, .{
         .max_entities = 65536,
-        .deferred_queue_capacity = 4096,
     });
     defer reg.deinit();
 

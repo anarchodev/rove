@@ -2117,7 +2117,6 @@ pub fn main() !void {
 
     var reg = try CpH2.Reg.init(allocator, .{
         .max_entities = 8192,
-        .deferred_queue_capacity = 2048,
     });
     defer reg.deinit();
 
