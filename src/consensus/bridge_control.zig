@@ -25,6 +25,11 @@ pub const ControlCmd = struct {
     /// `create_group_epoch`: birth the group with THIS node as a learner
     /// (joining an existing group) rather than a voter — see node.createGroupCore.
     as_learner: bool = false,
+    /// `create_group_epoch`: pin the group always-active right after
+    /// creation (`Bridge.pin_id_str` matched) — set by the wrapper so the
+    /// pin executes on the pump thread with the create, and no creation
+    /// path can forget it.
+    pin: bool = false,
     /// `propose_conf_change`: the raft node id to change + the op (0 add_voter /
     /// 1 remove / 2 add_learner — matches `raft.Manager.ConfChange`).
     node_id: u64 = 0,
@@ -94,7 +99,8 @@ pub const ControlCmd = struct {
 /// `birth_voters` (or the static env set).
 pub fn createGroupEpoch(self: anytype, gid: u64, epoch: u64, as_learner: bool, birth_voters: ?[]const u64, birth_learners: ?[]const u64) Error!void {
     const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
-    var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .as_learner = as_learner, .birth_voters = birth_voters, .birth_learners = birth_learners };
+    const pin = if (self.pin_id_str) |p| std.mem.eql(u8, sig.id_str, p) else false;
+    var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .as_learner = as_learner, .birth_voters = birth_voters, .birth_learners = birth_learners, .pin = pin };
     return runControl(self, &cmd);
 }
 
@@ -299,6 +305,11 @@ pub fn drainControl(self: anytype) bool {
                 // on the streamed catch-up's END_STREAM — the retired atomic
                 // create+install (createGroupAtBaseline) has no callers.
                 _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch, cmd.as_learner, cmd.birth_voters, cmd.birth_learners) catch |e| break :blk e;
+                // Pin with the create, on this (pump) thread: an unpinned
+                // pin-tenant group is the hibernated-leaderless availability
+                // hole pin_id_str exists to close — fail the cmd rather
+                // than succeed unpinned.
+                if (cmd.pin) self.node.pinActive(cmd.gid) catch |e| break :blk e;
                 break :blk null;
             },
             .destroy_group => blk: {

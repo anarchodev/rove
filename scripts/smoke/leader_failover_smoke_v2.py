@@ -64,10 +64,13 @@ export function handler() {
 }
 """
 
-# Every raft group in this cluster: the test tenant + the standing deploy
-# app. A leader kill orphans every group the victim led, so the acquisition
-# accounting below has to know the full set (rove#374).
-GROUPS = ("acme", "__admin__")
+# Every raft group in this cluster: the test tenant, the standing deploy
+# app, and the cluster root (rove#715: every cluster carries a `__root__`
+# group, born at worker boot). A leader kill orphans every group the
+# victim led, so the acquisition accounting below has to know the full
+# set (rove#374) — a group missing here reads as a spurious extra
+# election whenever the victim happened to lead it (~1/3 of kills).
+GROUPS = ("acme", "__admin__", "__root__")
 KEY = "failover/value"
 VALUE1 = "committed-before-kill"
 VALUE2 = "committed-after-failover"
@@ -191,6 +194,16 @@ def main() -> int:
         settled = {t: c.leader_now(t, nodes=survivors) for t in orphaned}
         check("every orphaned group re-elected a leader",
               all(v is not None for v in settled.values()), f"leaders={settled}")
+        # A leaderless group's per-node door statuses distinguish the
+        # failure: 503 = member that will not elect, 404 = group missing
+        # on that survivor entirely.
+        from smoke_lib_v2 import MOVE_SECRET as _MS, _curl as _c2
+        for t, v in settled.items():
+            if v is None:
+                sts = [(i, _c2(f"{c.node_url(i)}/_system/v2-leader?tenant={t}",
+                               headers={"X-Rewind-Move-Secret": _MS}).status)
+                       for i in survivors]
+                print(f"       LEADERLESS {t!r}: survivor door statuses = {sts}")
         bumped = []
         for i in survivors:
             now = metric_counter(c.metrics(i), "raft_leadership_acquisitions_total") or 0.0
