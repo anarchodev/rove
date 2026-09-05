@@ -196,8 +196,10 @@ fn appendJsonLine(
 /// Byte-level JSON string escape. Values are arbitrary customer bytes, so
 /// this escapes the two structural characters, the C0 range, and DEL —
 /// anything else rides verbatim (the reader is a JSON parser, and rove's
-/// strings are already UTF-8 by the codec).
-fn appendJsonString(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+/// strings are already UTF-8 by the codec). Shared with the platform
+/// dispatch result hop (`worker_fire`), which carries a target's terminal
+/// body — arbitrary customer bytes on exactly the same argument.
+pub fn appendJsonString(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
     try out.append(a, '"');
     for (s) |ch| switch (ch) {
         '"' => try out.appendSlice(a, "\\\""),

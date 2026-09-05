@@ -1504,6 +1504,18 @@ pub const FirePrep = struct {
     /// isn't registered with the bridge or the group has no published
     /// term yet; the record then rides unstamped.
     exec_seq: u64 = 0,
+    /// The committed terminal outcome, captured only under
+    /// `FinishSpec.capture_terminal` (the platform-dispatch return hop —
+    /// the engine carries the target's terminal body back to the origin,
+    /// so the fire site needs it after `runFire` returns). Bounded at
+    /// `TERMINAL_CAPTURE_MAX`: a result that rides a raft entry in the
+    /// origin's group must stay far below the frame budget, and a reader
+    /// that wants more re-requests with a narrower ask. `terminal_overflow`
+    /// says the cap truncated (the fire site reports it instead of handing
+    /// over a silently clipped payload). Freed by `deinit`.
+    terminal_status: u16 = 0,
+    terminal_body: []u8 = &.{},
+    terminal_overflow: bool = false,
     /// Did this activation reach a committed terminal outcome?
     ///
     /// Set only where `runFire` records an `.ok` log — the write path after
@@ -1522,6 +1534,7 @@ pub const FirePrep = struct {
     plan_gen: u64,
 
     pub fn deinit(p: *FirePrep, allocator: std.mem.Allocator) void {
+        if (p.terminal_body.len > 0) allocator.free(p.terminal_body);
         if (!p.txn_done) p.txn.rollback() catch {};
         if (p.txn_owned) allocator.destroy(p.txn);
         p.ws.deinit();
@@ -1639,7 +1652,16 @@ const FinishSpec = struct {
     /// or `.none` for kinds whose Msg needs no dedicated
     /// capture here.
     tape: FireTape = .none,
+    /// Capture the committed terminal status/body into
+    /// `FirePrep.terminal_*` (platform dispatch — the engine-sent result
+    /// hop carries the target's outcome back to the origin).
+    capture_terminal: bool = false,
 };
+
+/// Cap on a captured terminal body (`FinishSpec.capture_terminal`). The
+/// result rides a raft entry in the origin's group, so it must stay far
+/// under the wire frame budget; larger reads paginate at the caller.
+pub const TERMINAL_CAPTURE_MAX: usize = 32 * 1024;
 
 /// The Msg-tape a connectionless fire records (the fire-family sibling
 /// of worker_drain's `ContTape`).
@@ -1737,6 +1759,21 @@ fn commitReadOnlyFire(p: *FirePrep, comptime site: []const u8) void {
 /// tenant); `activation_bytes` feeds tape capture when `spec.tape ==
 /// .activation` (fetch chunk payloads) — pass "" otherwise (a
 /// `.callback` tape reads `req.body` + `req.fn_override` instead).
+/// Capture a committed terminal outcome into `FirePrep.terminal_*`
+/// (see `FinishSpec.capture_terminal`). On allocation failure the body
+/// stays empty and `terminal_overflow` is set — the reader sees an
+/// incomplete payload flagged as incomplete, never a silently clipped
+/// one.
+fn captureTerminal(allocator: std.mem.Allocator, p: *FirePrep, st: u16, body: []const u8) void {
+    p.terminal_status = st;
+    const n = @min(body.len, TERMINAL_CAPTURE_MAX);
+    p.terminal_overflow = body.len > n;
+    p.terminal_body = allocator.dupe(u8, body[0..n]) catch blk: {
+        p.terminal_overflow = true;
+        break :blk &.{};
+    };
+}
+
 pub fn runFire(
     worker: anytype,
     p: *FirePrep,
@@ -1852,6 +1889,7 @@ pub fn runFire(
                 p.txn_done = true;
                 captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, tapes, corr, r.tags, spec.act, fw_seq, p.exec_seq);
                 p.completed_ok = true;
+                if (comptime spec.capture_terminal) captureTerminal(allocator, p, st, r.body);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1860,6 +1898,7 @@ pub fn runFire(
             flushFireFetches(worker, &pending_fetches);
             captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, r.tags, spec.act, 0, p.exec_seq);
             p.completed_ok = true;
+            if (comptime spec.capture_terminal) captureTerminal(allocator, p, st, r.body);
             r.console = &.{};
             r.exception = &.{};
         },

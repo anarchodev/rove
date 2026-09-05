@@ -382,6 +382,7 @@
     sendOwed: 1,
     blobOwed: 1,
     dispatchOwed: 1,
+    dispatchResult: 1,
     segIdx: 1,
     exportRec: 1,
   };
