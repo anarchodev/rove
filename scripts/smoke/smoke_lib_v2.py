@@ -1400,8 +1400,15 @@ class V2Cluster:
         only way to guarantee that is one door for both (rove#870).
 
         `retry_s > 0` retries the RETRYABLE refusals for that long, rotating
-        nodes: `421` (not leader here) and `503` (single-writer contention, or a
-        propose still settling). Use it when the write is a PRECONDITION and the
+        nodes: `421` (not leader here), `503` (single-writer contention, or a
+        propose still settling), and `502` — the front's AMBIGUOUS
+        transport-error answer, which the proxy by contract never silently
+        re-sends ("the client's retry policy owns the ambiguous case",
+        `src/front/proxy.zig`): after worker restarts the front's pooled
+        upstream legs are stale, the first request through each can 502,
+        and a caller treating 502 as final reads a recovering cluster as a
+        dead one. Re-sending the same key+value makes owning the ambiguity
+        safe here. Use it when the write is a PRECONDITION and the
         caller would otherwise discard the status — a dropped seed surfaces far
         away as a wrong ANSWER rather than an error. That was rove#438: seeding
         `__admin__`'s operator allowlist right after a deploy contends with the
@@ -1427,7 +1434,7 @@ class V2Cluster:
                 headers={"Authorization": f"Bearer {self.root_token}",
                          "Content-Type": "application/json"},
                 data=json.dumps({"key": key, "value": value}))
-            if r.status not in (421, 503, 0) or _t.time() >= deadline:
+            if r.status not in (421, 502, 503, 0) or _t.time() >= deadline:
                 return r
             attempt += 1
             _t.sleep(0.3)
@@ -1490,7 +1497,7 @@ class V2Cluster:
                     "tenant": tenant,
                     "key": key if raw else USER_KEY_ROOT + key,
                     "value": value}))
-            if r.status not in (421, 503, 0) or _t.time() >= deadline:
+            if r.status not in (421, 502, 503, 0) or _t.time() >= deadline:
                 return r
             attempt += 1
             _t.sleep(0.3)

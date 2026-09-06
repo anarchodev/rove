@@ -270,18 +270,24 @@ fn handleKv(
 
 // ── shared write path (v2-kv PUT + v2-apply) ─────────────────────────
 
-/// Commit a single key/value through the leader-gated propose path: an
-/// immediate kvexp `TrackedTxn` commit on `inst.kv` followed by a raft
-/// propose awaited to quorum. Returns 0 on success, else the HTTP status to
-/// reply with. Shared by `v2-kv` (a new source write) and `v2-apply` (a
-/// write forwarded from a move source) — both land a write through the same
-/// durable path; only `v2-kv` then forwards (`v2-apply` is the receiving
-/// end, so it must NOT re-forward — no loops).
+/// Commit a single key/value through the leader-gated propose path: a
+/// kvexp `TrackedTxn` held OPEN across a raft propose awaited to quorum,
+/// committed only once the entry commits — the fold-gate ordering
+/// (`docs/architecture/consensus-robustness.md`): a local store commit
+/// that precedes quorum has no undo, so a leader that loses its majority
+/// mid-await would keep the value in its store while the entry orphans in
+/// its log; truncation later removes the ENTRY but not the ROW, leaving a
+/// silently diverged replica serving data no majority accepted (the RC-1
+/// class `truncation_after_fold_smoke_v2` reproduces). Returns 0 on
+/// success, else the HTTP status to reply with. Shared by `v2-kv` (a new
+/// source write) and `v2-apply` (a write forwarded from a move source) —
+/// both land a write through the same durable path; only `v2-kv` then
+/// forwards (`v2-apply` is the receiving end, so it must NOT re-forward —
+/// no loops).
 fn commitWrite(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8, key: []const u8, value: []const u8) u16 {
     // Leader gate: only the group leader may take the
-    // write. A follower would commit to its own `inst.kv` speculatively then
-    // fault the propose with no undo (this immediate-commit path, unlike the
-    // parked customer path) — diverging it. Reject fast with 421 (the
+    // write — a follower's propose faults, and its txn would sit open for
+    // the full commit-wait for nothing. Reject fast with 421 (the
     // not-leader / nothing-executed status the front door + serve-or-forward
     // retry on) so the caller re-aims at the leader. Registering first is
     // idempotent + makes
@@ -318,16 +324,51 @@ fn commitWrite(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8
         txn.rollback() catch {};
         return 500;
     };
-    txn.commit() catch |err| return if (err == error.Conflict) 503 else 500;
 
-    const proposed = raft_propose.proposeWriteSet(worker, &ws, tenant, "") catch return 503;
-    // The txn committed BEFORE the propose (immediate-commit path): its
-    // writes are already fold-visible, so release the durabilize floor
-    // the bridge would otherwise hold for this skipped own-propose. Safe
-    // to ack pre-commit — the bridge keeps an acked high-water and never
-    // tracks an already-acked seq.
+    // Propose with the txn OPEN; commit only on quorum (see the fn doc —
+    // the fold-gate ordering). The open txn holds the tenant's
+    // single-writer lease across the await, exactly as the customer
+    // path's parked txn does; a concurrent writer sees retryable
+    // Conflict/503 for the bounded commit-wait, never a diverged store.
+    const proposed = raft_propose.proposeWriteSet(worker, &ws, tenant, "") catch {
+        txn.rollback() catch {};
+        return 503;
+    };
+    if (!awaitCommit(worker, proposed.group_id, proposed.seq)) {
+        // Ambiguous: the entry may commit a beat after our deadline. Ask
+        // the pump to classify — commit beats fault (`requestFault`) —
+        // and act only on its verdict; a unilateral rollback here would
+        // drop a write the cluster then commits, diverging this store in
+        // the other direction (missing an agreed entry).
+        worker.raft.requestFault(proposed.group_id, proposed.seq);
+        if (!awaitCommit(worker, proposed.group_id, proposed.seq)) {
+            txn.rollback() catch {};
+            return 504;
+        }
+    }
+    // Quorum reached: land the writes locally, then ack so the
+    // durabilize floor advances (the pump skipped its own propose and
+    // waits for this worker-side commit). `Conflict` (not chain head)
+    // clears when the predecessor's worker commits — retry briefly. Any
+    // terminal failure here means an entry the cluster committed cannot
+    // land in this store: that IS the divergence condition, and
+    // continuing would serve it — panic, don't translate to a 5xx.
+    var spins: u32 = 0;
+    while (true) {
+        txn.commit() catch |err| {
+            if (err == error.Conflict and spins < 2000) {
+                spins += 1;
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+                continue;
+            }
+            std.debug.panic(
+                "v2-kv: committed entry gid={d} seq={d} cannot land in the local store: {s}",
+                .{ proposed.group_id, proposed.seq, @errorName(err) },
+            );
+        };
+        break;
+    }
     worker.raft.noteWorkerCommitted(proposed.group_id, proposed.seq);
-    if (!awaitCommit(worker, proposed.group_id, proposed.seq)) return 504;
     return 0;
 }
 
