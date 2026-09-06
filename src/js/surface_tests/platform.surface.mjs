@@ -44,9 +44,9 @@ export default function ({ platform }) {
     throws(() => platform.dispatch("acme", "__system/release", { actor: "root" }), /actor must be one of/);
   });
 
-  check("platform.releases.publish", () => {
-    throws(() => platform.releases.publish("acme", "0123456789abcdef"), NOT_ADMIN);
-  });
+  // No `platform.releases` check: the namespace is gone — the release flip
+  // is a dispatched activation (`__system/release_flip`), covered by the
+  // `platform.dispatch` checks above.
 
   // No `platform.auth` check: the verb is gone. The operator-root verdict is
   // `request.rewind.isRoot`, installed only on a platform-bound handler, so a

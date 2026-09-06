@@ -135,7 +135,10 @@ terminal outcome — and only then — the engine enqueues
 owed marker in the SAME writeset — so the marker's kv wake cannot fire without
 the result being readable. The origin's wake consumes (deletes) the result
 row; the bytes are another tenant's output and carry a request body's trust
-posture. Every other exit — propose fault, throw, an unfinished continuation —
+posture. A fire-and-forget caller passes `result: false` and gets no row —
+the marker still resolves (the durability contract), but a caller that will
+never harvest must say so or every call leaks one row (the dashboard's
+release publish is the standing example). Every other exit — propose fault, throw, an unfinished continuation —
 leaves the marker standing and the watchdog re-fires, the safe direction:
 reporting completion tells another tenant it may stop retrying.
 

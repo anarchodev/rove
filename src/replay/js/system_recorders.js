@@ -580,6 +580,10 @@
       // surfacing at its site, not a watchdog loop.
       dispatchResolve: function(id, marker){
         var tenant = marker.tenant, module = marker.module;
+        // The op record — what the effect log names (which module, against
+        // which tenant, on whose behalf); the target's own writes follow as
+        // store-tagged entries.
+        push({ kind: "platform", op: "dispatch", tenant: tenant, module: module, actor: marker.actor });
         var msg = marker.ctx === undefined || marker.ctx === null ? {} : marker.ctx;
         var status = 200, body = "";
         if (module === "__system/scope_kv") {
@@ -602,6 +606,22 @@
             for (var di = 0; di < deletes.length; di++) st.delete(deletes[di]);
             body = JSON.stringify({ values: values, pages: pages });
           }
+        } else if (module === "__system/release_flip") {
+          // The release flip (dep_hex via ctx — the dashboard's publish).
+          // Same rows the baked source writes: the live pointer plus the
+          // lex-ordered history row; a same-id re-flip writes nothing.
+          var fst = storeKv(NS_STORE + "i/" + tenant + "/", "i/" + tenant);
+          var fh = typeof msg.dep_hex === "string" ? msg.dep_hex : "";
+          if (!/^[0-9a-fA-F]{1,16}$/.test(fh)) { status = 400; body = "dep_hex must be a hex u64 > 0"; }
+          else {
+            var fhex = fh.toLowerCase();
+            while (fhex.length < 16) fhex = "0" + fhex;
+            if (fst.get("_deploy/current") !== fhex) {
+              fst.set("_deploy/current", fhex);
+              fst.set("_release/" + String(Date.now()).padStart(20, "0"), fhex);
+            }
+            status = 204;
+          }
         } else if (module === "__system/root_kv_install") {
           // Only in root scope: at a TENANT target this module writes the
           // target's store RAW (below the user root), a spelling the sim's
@@ -618,9 +638,11 @@
         // The result row + marker resolve, exactly the writeset
         // `__system/dispatch_result` commits live — recorded
         // (store-untagged = the origin's own store) so it folds forward.
-        var row = JSON.stringify({ v: 1, status: status, overflow: false, body: body });
-        push({ kind: "write", key: "_dispatch/result/" + id, value: row });
-        globalThis.kv.set("_dispatch/result/" + id, row);
+        if (marker.no_result !== true) {
+          var row = JSON.stringify({ v: 1, status: status, overflow: false, body: body });
+          push({ kind: "write", key: "_dispatch/result/" + id, value: row });
+          globalThis.kv.set("_dispatch/result/" + id, row);
+        }
         push({ kind: "delete", key: "_dispatch/owed/" + id });
         globalThis.kv.delete("_dispatch/owed/" + id);
         // Cancel the watchdog pair the shim armed (same derivation as the
@@ -639,7 +661,6 @@
         }
       },
       instances: { deployStarter: gate(function(name){ push({ kind: "platform", op: "instances.deployStarter", name: name }); }) },
-      releases: { publish: gate(function(tenant, depId){ push({ kind: "platform", op: "releases.publish", tenant: tenant, depId: depId }); }) },
       // No `auth` verb: the operator-root verdict is `request.rewind.isRoot`,
       // supplied by the world (scenario({ isRoot })) and folded from the
       // root_verdict tape entry — never a call taking the bearer. A token the

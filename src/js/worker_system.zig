@@ -1070,7 +1070,7 @@ fn handleReset(
 test "release-history key is pure digits (no sign) — regression for the i64 `+` bug" {
     // Mirrors the key construction in `__system/release_flip.mjs` (JS pads
     // with String.padStart, which cannot emit a sign) and the
-    // `platform.releases.publish` trampoline in worker.zig — the Zig side
+    // retired `releases.publish` trampoline — the Zig side
     // this test pins directly. `ts_ms` MUST be
     // unsigned: `{d:0>20}` on a signed positive integer reserves a sign column
     // and emits a leading `+` ("_release/000000+<ms>"). That `+` is not a

@@ -32,19 +32,32 @@ function answer(status, body) {
 export default function ({ __system }) {
     if (request.method !== "POST") return answer(405, "POST only\n");
 
-    // `dep_id` is a u64 content hash. It must NOT pass through JSON.parse —
-    // a Number mangles anything past 2^53 — so pull the digits from the raw
-    // body and carry them as a BigInt. `tenant_id` is deliberately ignored:
-    // the SCOPE is the tenant, resolved by the route before dispatch, and a
-    // body naming someone else must not override it.
-    const m = (request.text || "").match(/"dep_id"\s*:\s*(\d+)/);
-    if (!m) return answer(400, 'expected {"tenant_id":"...","dep_id":N}\n');
-    let dep = 0n;
-    try { dep = BigInt(m[1]); } catch (_e) { /* falls through to the check */ }
-    if (dep <= 0n || dep > 0xffffffffffffffffn) {
-        return answer(400, "dep_id must be a u64 > 0\n");
+    // Two callers, two payload shapes, one id discipline (a u64 must not
+    // pass through JSON.parse — a Number mangles anything past 2^53):
+    //   - `platform.dispatch` (the dashboard's publish): `request.ctx`
+    //     carries `dep_hex`, the hex string `deploy`/cut returned.
+    //   - the `/_system/release` door: the raw body carries decimal
+    //     `dep_id`, pulled by regex and widened as a BigInt.
+    // `tenant_id` is deliberately ignored in both: the SCOPE is the
+    // tenant, resolved before dispatch, and a payload naming someone else
+    // must not override it.
+    let hex = null;
+    const cmsg = request.ctx || {};
+    if (typeof cmsg.dep_hex === "string") {
+        if (!/^[0-9a-fA-F]{1,16}$/.test(cmsg.dep_hex) || BigInt("0x" + cmsg.dep_hex) === 0n) {
+            return answer(400, "dep_hex must be a hex u64 > 0\n");
+        }
+        hex = cmsg.dep_hex.toLowerCase().padStart(16, "0");
+    } else {
+        const m = (request.text || "").match(/"dep_id"\s*:\s*(\d+)/);
+        if (!m) return answer(400, 'expected {"tenant_id":"...","dep_id":N}\n');
+        let dep = 0n;
+        try { dep = BigInt(m[1]); } catch (_e) { /* falls through to the check */ }
+        if (dep <= 0n || dep > 0xffffffffffffffffn) {
+            return answer(400, "dep_id must be a u64 > 0\n");
+        }
+        hex = dep.toString(16).padStart(16, "0");
     }
-    const hex = dep.toString(16).padStart(16, "0");
 
     // Same-id re-release: the route's fast path answers before dispatch;
     // this re-check closes the race between that check and this activation

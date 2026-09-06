@@ -57,7 +57,10 @@ export default function () {
     // Resolve-once also covers the result row below: only the FIRST result
     // writes it, so a late duplicate cannot clobber a value the origin's
     // wake may already have consumed and deleted.
-    if (kv.get("_dispatch/owed/" + id) === null) return { status: 200 };
+    const rawMarker = kv.get("_dispatch/owed/" + id);
+    if (rawMarker === null) return { status: 200 };
+    let noResult = false;
+    try { noResult = JSON.parse(rawMarker).no_result === true; } catch (_e) { /* keep the row */ }
 
     // The target's committed terminal outcome, engine-carried. Written in
     // the SAME writeset as the marker delete so the origin's kv wake on the
@@ -66,7 +69,7 @@ export default function () {
     // (untrusted data), and `overflow` says the engine's carry cap
     // truncated them. The origin's wake consumes and deletes the row; a
     // chain that dies parked leaks one bounded row; nothing re-fires it.
-    if (typeof msg.status === "number") {
+    if (typeof msg.status === "number" && !noResult) {
         kv.set("_dispatch/result/" + id, JSON.stringify({
             v: DISPATCH_RESULT_V,
             status: msg.status,

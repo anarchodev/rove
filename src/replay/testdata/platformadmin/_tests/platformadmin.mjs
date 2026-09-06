@@ -3,7 +3,7 @@
 // all succeed. `platform.compile` is ungated in both (door-side check in prod).
 import { scenario, expect } from "rewind:test";
 
-const GATED = ["scope", "root", "releases", "dispatch"];
+const GATED = ["scope", "root", "dispatch"];
 const NOT_ADMIN = /only available on the admin handler/;
 
 // Non-admin (default): the gated methods throw, compile still emits.
@@ -30,6 +30,6 @@ expect(ok.effects.some((e) => e.kind === "platform" && e.op === "scope")).toBe(t
 // model resolves a dispatch eagerly (marker never observably stands), same
 // semantics as the live round-trip, one activation sooner.
 expect(ok.instanceKv("acme", "pd/x")).toBe("1");
-// The recorders carry their real arguments — the effect log distinguishes which
-// deployment was published on which tenant, and which instance was created.
-expect(ok.effects.some((e) => e.op === "releases.publish" && e.tenant === "acme" && e.depId === "0123456789abcdef")).toBe(true);
+// The recorders carry their real arguments — the effect log names which
+// module was dispatched against which tenant.
+expect(ok.effects.some((e) => e.op === "dispatch" && e.tenant === "acme" && e.module === "__system/scope_kv")).toBe(true);
