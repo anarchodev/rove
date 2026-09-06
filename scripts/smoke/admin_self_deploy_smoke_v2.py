@@ -209,6 +209,32 @@ def main() -> int:
         check("dispatch result rows are consumed (no residue)",
               ok_res, f"got {r.status} {r.body[:200]!r}")
 
+        # 9. The export routes ride dispatched scoped kv end to end: start
+        #    parks through TWO dispatches (running-check, then the lib-built
+        #    marker + wake rows committed in the TARGET's log), and the
+        #    engine's sched arm starts the job in the target's own group.
+        r = _curl(f"{node}/v1/instances/viadash/export", method="POST", headers=auth)
+        exp_id = None
+        try:
+            exp_id = _json.loads(r.body).get("id")
+        except Exception:
+            pass
+        check("export start → 202 through the dispatched chain",
+              r.status == 202 and bool(exp_id), f"got {r.status} {r.body[:160]!r}")
+        r = _curl(f"{node}/v1/instances/viadash/export/{exp_id}", headers=auth)
+        st = None
+        try:
+            st = _json.loads(r.body).get("state")
+        except Exception:
+            pass
+        check("export poll sees the marker in the target",
+              r.status == 200 and st in ("running", "done"),
+              f"got {r.status} state={st!r}")
+        r = _curl(f"{node}/v1/instances/viadash/export", headers=auth)
+        check("export list carries it",
+              r.status == 200 and exp_id is not None and exp_id in r.body,
+              f"got {r.status} {r.body[:160]!r}")
+
     print()
     if failures:
         print(f"FAILURES ({len(failures)}): " + ", ".join(failures))

@@ -53,73 +53,79 @@ function _key(id) {
   return "_export/" + id;
 }
 
-// Durable-scheduler arm against an arbitrary kv handle — the exact `_sched/`
-// rows globals/schedule.js writes (and `__system/export_run`'s inlined
-// re-arm), spelled here so a scoped handle can carry them cross-tenant. The
-// sched id derives from the idempotency key (`sha256b64url(key)`), which is
-// what lets the job's own watchdog re-arm MOVE this entry rather than
-// accumulate one per attempt.
+// The durable-scheduler wake rows — the exact `_sched/` shapes
+// globals/schedule.js writes (and `__system/export_run`'s inlined re-arm).
+// The sched id derives from the idempotency key (`sha256b64url(key)`),
+// which is what lets the job's own watchdog re-arm MOVE this entry rather
+// than accumulate one per attempt.
 const SCHED_TICK_NS = 1_000_000_000n;
 function _schedByTimeKey(whenNs, id) {
   return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
 }
-function _schedArm(kvh, whenNs, target, msg, key) {
-  const rounded = whenNs <= 0n ? 0n
-    : ((whenNs + SCHED_TICK_NS - 1n) / SCHED_TICK_NS) * SCHED_TICK_NS;
-  const id = crypto.sha256b64url(key);
-  const byIdKey = "_sched/by_id/" + id;
-  const prev = kvh.get(byIdKey);
-  if (prev !== null) {
-    try {
-      const old = JSON.parse(prev);
-      if (old.v !== SCHED_REC_V) throw new Error("version");
-      const oldWhen = BigInt(old.when_ns);
-      if (oldWhen !== rounded) kvh.delete(_schedByTimeKey(oldWhen, id));
-    } catch (_e) { /* corrupt prior record — overwrite below */ }
-  }
-  const rec = { v: SCHED_REC_V, when_ns: String(rounded), target: target, msg: msg, key: key };
-  // Provenance: the arming saga rides to the fired record as `armed_by`
-  // (handler-shape.md §3.2 — what the seam scan reads to link a fired job
-  // back to whoever started it). Every `_sched/` writer stamps it; a
-  // cross-tenant start stamps the ADMIN saga that armed it, which is
-  // exactly the link an operator wants when a customer's export misfires.
-  if (typeof request !== "undefined" && typeof request.sagaId === "string" && request.sagaId)
-    rec.armed_by = request.sagaId;
-  kvh.set(byIdKey, JSON.stringify(rec));
-  kvh.set(_schedByTimeKey(rounded, id), "");
-  return id;
-}
-
 // `_export/{id}` record version, and the `_sched/by_id/` record version
 // this module arms its wakes with (`format-versioning.md` §1f).
 const EXPORT_REC_V = 1;
 const SCHED_REC_V = 1;
 
-function _start(kvh, opts) {
+/**
+ * The rows a fresh start writes, as data — one construction for both
+ * writers: `start` commits them through a kv handle here; the admin
+ * dashboard ships the same rows through a dispatched activation in the
+ * target's own scope (its store, its raft group), where a handle-shaped
+ * write would leave the target ordered by someone else's log.
+ *
+ * Pure: no reads (a fresh export id cannot collide with a prior sched
+ * entry, so the re-arm's cleanup read has nothing to clean), no writes,
+ * no scheduling — the caller owns delivery.
+ *
+ * @param {object} [opts] - As {@link start}.
+ * @returns {{id: string, rows: Array<{key: string, value: string}>}}
+ */
+export function startRows(opts) {
   const id = crypto.randomUUID();
-  // The marker IS the job: `export_run` reads it on every activation and
-  // no-ops when it is absent, so writing it is what makes the export exist.
-  // Written BEFORE the wake is armed — a wake that fired first would find
-  // nothing and drop the chain.
-  kvh.set(_key(id), JSON.stringify({
-    // `_export/{id}` RECORD version (`format-versioning.md` §1f) — the
-    // layout of this bookkeeping object. Distinct from `format` below,
-    // which versions the export ARTIFACT the job produces: one is how
-    // to read this record, the other is what the customer downloads,
-    // and they move independently.
-    v: EXPORT_REC_V,
-    format: 2,
-    state: "running",
-    cursor: "",
-    parts: [],
-    // The code slice is on by default: a leaving customer wants bytes, and
-    // a kv-only artifact is the OPT-OUT ({bundle: false}), not the default.
-    bundle_requested: !(opts && opts.bundle === false),
-    started_at: Date.now(),
-  }));
-  _schedArm(kvh, BigInt(Date.now()) * 1_000_000n, "__system/export_run",
-    { id: id }, _key(id));
-  return id;
+  const nowMs = Date.now();
+  const whenNs = BigInt(nowMs) * 1_000_000n;
+  const rounded = whenNs <= 0n ? 0n
+    : ((whenNs + SCHED_TICK_NS - 1n) / SCHED_TICK_NS) * SCHED_TICK_NS;
+  const sid = crypto.sha256b64url(_key(id));
+  const sched = { v: SCHED_REC_V, when_ns: String(rounded),
+                  target: "__system/export_run", msg: { id: id }, key: _key(id) };
+  // Provenance: the arming saga rides to the fired record as `armed_by`
+  // (handler-shape.md §3.2) — the link an operator wants when a customer's
+  // export misfires.
+  if (typeof request !== "undefined" && typeof request.sagaId === "string" && request.sagaId)
+    sched.armed_by = request.sagaId;
+  return { id: id, rows: [
+    // The marker IS the job: `export_run` reads it on every activation and
+    // no-ops when it is absent, so writing it is what makes the export
+    // exist. Ordered BEFORE the wake rows — a wake that fired first would
+    // find nothing and drop the chain.
+    { key: _key(id), value: JSON.stringify({
+      // `_export/{id}` RECORD version (`format-versioning.md` §1f) — the
+      // layout of this bookkeeping object. Distinct from `format` below,
+      // which versions the export ARTIFACT the job produces: one is how
+      // to read this record, the other is what the customer downloads,
+      // and they move independently.
+      v: EXPORT_REC_V,
+      format: 2,
+      state: "running",
+      cursor: "",
+      parts: [],
+      // The code slice is on by default: a leaving customer wants bytes,
+      // and a kv-only artifact is the OPT-OUT ({bundle: false}), not the
+      // default.
+      bundle_requested: !(opts && opts.bundle === false),
+      started_at: nowMs,
+    }) },
+    { key: "_sched/by_id/" + sid, value: JSON.stringify(sched) },
+    { key: _schedByTimeKey(rounded, sid), value: "" },
+  ] };
+}
+
+function _start(kvh, opts) {
+  const made = startRows(opts);
+  for (const r of made.rows) kvh.set(r.key, r.value);
+  return made.id;
 }
 
 function _get(kvh, id) {
@@ -219,4 +225,4 @@ export function forScope(scope) {
   };
 }
 
-export default { start, get, links, forScope };
+export default { start, startRows, get, links, forScope };
