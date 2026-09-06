@@ -2414,7 +2414,7 @@ pub fn Worker(comptime opts: Options) type {
                 std.log.warn("reset: commit failed: {s}", .{@errorName(err)});
                 return error.StageFailed;
             };
-            _ = raft_propose.proposeWriteSet(self, &release_ws, inst.id, "") catch |err| {
+            _ = raft_propose.proposeWriteSet(self, &release_ws, inst.id, "", .{ .engine = .starter_deploy }) catch |err| {
                 std.log.warn("reset: propose failed: {s}", .{@errorName(err)});
                 return error.ProposeFailed;
             };

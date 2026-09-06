@@ -242,7 +242,7 @@ fn writeReplicated(
     var ws = kv_mod.WriteSet.init(worker.allocator);
     defer ws.deinit();
     ws.addPut(key, value) catch return Error.OutOfMemory;
-    const proposed = raft_propose.proposeWriteSet(worker, &ws, tenant, "") catch
+    const proposed = raft_propose.proposeWriteSet(worker, &ws, tenant, "", .{ .engine = .keyring }) catch
         return Error.NotCommitted;
     worker.raft.awaitCommit(proposed.group_id, proposed.seq, COMMIT_TIMEOUT_NS) catch
         return Error.NotCommitted;

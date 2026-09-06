@@ -330,7 +330,7 @@ fn commitWrite(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8
     // single-writer lease across the await, exactly as the customer
     // path's parked txn does; a concurrent writer sees retryable
     // Conflict/503 for the bounded commit-wait, never a diverged store.
-    const proposed = raft_propose.proposeWriteSet(worker, &ws, tenant, "") catch {
+    const proposed = raft_propose.proposeWriteSet(worker, &ws, tenant, "", .{ .engine = .move_seed }) catch {
         txn.rollback() catch {};
         return 503;
     };
