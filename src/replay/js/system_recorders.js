@@ -557,6 +557,87 @@
       // root WRITES are dispatched activations against the `__root__` group
       // — the shim exposes only the reads, so the recorder mirrors that.
       root: { get: gate(rootStore_r.get), prefix: gate(rootStore_r.prefix) },
+      // The offline half of `platform.dispatch`. The PUBLIC verb is the
+      // real platform.js shim (marker + watchdog + the dispatch_fire arm —
+      // all recorded kv, shared with prod verbatim); what has no thread to
+      // run offline is the engine side: the fire in the target's scope and
+      // the engine-sent result hop. The shim probes for THIS optional
+      // member after arming — the worker's native `_system.platform` has
+      // no such member, so live runs skip it — and offline it resolves the
+      // dispatch NOW, eagerly: run the modeled target against the target
+      // store, write the result row, delete the marker, cancel the
+      // watchdog. Eager resolution means the marker never observably
+      // stands, so a driver written as "harvest if resolved, else park"
+      // completes in one activation offline and parks live. CAPTURED
+      // replays never need this round-trip: the wake that harvested taped
+      // its kv reads, and replay feeds them back.
+      //
+      // The modeled targets are the ones the admin app dispatches; their
+      // semantics mirror the baked sources (`__system/scope_kv`,
+      // `__system/root_kv_install`), including scope_kv's raw-row write
+      // refusal (engine rows have dedicated verbs). An unmodeled module
+      // throws at the call — an authored world naming one is a test bug
+      // surfacing at its site, not a watchdog loop.
+      dispatchResolve: function(id, marker){
+        var tenant = marker.tenant, module = marker.module;
+        var msg = marker.ctx === undefined || marker.ctx === null ? {} : marker.ctx;
+        var status = 200, body = "";
+        if (module === "__system/scope_kv") {
+          var st = tenant === "__root__" ? rootStore_r : storeKv(NS_STORE + "i/" + tenant + "/", "i/" + tenant);
+          var gets = Array.isArray(msg.gets) ? msg.gets : [];
+          var prefixes = Array.isArray(msg.prefixes) ? msg.prefixes : [];
+          var pairs = Array.isArray(msg.pairs) ? msg.pairs : [];
+          var deletes = Array.isArray(msg.deletes) ? msg.deletes : [];
+          var isRaw = function(k){ return k.indexOf("_deploy/") === 0 || k.indexOf("_release/") === 0; };
+          var bad = pairs.some(function(w){ return !w || typeof w.key !== "string" || !w.key.length || typeof w.value !== "string" || isRaw(w.key); }) ||
+                    deletes.some(function(k){ return typeof k !== "string" || !k.length || isRaw(k); }) ||
+                    gets.some(function(k){ return typeof k !== "string" || !k.length; }) ||
+                    prefixes.some(function(pf){ return !pf || typeof pf.prefix !== "string" || (pf.limit !== undefined && (typeof pf.limit !== "number" || pf.limit < 1 || pf.limit > 500)); });
+          if (bad) { status = 400; body = JSON.stringify({ error: "scope_kv refused the ask" }); }
+          else {
+            var values = {};
+            for (var gi = 0; gi < gets.length; gi++) { var gv = st.get(gets[gi]); values[gets[gi]] = gv === undefined ? null : gv; }
+            var pages = prefixes.map(function(pf){ return st.prefix(pf.prefix, pf.after || "", pf.limit || 100); });
+            for (var wi = 0; wi < pairs.length; wi++) st.set(pairs[wi].key, pairs[wi].value);
+            for (var di = 0; di < deletes.length; di++) st.delete(deletes[di]);
+            body = JSON.stringify({ values: values, pages: pages });
+          }
+        } else if (module === "__system/root_kv_install") {
+          // Only in root scope: at a TENANT target this module writes the
+          // target's store RAW (below the user root), a spelling the sim's
+          // flattened per-instance keyspace cannot represent — refuse
+          // rather than model it wrong.
+          if (tenant !== "__root__") throw new TypeError("platform.dispatch: root_kv_install is only modeled against __root__ offline");
+          var rp = Array.isArray(msg.pairs) ? msg.pairs : [];
+          var rd = Array.isArray(msg.deletes) ? msg.deletes : [];
+          for (var ri = 0; ri < rp.length; ri++) rootStore_r.set(rp[ri].key, rp[ri].value);
+          for (var rj = 0; rj < rd.length; rj++) rootStore_r.delete(rd[rj].key);
+        } else {
+          throw new TypeError("platform.dispatch: no offline model for " + module);
+        }
+        // The result row + marker resolve, exactly the writeset
+        // `__system/dispatch_result` commits live — recorded
+        // (store-untagged = the origin's own store) so it folds forward.
+        var row = JSON.stringify({ v: 1, status: status, overflow: false, body: body });
+        push({ kind: "write", key: "_dispatch/result/" + id, value: row });
+        globalThis.kv.set("_dispatch/result/" + id, row);
+        push({ kind: "delete", key: "_dispatch/owed/" + id });
+        globalThis.kv.delete("_dispatch/owed/" + id);
+        // Cancel the watchdog pair the shim armed (same derivation as the
+        // scheduler contract: keyed id = sha256b64url of the key).
+        var sid = crypto.sha256b64url("_dispatch/" + id);
+        var brec = globalThis.kv.get("_sched/by_id/" + sid);
+        if (brec !== null && brec !== undefined) {
+          try {
+            var pr = JSON.parse(brec);
+            var bt = "_sched/by_time/" + String(BigInt(pr.when_ns)).padStart(20, "0") + "/" + sid;
+            push({ kind: "delete", key: bt });
+            globalThis.kv.delete(bt);
+          } catch (_e) { /* corrupt prior — by_id drop below still lands */ }
+          push({ kind: "delete", key: "_sched/by_id/" + sid });
+          globalThis.kv.delete("_sched/by_id/" + sid);
+        }
+      },
       instances: { deployStarter: gate(function(name){ push({ kind: "platform", op: "instances.deployStarter", name: name }); }) },
       releases: { publish: gate(function(tenant, depId){ push({ kind: "platform", op: "releases.publish", tenant: tenant, depId: depId }); }) },
       // No `auth` verb: the operator-root verdict is `request.rewind.isRoot`,

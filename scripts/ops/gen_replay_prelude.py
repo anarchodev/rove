@@ -78,7 +78,6 @@ PIECES = [
     (ROVE / "src" / "js" / "globals" / "http.js", False),
     (ROVE / "src" / "js" / "globals" / "base64.js", False),
     (ROVE / "src" / "js" / "globals" / "urlsearchparams.js", False),
-    (ROVE / "src" / "js" / "globals" / "platform.js", False),
     # The connection/continuation trio — faithful recorders that do not
     # decompose.
     (ROVE / "src" / "js" / "globals" / "after.js", False),
@@ -91,6 +90,10 @@ PIECES = [
     # freeze-safe embedded bare).
     (ROVE / "src" / "js" / "globals" / "time.js", False),
     (ROVE / "src" / "js" / "globals" / "schedule.js", False),
+    # AFTER schedule.js, mirroring the worker (globals.zig): platform.js
+    # captures the private `_system.sched` at eval for platform.dispatch's
+    # watchdog arm — earlier, it captures undefined and dispatch throws.
+    (ROVE / "src" / "js" / "globals" / "platform.js", False),
     (ROVE / "src" / "js" / "globals" / "webhook.js", False),
     # `blob` composes on the base `after.fetch`, so it lands after it.
     (ROVE / "src" / "js" / "globals" / "blob.js", False),

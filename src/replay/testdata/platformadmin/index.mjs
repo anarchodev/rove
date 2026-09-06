@@ -13,6 +13,8 @@ export default function ({ platform }) {
   probe("scope", () => platform.scope("acme").kv.get("x"));
   probe("root", () => platform.root.get("x"));
   probe("releases", () => platform.releases.publish("acme", "0123456789abcdef"));
+  probe("dispatch", () => platform.dispatch("acme", "__system/scope_kv",
+    { ctx: { pairs: [{ key: "pd/x", value: "1" }] }, actor: "system" }));
   // `request.rewind` is not gated — it simply doesn't EXIST off a
   // platform-bound handler, so the probe reports presence rather than a throw.
   out.rewind = typeof request.rewind === "undefined" ? "absent" : String(request.rewind.isRoot);

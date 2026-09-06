@@ -289,6 +289,32 @@ Read-your-write minimality applies as it does for tenant kv: a root key this
 activation already wrote is reproduced offline by re-running the write into the
 same namespace, so it stays off the tape.
 
+### `platform.dispatch` resolves eagerly offline
+
+The public `platform.dispatch` is the real shim in every engine — marker,
+watchdog arm, all recorded kv. What has no thread to run offline is the
+engine half: the fire in the target's scope and the engine-sent result hop.
+The shim probes for an optional `_system.platform.dispatchResolve` after
+arming; the worker's native binding has no such member (live runs skip it),
+and the sim's recorder layer defines it to resolve the dispatch NOW: run the
+modeled target against the target store, write the `_dispatch/result/{id}`
+row, delete the owed marker, cancel the watchdog — the same writeset
+`__system/dispatch_result` commits live, one activation sooner.
+
+Eager resolution means the marker never observably stands offline, so a
+driver written as "harvest if resolved, else park" completes in one
+activation in a test and parks live — the pending branch is prod-only, and
+prod smokes are what exercise it. Captured replays never need the model at
+all: the wake that harvested the result taped its kv reads, and replay
+feeds them back.
+
+The modeled targets are the modules the admin app dispatches
+(`__system/scope_kv`, and `__system/root_kv_install` against `__root__`
+only — at a tenant target that module writes below the user root, a
+spelling the sim's flattened per-instance keyspace cannot represent). An
+unmodeled module throws at the call site: an authored world naming one is a
+test bug surfacing where it was written, never a watchdog loop.
+
 ### Fail-closed is a harness affordance, not a security boundary
 
 The offline `platform.*` facade is gated: every sync verb throws unless the run

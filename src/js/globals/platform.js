@@ -447,6 +447,12 @@
         { id: id },
         { key: "_dispatch/" + id },
       );
+      // Offline (the sim / replay arena), the engine's fire + result hop
+      // has no thread to run on — the recorder layer resolves the dispatch
+      // NOW through this optional member, same semantics but eager. The
+      // worker's native `_system.platform` has no such member, so live
+      // runs skip it.
+      if (typeof sys.dispatchResolve === "function") sys.dispatchResolve(id, marker);
       return id;
     },
 
