@@ -506,6 +506,7 @@ fn workerMain(args: *WorkerCtx) !void {
         runPromotionHook(worker, &last_sweep_gen);
         drainSnapshotCatchupJobs(worker, catchup);
         try rjs.drainForwardPending(worker);
+        try rjs.drainDoorPending(worker);
         // Finalize completed streamed-snapshot transfers
         // (install the baseline + respond) parked in `snapshot_streams`, and
         // respond to parked CP-triggered move pushes as the driver finishes them.

@@ -1431,6 +1431,7 @@ pub fn Worker(comptime opts: Options) type {
     const merged_request_row = rove.Row(&.{
         RaftWait,
         ForwardWait,
+        deploy_thread_mod.DoorWait,
         BodyDurabilityWait,
         BodyInbound,
         RateCharged,
@@ -1487,6 +1488,7 @@ pub fn Worker(comptime opts: Options) type {
             .{ .name = "raft_pending_stream", .row = h2.StreamRowFor(worker_h2_opts) },
             .{ .name = "body_pending", .row = h2.StreamRowFor(worker_h2_opts) },
             .{ .name = "forward_pending", .row = h2.StreamRowFor(worker_h2_opts) },
+            .{ .name = "door_pending", .row = h2.StreamRowFor(worker_h2_opts) },
             .{ .name = "parked_continuations", .row = h2.StreamRowFor(worker_h2_opts) },
             .{ .name = "snapshot_streams", .row = h2.StreamRowFor(worker_h2_opts) },
             .{ .name = "snapshot_pushes", .row = h2.StreamRowFor(worker_h2_opts) },
@@ -1593,6 +1595,19 @@ pub fn Worker(comptime opts: Options) type {
         /// `StreamRow` as `raft_pending_*` so `reg.move` preserves the
         /// h2 sid/session/headers the response needs.
         forward_pending: *StreamColl,
+        /// Publish-door park (`deploy_door.zig`). A manifest POST parks
+        /// here with a `DoorWait` while the DeployThread runs the S3
+        /// presence probe off the poll loop; `drainDoorPending` matches
+        /// the probe's `DoorResult` back by door_id (or reaps on the
+        /// deadline — the 504 was staged at park). Same `StreamRow` as
+        /// `forward_pending`.
+        door_pending: *StreamColl,
+        /// The DeployThread's reply path for door jobs. Address-stable for
+        /// the worker's lifetime; drained every loop.
+        door_inbox: deploy_thread_mod.DoorResultInbox = .{},
+        /// Mints `DoorWait.door_id` (per-worker monotonic; starts at 1 so
+        /// 0 stays "no wait").
+        door_id_counter: u64 = 0,
         /// Background compile/stage thread backing the `platform.*` deploy
         /// primitives (`docs/architecture/cli-and-deploy.md` §4). Owns its own QuickJS
         /// runtime (the poll-loop `compile_fn` is used by
@@ -1945,6 +1960,7 @@ pub fn Worker(comptime opts: Options) type {
                 .raft_pending_stream = reg.coll(.raft_pending_stream),
                 .body_pending = reg.coll(.body_pending),
                 .forward_pending = reg.coll(.forward_pending),
+                .door_pending = reg.coll(.door_pending),
                 .parked_continuations = reg.coll(.parked_continuations),
                 .snapshot_streams = reg.coll(.snapshot_streams),
                 .snapshot_pushes = reg.coll(.snapshot_pushes),
@@ -2217,6 +2233,11 @@ pub fn Worker(comptime opts: Options) type {
                 self.deploy_thread = null;
             }
 
+            // Door results that never found their parked stream (shutdown
+            // races the probe): free their bodies. After the thread join
+            // above, nothing pushes.
+            self.door_inbox.deinit(self.allocator);
+
             // Drop any still-parked fetch chunks at shutdown
             // (best-effort, same lossy posture as the log flusher's
             // final drain). Each entry owns its UpstreamFetchEvent's
@@ -2238,6 +2259,12 @@ pub fn Worker(comptime opts: Options) type {
         /// node's shared blob backend config so each job writes the
         /// target tenant's own `file-blobs/` + `deployments/` keys.
         /// Call once after `create`, before serving.
+        /// Mint the next publish-door wait id (`DoorWait.door_id`).
+        pub fn nextDoorId(self: *Self) u64 {
+            self.door_id_counter += 1;
+            return self.door_id_counter;
+        }
+
         pub fn startDeployThread(self: *Self) !void {
             if (self.deploy_thread != null) return;
             const dt = try deploy_thread_mod.DeployThread.init(
@@ -4050,6 +4077,7 @@ pub const flushLogs = worker_log.flushLogs;
 // without touching their import lines.
 pub const drainRaftPending = worker_drain.drainRaftPending;
 pub const drainForwardPending = worker_drain.drainForwardPending;
+pub const drainDoorPending = worker_drain.drainDoorPending;
 pub const drainBodyPending = worker_drain.drainBodyPending;
 pub const drainFetchPendingDurability = worker_drain.drainFetchPendingDurability;
 pub const resolveDeployment = worker_drain.resolveDeployment;

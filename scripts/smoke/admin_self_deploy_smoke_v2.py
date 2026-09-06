@@ -69,7 +69,7 @@ def main() -> int:
             failures.append(label)
 
     print("=== deploy doors: baked app vs the released dashboard ===")
-    with V2Cluster.spawn("admself", nodes=1) as c:
+    with V2Cluster.spawn("admself", nodes=1, deploy_private_port=True) as c:
         # 1. Bootstrap: the BAKED deploy app becomes __admin__'s released bundle.
         c._ensure_admin_app()
         pkgs, imports = c.firstparty_packages(["@rewind/oidc"])
@@ -234,6 +234,74 @@ def main() -> int:
         check("export list carries it",
               r.status == 200 and exp_id is not None and exp_id in r.body,
               f"got {r.status} {r.body[:160]!r}")
+
+        # 10. The engine publish door: manifest-first, content-addressed,
+        #     stateless. The handshake is open; writes take the door's own
+        #     gate (root ONLY on the private loopback listener); the
+        #     negotiation answers 200 {dep_id} when every blob is present
+        #     (viadash's index.mjs was staged content-addressed by the
+        #     deploy above) and 409 {need} when one is not; a repeated
+        #     post returns the SAME dep_id; validation reports EVERY
+        #     violation in one round trip.
+        import hashlib as _hashlib
+        door = f"http://127.0.0.1:{c.deploy_private_port}/_system/deploy"
+        r = _curl(f"{door}/version")
+        check("door handshake is open", r.status == 200 and '"min"' in r.body,
+              f"got {r.status} {r.body[:120]!r}")
+        src_hash = _hashlib.sha256(TARGET_SRC.encode()).hexdigest()
+        manifest = _json.dumps({"v": 1, "tenant": "viadash", "client": "smoke",
+                                "files": [{"path": "index.mjs", "hash": src_hash}]})
+        hdr = {"Content-Type": "application/json"}
+        r = _curl(door, method="POST", headers=hdr, data=manifest)
+        check("unauthenticated manifest POST is refused",
+              r.status == 401, f"got {r.status} {r.body[:120]!r}")
+        rooth = {**hdr, "Authorization": f"Bearer {c.root_token}"}
+        r = _curl(f"{node}/_system/deploy", method="POST",
+                  headers={**rooth, "Host": c.admin_host(0)}, data=manifest)
+        check("root on the PUBLIC plane is refused with its own code",
+              r.status == 403 and "root_credential_on_public_plane" in r.body,
+              f"got {r.status} {r.body[:160]!r}")
+        r = _curl(door, method="POST", headers=rooth, data=manifest)
+        dep1 = None
+        try:
+            dep1 = _json.loads(r.body).get("dep_id")
+        except Exception:
+            pass
+        check("a fully-present bundle answers 200 {dep_id}",
+              r.status == 200 and bool(dep1), f"got {r.status} {r.body[:160]!r}")
+        r = _curl(door, method="POST", headers=rooth, data=manifest)
+        dep2 = None
+        try:
+            dep2 = _json.loads(r.body).get("dep_id")
+        except Exception:
+            pass
+        check("a repeated post returns the same dep_id (idempotent)",
+              r.status == 200 and dep2 == dep1, f"got {r.status} dep2={dep2!r}")
+        missing = "0" * 64
+        m2 = _json.dumps({"v": 1, "tenant": "viadash", "client": "smoke",
+                          "files": [{"path": "index.mjs", "hash": src_hash},
+                                    {"path": "_static/x.css", "hash": missing}]})
+        r = _curl(door, method="POST", headers=rooth, data=m2)
+        ok_need = False
+        try:
+            ok_need = _json.loads(r.body).get("need") == [missing]
+        except Exception:
+            pass
+        check("a missing blob answers 409 naming exactly it",
+              r.status == 409 and ok_need, f"got {r.status} {r.body[:160]!r}")
+        bad = _json.dumps({"v": 1, "tenant": "viadash", "client": "smoke",
+                           "files": [{"path": "_tests/t.mjs", "hash": src_hash},
+                                     {"path": "index.mjs", "hash": "zz"},
+                                     {"path": "index.mjs", "hash": src_hash}]})
+        r = _curl(door, method="POST", headers=rooth, data=bad)
+        ok_all = False
+        try:
+            codes = sorted(e["code"] for e in _json.loads(r.body)["errors"])
+            ok_all = codes == ["bad_hash", "duplicate_path", "test_artifact_path"]
+        except Exception:
+            pass
+        check("validation reports every violation in one round trip",
+              r.status == 400 and ok_all, f"got {r.status} {r.body[:220]!r}")
 
     print()
     if failures:

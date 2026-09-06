@@ -431,6 +431,9 @@ class V2Cluster:
     data_dirs: list[Path]
     cp_data_dir: Path
     log_data_dir: Path
+    # The publish door's private loopback listener port on node 0 (0 = the
+    # listener is off, the suite default).
+    deploy_private_port: int = 0
     procs: list = field(default_factory=list)
     node_procs: dict = field(default_factory=dict)  # node index → Popen (for stop/start)
     # Node indices currently SIGSTOPped by `freeze_node`. A frozen process is
@@ -482,7 +485,8 @@ class V2Cluster:
               tls_cert: str = "", tls_key: str = "",
               genesis: bool = False,
               storage_generation: int = 0,
-              worker_log_push: bool = True) -> "V2Cluster":
+              worker_log_push: bool = True,
+              deploy_private_port: bool = False) -> "V2Cluster":
         if not os.environ.get("S3_ENDPOINT"):
             raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
         ensure_smoke_bins()
@@ -494,6 +498,10 @@ class V2Cluster:
         # and a second cluster in the same smoke — can never collide.
         assert nodes <= 28, "cluster block layout caps nodes at 28"
         base = alloc(CLUSTER_BLOCK)
+        # The publish door's private loopback listener (node 0 only): a
+        # smoke that exercises the door opts in and gets a port from the
+        # same block, so concurrent smokes cannot collide on the default.
+        private_port = base + CLUSTER_BLOCK - 1 if deploy_private_port else 0
         rbase = base + 100
         pid = os.getpid()
         node_ports = [base + i for i in range(nodes)]
@@ -522,6 +530,7 @@ class V2Cluster:
             genesis=genesis,
             worker_log_push=worker_log_push,
             logs_metrics_port=base + 59,
+            deploy_private_port=private_port,
             _block_base=base,
         )
         for d in (*c.data_dirs, c.cp_data_dir):
@@ -706,6 +715,8 @@ class V2Cluster:
         # ship bytes no peer could open.
         env["REWIND_KEYRING_KEK"] = KEYRING_KEK
         env["REWIND_NODE_ID"] = str(i + 1)
+        if i == 0 and self.deploy_private_port:
+            env["REWIND_DEPLOY_PRIVATE_PORT"] = str(self.deploy_private_port)
         # Cold-multi: every node carries the full static voter/peer set, so each
         # raft group is born {1..N} and elects on its own (genesis and steady
         # state are the same boot — see docs/architecture/consensus-and-storage.md "Cluster genesis & membership" (genesis).

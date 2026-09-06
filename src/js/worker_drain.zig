@@ -38,6 +38,7 @@ const kv_mod = @import("raft-kv");
 const blob_mod = @import("rove-blob");
 const tape_mod = @import("rove-tape");
 const log_mod = @import("rove-log");
+const deploy_thread_mod = @import("deploy_thread.zig");
 const tenant_mod = @import("rove-tenant");
 
 const dispatcher_mod = @import("dispatcher.zig");
@@ -474,6 +475,65 @@ pub fn drainForwardPending(worker: anytype) !void {
     // reaped, or a duplicate result raced).
     for (results.items, 0..) |*r, k| {
         if (!consumed[k]) r.outcome.deinit(allocator);
+    }
+}
+
+/// Resolve publish-door parks (`deploy_door.zig`): match DeployThread
+/// `DoorResult`s back to entities parked in `door_pending` by door_id, or
+/// reap on the deadline. The reap is only a move — the 504 body was
+/// staged as a placeholder at park time. Mirrors `drainForwardPending`.
+pub fn drainDoorPending(worker: anytype) !void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+
+    var results: std.ArrayListUnmanaged(deploy_thread_mod.DoorResult) = .empty;
+    defer results.deinit(allocator);
+    try worker.door_inbox.drainInto(allocator, &results);
+
+    const parked = worker.door_pending.entitySlice();
+    if (results.items.len == 0 and parked.len == 0) return;
+
+    var consumed = try allocator.alloc(bool, results.items.len);
+    defer allocator.free(consumed);
+    @memset(consumed, false);
+
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const waits = worker.door_pending.column(deploy_thread_mod.DoorWait);
+    const resp_bodies = worker.door_pending.column(h2.RespBody);
+
+    var i: usize = 0;
+    while (i < parked.len) : (i += 1) {
+        const ent = parked[i];
+        const did = waits[i].door_id;
+
+        var matched: ?usize = null;
+        for (results.items, 0..) |r, k| {
+            if (!consumed[k] and r.door_id == did) {
+                matched = k;
+                break;
+            }
+        }
+
+        if (matched) |k| {
+            consumed[k] = true;
+            // Swap the placeholder body for the probe's answer; status
+            // rides the same overwrite. Headers stay — content type and
+            // CORS were staged at park.
+            const old = resp_bodies[i];
+            if (old.data) |p2| allocator.free(p2[0..old.len]);
+            const r = &results.items[k];
+            try server.reg.set(ent, worker.door_pending, h2.Status, .{ .code = r.status });
+            try server.reg.set(ent, worker.door_pending, h2.RespBody, .{ .data = r.body.ptr, .len = @intCast(r.body.len) });
+            try server.reg.move(ent, worker.door_pending, server.coll(.response_in));
+        } else if (waits[i].deadline_ns != 0 and now_ns >= waits[i].deadline_ns) {
+            // The placeholder IS the timeout answer.
+            try server.reg.move(ent, worker.door_pending, server.coll(.response_in));
+        }
+    }
+
+    // Results whose door_id had no parked entity (reaped / raced): free.
+    for (results.items, 0..) |r, k| {
+        if (!consumed[k]) allocator.free(r.body);
     }
 }
 
