@@ -847,7 +847,7 @@ fn finalizeBatch(
     var processed: usize = 0;
 
     // A batch with only side effects (e.g. an admin handler that did
-    // nothing but `platform.root.set` or `platform.releases.publish`)
+    // nothing but cross-tenant target writes)
     // must NOT take the read-only fast path — its response has to be
     // parked until the side-effect inners commit.
     if (!has_writes and !has_side) {

@@ -338,7 +338,7 @@ pub const Admin = struct {
     /// the JS globals can install `platform.root.*`.
     platform: ?*tenant_mod.Tenant = null,
     /// Admin platform-capability trampolines (deployStarter /
-    /// releases.publish / scope().kv), bundled all-or-nothing. See
+    /// scope().kv), bundled all-or-nothing. See
     /// `globals.PlatformCaps`.
     platform_caps: ?globals.PlatformCaps = null,
 };

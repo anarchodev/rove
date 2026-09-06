@@ -10,7 +10,7 @@
 //! 1. A release POST commits `_deploy/current = N` to raft and
 //!    returns 200 immediately. No fetch on the request thread.
 //! 2. The proposing trampoline (`releasePublishTrampoline` for
-//!    `platform.releases.publish`, `handleRelease` for the
+//!    the dispatched `__system/release_flip`, `handleRelease` for the
 //!    bootstrap-only `/_system/release` route) calls `enqueue`
 //!    inline. On follower nodes, `apply.zig`'s envelope-0 apply
 //!    detects `_deploy/current` writes and enqueues there too,

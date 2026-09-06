@@ -52,7 +52,7 @@
 
   /**
    * Admin control plane: cross-tenant kv access, the platform root
-   * store, instance lifecycle, releases, and root-token auth. Only
+   * store, instance lifecycle, and root-token auth. Only
    * usable from the `__admin__` handler.
    *
    * @namespace platform
@@ -79,7 +79,7 @@
      *     (`[{path, kind, source_hex, bytecode_hex?, content_type?}]`);
      *     stampManifest returns the dep_id (16-hex). Compose deploys with
      *     {@link platform.compile} (handlers) + `blob.receive` (statics) +
-     *     `stampManifest`, then activate with {@link platform.releases.publish}.
+     *     `stampManifest`, then activate by dispatching `__system/release_flip`.
      *   Unknown id throws `Error{code:"InstanceNotFound"}`.
      *
      * @example
@@ -225,7 +225,7 @@
      * `request.ctx = {ok, results:[{path, source_hex, bytecode_hex}]}`
      * (or `{ok:false, status, error}`). Compose the manifest from those
      * hashes + your statics and stamp it there. Stage/activate is still a
-     * separate `platform.releases.publish`.
+     * separate release dispatch (`__system/release_flip`).
      *
      * Imports resolve — and are therefore VALIDATED — across the whole
      * batch: a handler may import a sibling in the same call, and a
@@ -327,30 +327,6 @@
     },
 
     /**
-     * Releases.
-     *
-     * @namespace platform.releases
-     */
-    releases: {
-      /**
-       * Activate deployment `depId` on `tenantId`: stamp
-       * `_deploy/current`, propose envelope-0 through raft (no
-       * blocking on consensus), and enqueue the deployment loader.
-       * Returns sub-millisecond; consensus + bytecode load run async.
-       * Throws `Error{code:"InstanceNotFound"}` if `tenantId` doesn't
-       * resolve.
-       *
-       * @param {string} tenantId - Target instance id.
-       * @param {string} depId - Deployment id to activate.
-       * @returns {void}
-       * @example platform.releases.publish("acme-prod", depId);
-       */
-      publish(tenantId, depId) {
-        return sys.releases.publish(tenantId, depId);
-      },
-    },
-
-    /**
      * Run a platform action in another tenant's scope — durably.
      *
      * The primitive that unfuses *whose code runs* from *whose data it runs
@@ -381,6 +357,10 @@
      * @param {object} [opts]
      * @param {*} [opts.ctx] - Argument payload, JSON-serialisable.
      * @param {string} [opts.fn] - Named export; default export when omitted.
+     * @param {boolean} [opts.result=true] - When false, the resolution
+     *   deletes the owed marker but writes no `_dispatch/result/{id}` row —
+     *   fire-and-forget. A caller that will never harvest must say so, or
+     *   every call leaks one row of the target's output into this store.
      * @param {"tenant_user"|"operator"|"system"} [opts.actor="system"] -
      *   WHO caused this, as the target's log will record it. Three values
      *   because "the dashboard did it" hides the split a reader most wants:
@@ -396,6 +376,9 @@
     dispatch(tenant, module, opts) {
       opts = opts || {};
       _rejectRenamed("platform.dispatch", opts, { on: "fn", context: "ctx" });
+      if (opts.result !== undefined && typeof opts.result !== "boolean") {
+        throw new TypeError("platform.dispatch: result must be a boolean");
+      }
       if (typeof tenant !== "string" || !tenant) {
         throw new TypeError("platform.dispatch: tenant must be a non-empty string");
       }
@@ -427,6 +410,13 @@
         fn: typeof opts.fn === "string" ? opts.fn : null,
         actor: actor,
       };
+      // `result: false` — fire-and-forget: the resolution still deletes the
+      // marker (the durability contract), but writes no `_dispatch/result/`
+      // row. A caller that will never harvest must say so, or every call
+      // leaks one row of another tenant's output into this store. Additive
+      // on the marker (absent = write the row), so the record version
+      // holds.
+      if (opts.result === false) marker.no_result = true;
 
       // The marker and its watchdog ride THIS activation's writeset, so the
       // intent and its recovery commit together or not at all. Written

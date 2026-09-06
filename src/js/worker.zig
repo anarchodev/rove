@@ -2425,86 +2425,6 @@ pub fn Worker(comptime opts: Options) type {
             return dep_id;
         }
 
-        /// Trampoline for `platform.releases.publish(tenant_id,
-        /// dep_id)`. Stamps `_deploy/current = hex(dep_id)` on the
-        /// target tenant's app.db (one-shot kvexp speculative
-        /// commit) and folds that writeset into the batch's single
-        /// atomic raft entry (Option-A, the proposer fold-gate,
-        /// `docs/architecture/consensus-robustness.md`), then enqueues the deployment loader.
-        ///
-        /// Returns `error.InstanceNotFound` if the target doesn't
-        /// resolve. The caller's response is **gated on commit**:
-        /// `finalizeBatch` parks the calling admin request on the
-        /// batch seq, so the 2xx releases only once the
-        /// `_deploy/current` write reaches quorum (a pre-quorum
-        /// fault → 503, no escaped effect). No fire-and-forget: kvexp
-        /// volatility + the Option-A gate keep the effect from
-        /// escaping before quorum.
-        pub fn releasePublishTrampoline(
-            ctx: *anyopaque,
-            allocator: std.mem.Allocator,
-            target_id: []const u8,
-            dep_id: u64,
-        ) anyerror!void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-
-            const inst_opt = self.node.tenant.getInstance(target_id) catch
-                return error.InstanceNotFound;
-            const inst = inst_opt orelse return error.InstanceNotFound;
-
-            var hex_buf: [16]u8 = undefined;
-            const hex = std.fmt.bufPrint(&hex_buf, "{x:0>16}", .{dep_id}) catch unreachable;
-
-            // Idempotent fast path: if `_deploy/current` is already
-            // exactly `dep_id`, do nothing. No raft propose, no commit,
-            // no loader enqueue. This is what the 10k snapshot bench's
-            // warmup phase needs — `loop46 seed --deploy-id 1` pre-
-            // stamps `_deploy/current = 1` on every tenant, then
-            // warmup calls publishRelease(tenant, 1) on each one,
-            // every call asking us to activate the dep we just stamped.
-            // Without this fast path, that's 10k raft proposals doing
-            // exactly no work.
-            //
-            // We intentionally do NOT fast-path on `current > dep_id`
-            // — that's a customer-requested rollback to an older
-            // version, semantically a real write. Only exact-match
-            // is a no-op.
-            if (inst.kv.get("_deploy/current")) |current_hex| {
-                defer allocator.free(current_hex);
-                const current_id = std.fmt.parseInt(u64, current_hex, 16) catch 0;
-                if (current_id == dep_id) return;
-            } else |_| {}
-
-            var release_ws = kv_mod.WriteSet.init(allocator);
-            defer release_ws.deinit();
-            try release_ws.addPut("_deploy/current", hex);
-            // Release history: per-tenant `_release/{ts_ms:020}` → `{id:016x}`,
-            // the SAME record the HTTP `/_system/release` path writes — so the
-            // history (read by `/v1/history` → `rewind deployments`) is populated
-            // no matter which release path flipped the pointer (root HTTP or this
-            // JS `platform.releases.publish`). Lex-ordered by ts for a newest-
-            // first reverse scan.
-            var ts_buf: [20]u8 = undefined;
-            // MUST be unsigned — see the note in worker_dispatch.zig's
-            // handleRelease: `{d:0>20}` on a signed positive int emits a
-            // leading `+` sign that breaks the dashboard reader's parseInt.
-            const ts_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
-            const ts_str = std.fmt.bufPrint(&ts_buf, "{d:0>20}", .{ts_ms}) catch unreachable;
-            var rk_buf: [32]u8 = undefined;
-            const release_key = std.fmt.bufPrint(&rk_buf, "_release/{s}", .{ts_str}) catch unreachable;
-            try release_ws.addPut(release_key, hex);
-            try self.applyTargetWrite(allocator, inst, target_id, &release_ws);
-
-            if (self.node.deploy.deployment_loader) |loader| {
-                loader.enqueue(target_id, dep_id) catch |err| {
-                    std.log.warn(
-                        "releases.publish: enqueue loader for {s}/{d} failed: {s}",
-                        .{ target_id, dep_id, @errorName(err) },
-                    );
-                };
-            }
-        }
-
         /// Trampoline for `platform.scope(id).kv.{set,delete}`. A
         /// cross-tenant write to `target_id`'s app.db: one-shot kvexp
         /// speculative commit, then folded into the batch's single
@@ -2592,7 +2512,6 @@ pub fn Worker(comptime opts: Options) type {
             return .{
                 .ctx = @ptrCast(self),
                 .deploy_starter = &Self.deployStarterTrampoline,
-                .release_publish = &Self.releasePublishTrampoline,
                 .scope_kv_write = &Self.scopeKvWriteTrampoline,
             };
         }

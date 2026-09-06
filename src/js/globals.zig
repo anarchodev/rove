@@ -352,15 +352,6 @@ pub const PlatformCaps = struct {
         allocator: std.mem.Allocator,
         target_id: []const u8,
     ) anyerror!void = null,
-    /// `platform.releases.publish(tenant_id, dep_id)`: stamp
-    /// `_deploy/current = dep_id` on the target's app.db, propose
-    /// envelope-0 (fire-and-forget), enqueue the deployment loader.
-    release_publish: ?*const fn (
-        ctx: *anyopaque,
-        allocator: std.mem.Allocator,
-        target_id: []const u8,
-        dep_id: u64,
-    ) anyerror!void = null,
     /// `platform.scope(id).kv.{set,delete}`: self-contained cross-
     /// tenant write+commit+raft-propose to the target (envelope-0),
     /// deliberately OUTSIDE the dispatch batch txn — the scoped
@@ -759,7 +750,7 @@ pub const DispatchState = struct {
     /// the dispatch carries no saga_id.
     saga_id: []const u8 = "",
     /// Admin-tenant platform-capability trampolines (deployStarter /
-    /// releases.publish / scope().kv writes). Non-null only on admin-
+    /// scope().kv writes). Non-null only on admin-
     /// handler requests (gated by `platform != null` in
     /// `worker_dispatch`); customer requests have none and the JS
     /// callables reject at the gate. See `PlatformCaps`.
@@ -1442,9 +1433,6 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     .{ .path = &.{ "_system", "platform", "instances" }, .fns = &.{
         .{ .name = "deployStarter", .cfunc = platform_bindings.jsPlatformInstancesDeployStarter, .argc = 1 },
         .{ .name = "usage", .cfunc = platform_bindings.jsPlatformInstancesUsage, .argc = 1 },
-    } },
-    .{ .path = &.{ "_system", "platform", "releases" }, .fns = &.{
-        .{ .name = "publish", .cfunc = platform_bindings.jsPlatformReleasesPublish, .argc = 2 },
     } },
     // No `_system.platform.auth`: the operator-root verdict is engine-computed
     // and reaches the handler as `request.rewind.isRoot`, never as a native
