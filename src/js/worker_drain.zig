@@ -2556,8 +2556,15 @@ pub fn resumeBoundContinuation(
             if (chain != null and desc != null and std.mem.eql(u8, chain.?.tenant_id, tenant_id)) {
                 const bsid = desc.?.bound_schedule_id;
                 if (bsid != null and std.mem.eql(u8, bsid.?, sched_id)) {
-                    const sid = server.reg.get(ent, worker.parked_continuations, h2.StreamId) catch return false;
-                    const sess = server.reg.get(ent, worker.parked_continuations, h2.Session) catch return false;
+                    const sid = server.reg.get(ent, worker.parked_continuations, h2.StreamId) catch {
+                        std.log.warn("rove-js cont-resume: {s}/{s}: StreamId read failed on parked cont", .{ tenant_id, sched_id });
+                        return false;
+                    };
+                    const sess = server.reg.get(ent, worker.parked_continuations, h2.Session) catch {
+                        std.log.warn("rove-js cont-resume: {s}/{s}: Session read failed on parked cont", .{ tenant_id, sched_id });
+                        return false;
+                    };
+                    std.log.debug("rove-js cont-resume: delivering send_id={s} tenant={s} (map)", .{ sched_id, tenant_id });
                     resumeContinuation(worker, ent, sid.*, sess.*, outcome_json, true, false) catch |err| {
                         std.log.warn(
                             "rove-js cont-resume: {s}/{s}: {s}; 502",
@@ -2575,9 +2582,10 @@ pub fn resumeBoundContinuation(
     // be canonical; a hit here means the registry got out of sync
     // (component freed without unregister, double-bind collision,
     // etc.) and the scan is the safety net for the held-state
-    // design (`docs/architecture/effects-and-handlers.md`).
+    // design (`docs/architecture/effects-and-handlers.md`). No
+    // empty-set short-circuit: the total-miss warn below must fire
+    // for parked=0 too — that is the raced-park case.
     const ents = worker.parked_continuations.entitySlice();
-    if (ents.len == 0) return false;
     const sids = worker.parked_continuations.column(h2.StreamId);
     const sesss = worker.parked_continuations.column(h2.Session);
     const descs = worker.parked_continuations.column(components_mod.ContDescriptor);
@@ -2599,6 +2607,15 @@ pub fn resumeBoundContinuation(
         };
         return true;
     }
+    // Total miss — both the registry and the scan came up empty for a
+    // resume that was queued because SOMETHING matched at enqueue time.
+    // The bound cont changed state in between (reparked, resolved,
+    // destroyed) and this outcome is now undeliverable; without this
+    // line the chain's eventual 504 has no cause in the log.
+    std.log.warn(
+        "rove-js cont-resume: queued resume undeliverable — no bound cont for send_id={s} tenant={s} (parked={d})",
+        .{ sched_id, tenant_id, ents.len },
+    );
     return false;
 }
 
@@ -2616,12 +2633,36 @@ pub fn drainPendingBoundResumes(worker: anytype) void {
     // dispatch).
     var local = worker.pending_bound_resumes;
     worker.pending_bound_resumes = .empty;
-    defer {
-        for (local.items) |*p| p.deinit(allocator);
-        local.deinit(allocator);
-    }
-    for (local.items) |p| {
-        _ = resumeBoundContinuation(worker, p.tenant_id, p.send_id, p.event_json);
+    defer local.deinit(allocator);
+    std.log.debug("rove-js cont-resume: draining {d} queued bound resume(s)", .{local.items.len});
+    for (local.items) |*p| {
+        if (resumeBoundContinuation(worker, p.tenant_id, p.send_id, p.event_json)) {
+            p.deinit(allocator);
+            continue;
+        }
+        // Miss — but a live entity still bound to this send_id means the
+        // cont is MID-PARK (its move into `parked_continuations` lands
+        // at a commit this outcome raced; the trampoline queued on that
+        // same signature). Re-queue for the next tick rather than drop:
+        // the park is coming, and dropping here strands the chain at its
+        // hold deadline. Naturally bounded — the sweep's mandatory 504
+        // resolves the cont if the park never materializes, and the
+        // binding unregisters with it, turning the NEXT retry into a
+        // plain undeliverable drop.
+        if (worker.lookupBoundSendEntity(p.send_id)) |ent| {
+            if (!worker.h2.reg.isStale(ent)) {
+                worker.pending_bound_resumes.append(allocator, p.*) catch {
+                    p.deinit(allocator);
+                    continue;
+                };
+                std.log.debug(
+                    "rove-js cont-resume: send_id={s} still mid-park — re-queued",
+                    .{p.send_id},
+                );
+                continue;
+            }
+        }
+        p.deinit(allocator);
     }
 }
 
