@@ -52,7 +52,6 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     "\n;" ++ @embedFile("g_request") ++
     "\n;" ++ @embedFile("g_base64") ++
     "\n;" ++ @embedFile("g_urlsearchparams") ++
-    "\n;" ++ @embedFile("g_platform") ++
     // The connection/continuation shims — `after` (wake triggers), `stream`
     // (output frames), `next` (park disposition). Faithful recorders (they don't
     // decompose), installed unconditionally; the epilogue does not stub them.
@@ -74,6 +73,11 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     // `schedule.js` is self-IIFE'd (freeze-safe as embedded).
     "\n;" ++ @embedFile("g_time") ++
     "\n;" ++ @embedFile("g_schedule") ++
+    // AFTER schedule.js, mirroring the worker (globals.zig): platform.js
+    // captures the private `_system.sched` at eval for `platform.dispatch`'s
+    // watchdog arm — evaluated earlier it captures undefined and every
+    // dispatch throws at the arm.
+    "\n;" ++ @embedFile("g_platform") ++
     "\n;" ++ @embedFile("g_webhook") ++
     // `blob` — real shim over the `_system.blob` recorder + `_system.http` (PUT /
     // compose) + the pure-JS streaming sha256; `blob.get` composes on the base
