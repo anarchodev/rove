@@ -181,6 +181,34 @@ def main() -> int:
               "present" if found_kv is not None
               else "absent after 20s — the ops left no account of themselves")
 
+        # 7. /v1/sources/{t}/current: the live-pointer read is a dispatched
+        #    activation too, and its finisher continues the manifest chain
+        #    (readManifest -> blob reads) from the wake — the whole read
+        #    door composed across a park.
+        r = _curl(f"{node}/v1/sources/viadash/current", headers=auth, timeout=30.0)
+        ok_src = False
+        try:
+            ents = _json.loads(r.body).get("entries") or []
+            ok_src = any(e.get("path") == "index.mjs" and "ok" in (e.get("source") or "")
+                         for e in ents)
+        except Exception:
+            pass
+        check("sources/current resolves through the dispatched read",
+              r.status == 200 and ok_src, f"got {r.status} {r.body[:160]!r}")
+
+        # 8. No residue: every dispatched read's result row was consumed by
+        #    its wake (or chain terminal). The browse below is itself a
+        #    dispatched op whose own owed marker is live mid-scan, so only
+        #    the RESULT rows are asserted empty.
+        r = _curl(f"{node}/v1/instances/__admin__/kv?prefix=_dispatch/result/", headers=auth)
+        ok_res = False
+        try:
+            ok_res = r.status == 200 and (_json.loads(r.body).get("entries") == [])
+        except Exception:
+            pass
+        check("dispatch result rows are consumed (no residue)",
+              ok_res, f"got {r.status} {r.body[:200]!r}")
+
     print()
     if failures:
         print(f"FAILURES ({len(failures)}): " + ", ".join(failures))
