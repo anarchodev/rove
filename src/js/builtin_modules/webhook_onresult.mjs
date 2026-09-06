@@ -103,10 +103,17 @@ export default function () {
     if (a.kind !== "send_callback" && a.kind !== "fetch_chunk") {
         // Belt-and-braces — every dispatch via http.fetch hits us
         // with kind=fetch_chunk; via __rove_next chain hop with
-        // kind=send_callback (the retry-sweep PR-2d path).
-        return { status: 200 };
+        // kind=send_callback (the retry-sweep PR-2d path). 501 so the
+        // fire path warn-logs the wrong-kind dispatch instead of it
+        // reading as a healthy no-op.
+        return { status: 501 };
     }
-    if (a.kind === "fetch_chunk" && !a.final) return { status: 200 };
+    // Intermediate chunk: acknowledged, waiting for final. 206 (not
+    // 200) so the fire path's status log distinguishes this return
+    // from the classifier's real outcomes — a terminal event whose
+    // `final` flag was lost otherwise no-ops here as a clean 200 and
+    // the bound chain hangs to its hold deadline with no trace.
+    if (a.kind === "fetch_chunk" && !a.final) return { status: 206 };
 
     // The shim's bookkeeping ctx (the originating webhook.send
     // stuffed it onto the fetch's `ctx`) — lifted to `request.ctx`
@@ -115,10 +122,15 @@ export default function () {
     const { id, on_result, context } = ctx;
 
     // Read the owed marker — if absent, this is a duplicate fire
-    // (the retry sweep + first-attempt callback both completed);
-    // no-op.
+    // (the retry sweep + first-attempt callback both completed) — OR a
+    // marker-visibility failure, which strands any held-sync chain
+    // bound to this send until its hold deadline. The two are
+    // indistinguishable here, so answer 404: a connectionless fire's
+    // >=400 status is warn-logged by the fire path, making the case
+    // attributable from the node log either way (a true duplicate
+    // fire is rare enough that the line is signal, not noise).
     const owed_raw = kv.get("_send/owed/" + id);
-    if (owed_raw == null) return { status: 200 };
+    if (owed_raw == null) return { status: 404 };
     const owed = JSON.parse(owed_raw);
     // Loud, matching the parse above: this module ROUND-TRIPS the
     // marker on a retry re-arm, so continuing past a version it does

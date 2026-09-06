@@ -2810,6 +2810,10 @@ pub fn Worker(comptime opts: Options) type {
             // safety net for the registry-empty edge case (entry
             // was unregistered between the lookup and now, etc.).
             const server = self.h2;
+            std.log.debug(
+                "rove-js resumeIfBound: probe send_id={s} tenant={s} parked={d}",
+                .{ send_id, tenant_id, self.parked_continuations.entitySlice().len },
+            );
             const map_hit = self.lookupBoundSendEntity(send_id);
             var matched = false;
             if (map_hit) |ent| {
@@ -2825,6 +2829,24 @@ pub fn Worker(comptime opts: Options) type {
                             matched = true;
                         }
                     } else |_| {}
+                } else if (!server.reg.isStale(ent)) {
+                    // Registered and alive but not parked YET: the park
+                    // is a deferred registry move (raft_pending_cont →
+                    // parked_continuations lands at flush), and a fetch
+                    // that fails at setup — the outbound gate — can
+                    // round-trip its terminal event through the Msg
+                    // queue faster than that flush. The binding says
+                    // this outcome has a taker; dropping it here
+                    // strands the chain at its hold deadline. Match,
+                    // and let the drain (next tick, post-flush)
+                    // deliver — its own gen/tenant checks re-verify,
+                    // and a cont that truly died surfaces as the
+                    // drain's undeliverable warn, not a silent hang.
+                    std.log.debug(
+                        "rove-js resumeIfBound: send_id={s} bound to a mid-park cont — resume deferred to the drain",
+                        .{send_id},
+                    );
+                    matched = true;
                 }
             }
             if (!matched) {
@@ -2841,7 +2863,20 @@ pub fn Worker(comptime opts: Options) type {
                     }
                 }
             }
-            if (!matched) return false;
+            if (!matched) {
+                // A miss is the needle for a hung held-sync chain: the
+                // outcome event arrived, nothing was bound to it here,
+                // and any bound chain will 504 at its hold deadline
+                // with no other trace. Unconditional — a miss against
+                // an EMPTY parked set is the cross-context case (the
+                // event landed where the cont is not) and the most
+                // important one to see.
+                std.log.warn(
+                    "rove-js resumeIfBound: no bound cont for send_id={s} tenant={s} (parked={d} map_hit={})",
+                    .{ send_id, tenant_id, self.parked_continuations.entitySlice().len, map_hit != null },
+                );
+                return false;
+            }
 
             const a = self.allocator;
             const tid = a.dupe(u8, tenant_id) catch return false;
@@ -2855,6 +2890,10 @@ pub fn Worker(comptime opts: Options) type {
                 .send_id = sid_dup,
                 .event_json = ev,
             }) catch return false;
+            std.log.debug(
+                "rove-js resumeIfBound: matched send_id={s} tenant={s} — resume queued",
+                .{ send_id, tenant_id },
+            );
             return true;
         }
 

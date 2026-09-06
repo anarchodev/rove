@@ -3031,6 +3031,27 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // map so `resumeBoundContinuation` can skip its scan of
             // every parked cont and lookup directly.
             worker.registerBoundSendEntity(send_id, ent);
+        } else if (cont_opt != null) {
+            // A cont parking UNBOUND is deadline-only: nothing can
+            // resume it early. Legitimate for a pure-timer park, but a
+            // held-sync hop that wrote its owed marker and STILL lands
+            // here has lost its binding — count what the scan saw so
+            // that hang is attributable.
+            var owed_puts: usize = 0;
+            for (writeset.ops.items[ws_pre_len..]) |op| {
+                const k = switch (op) {
+                    .put => |p| p.key,
+                    .delete => |d| d.key,
+                };
+                if (std.mem.startsWith(u8, k, "_send/owed/")) owed_puts += 1;
+            }
+            // Debug, not warn: a deadline-only park (0 puts) is a
+            // legitimate shape — __admin__'s deploy holds park this way
+            // constantly. The interesting case is >1 (ambiguous bind).
+            if (owed_puts != 1) std.log.debug(
+                "rove-js cont-park: UNBOUND cont parked with {d} _send/owed/ put(s) in its writeset slice (tenant={s})",
+                .{ owed_puts, scope_inst.id },
+            );
         }
         // `resp.console` / `resp.exception` are freed here unless we
         // transfer them into a SuccessRec below.
