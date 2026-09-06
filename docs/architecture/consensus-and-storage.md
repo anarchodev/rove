@@ -51,6 +51,23 @@ Retired type bytes (including `root_writeset`, formerly `2`) are rejected
 loudly by the decoder so a stale log entry surfaces rather than mis-applying.
 The full evolution table is in PLAN §10.2.
 
+**The entry-producer invariant.** Every raft entry for a tenant is produced
+by a contiguous run of activations in that tenant's scope, and the log's
+order is the activation order. Against the LOG, not the store — a batch
+carries several activations of one tenant in one entry (`finalizeBatch`'s
+successes list, one readset per request), so activation↔entry was never
+1:1. Enforced at the one worker seam (`src/js/raft_propose.zig`): every
+propose names a `Producer` — an activation identity (its log header), a
+batch of activations, or a declared engine writer from a closed enum — so
+a producer with no activation and no declared engine write cannot compile.
+NOT violations, and stated so the invariant doesn't read as broken
+everywhere: the pump applying a committed entry (the order being realized,
+not a second writer); snapshot install (the log's compacted prefix);
+move-restore seeding a store before its group serves (genesis, not a
+write); and the named engine writers, which write surfaces no handler
+observes and carry no record by design — admitted explicitly, never by
+omission.
+
 **Entry origin frame (load-bearing).** Every proposed entry is wrapped in a
 17-byte identity frame *before* the envelope: `[0xF7][origin u64][seq u64]`
 (`envelope.EntryFrame`). `origin` is the proposing bridge's **per-boot random

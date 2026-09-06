@@ -101,7 +101,7 @@ pub fn recordStored(
     };
     // No dispatched handler here, so no readset rides the envelope — the same
     // stance every non-handler producer takes.
-    _ = raft_propose.proposeWriteSet(worker, &ws, tenant_id, "") catch |err| {
+    _ = raft_propose.proposeWriteSet(worker, &ws, tenant_id, "", .{ .engine = .blob_usage }) catch |err| {
         std.log.warn(
             "rove-js usage: {s} row propose failed: {s}; row is local-only until a later write",
             .{ tenant_id, @errorName(err) },

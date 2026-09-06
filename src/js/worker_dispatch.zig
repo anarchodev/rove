@@ -877,7 +877,7 @@ fn finalizeBatch(
             // with kv-reads that crossed an uncommitted speculative
             // overlay. The first-request readset rides as
             // `batch_readset_bytes` (slice 3d).
-            const barrier_proposed = (raft_propose.proposeWriteSet(worker, writeset, anchor_id, batch_readset_bytes) catch |perr| {
+            const barrier_proposed = (raft_propose.proposeWriteSet(worker, writeset, anchor_id, batch_readset_bytes, .{ .batch = .{ .activations = successes.items.len } }) catch |perr| {
                 std.log.warn("rove-js idiom-0 barrier propose (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
                 txn.rollback() catch |rb_err| panic_mod.invariantViolated(
                     "finalizeBatch.rollback(idiom0_barrier_fail)",
@@ -1125,6 +1125,7 @@ fn finalizeBatch(
         writeset,
         anchor_id,
         batch_readset_bytes,
+        .{ .batch = .{ .activations = successes.items.len } },
     ) catch |err| {
         std.log.warn("rove-js raft propose (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
         txn.rollback() catch |rb_err| panic_mod.invariantViolated(

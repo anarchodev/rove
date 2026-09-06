@@ -2253,10 +2253,24 @@ pub fn proposeForgetfulWrites(
     // un-durable chain state, so its staged output must gate on the chain
     // committing. `proposeBatch` would skip an empty writeset (seq 0 — no
     // propose, nothing to park on); `proposeWriteSet` always proposes.
+    // The producer identity is the fire's own log header — the record
+    // that explains the entry. A fire with no header would be an entry no
+    // record stands behind (the entry-producer invariant,
+    // `docs/architecture/consensus-and-storage.md`): refuse it rather than
+    // propose anonymously. No site passes null today.
+    const lh = log_header_opt orelse {
+        txn.rollback() catch {};
+        allocator.destroy(txn);
+        return error.MissingProducer;
+    };
+    const producer: raft_propose.Producer = .{ .activation = .{
+        .request_id = lh.request_id,
+        .source = lh.activation,
+    } };
     const prop_res = if (writeset.ops.items.len == 0)
-        raft_propose.proposeWriteSet(worker, writeset, tenant_id, rs_bytes)
+        raft_propose.proposeWriteSet(worker, writeset, tenant_id, rs_bytes, producer)
     else
-        raft_propose.proposeBatch(worker, writeset, tenant_id, rs_bytes);
+        raft_propose.proposeBatch(worker, writeset, tenant_id, rs_bytes, producer);
     const seq = (prop_res catch |err| {
         txn.rollback() catch {};
         allocator.destroy(txn);

@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Loop46, Inc.
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Worker-side propose helpers for the three writeset envelope flavors.
+//! Worker-side propose helpers — the ONE seam through which worker code
+//! reaches raft, and the enforcement point of the entry-producer
+//! invariant (`docs/architecture/consensus-and-storage.md`): every
+//! propose names WHO stands behind the entry (`Producer` — an activation,
+//! a batch of activations, or a declared engine writer).
 //!
 //! Each helper:
 //!   1. Encodes the writeset.
@@ -28,6 +32,7 @@ const bridge_mod = @import("bridge");
 // buffer size.
 const sizing = @import("rove-sizing");
 const tenant_mod = @import("rove-tenant");
+const log_mod = @import("rove-log");
 
 comptime {
     // The budgets and their partition of the entry are derived and asserted
@@ -56,6 +61,54 @@ pub const Proposed = struct {
     seq: u64 = 0,
 };
 
+/// WHO stands behind an entry — the compile-time half of the
+/// entry-producer invariant (`docs/architecture/consensus-and-storage.md`):
+/// every raft entry for a tenant is produced by a contiguous run of
+/// activations in that tenant's scope, or by an engine writer named here.
+/// The seam takes this identity instead of accepting raw bytes from any
+/// thread, so a producer that is neither an activation nor a declared
+/// engine write cannot compile — an invariant that must be remembered is
+/// one that rots.
+pub const Producer = union(enum) {
+    /// One dispatched activation in the tenant's own scope: the log
+    /// record that explains the entry.
+    activation: struct {
+        request_id: u64,
+        source: log_mod.ActivationSource,
+    },
+    /// A contiguous run of dispatched activations sharing one entry (the
+    /// H2 batch — `finalizeBatch`'s successes list, one readset per
+    /// request; activation↔entry was never 1:1).
+    batch: struct { activations: usize },
+    /// An engine writer below any binding, named with the surface it
+    /// writes. Admitted explicitly — an engine write absent from this
+    /// enum cannot propose, which is what stops the next one arriving by
+    /// omission.
+    engine: EngineWrite,
+};
+
+/// The engine writers. Each writes a reserved surface no handler
+/// observes (or a seed no handler produced), so no activation record
+/// exists for it by design.
+pub const EngineWrite = enum {
+    /// The baked starter/reset deploy: staging rows + the release stamp
+    /// on a tenant the platform is bootstrapping.
+    starter_deploy,
+    /// The `/_system/v2-kv` move door: seeds a store during a tenant
+    /// move/restore — genesis for that store, not a handler write.
+    move_seed,
+    /// Crypto-shred keyring slots (`_keys/`).
+    keyring,
+    /// The deploy-time `_config/` mirror (deployment-loader thread).
+    config_mirror,
+    /// Blob usage accounting rows.
+    blob_usage,
+
+    pub fn tag(self: EngineWrite) []const u8 {
+        return @tagName(self);
+    }
+};
+
 fn proposeEncoded(
     worker: anytype,
     writeset: *const kv_mod.WriteSet,
@@ -63,8 +116,10 @@ fn proposeEncoded(
     instance_id: []const u8,
     rs_bytes: []const u8,
     skip_empty: bool,
+    producer: Producer,
 ) !Proposed {
     if (skip_empty and writeset.ops.items.len == 0) return .{};
+    logProducer(producer, instance_id);
     const allocator = worker.allocator;
 
     // Resolve (or assign) this tenant's raft group id. Idempotent; the
@@ -101,16 +156,33 @@ pub fn proposeWriteSet(
     writeset: *const kv_mod.WriteSet,
     instance_id: []const u8,
     rs_bytes: []const u8,
+    producer: Producer,
 ) !Proposed {
-    return proposeEncoded(worker, writeset, .writeset, instance_id, rs_bytes, false);
+    return proposeEncoded(worker, writeset, .writeset, instance_id, rs_bytes, false, producer);
 }
 
-// platform.root.* writes fold into the batch multi-envelope via
-// `proposeBatch`, so there is no general standalone root-writeset
-// proposer.
-// control-plane domain-alias write). The type-2 encoder
-// `apply.encodeRootWriteSetEnvelope` is used by `proposeBatch` and
-// `acme.zig` directly.
+/// One debug line per propose naming its producer — the runtime shadow of
+/// the compile-time identity, so a log window shows WHO drove each entry.
+fn logProducer(producer: Producer, instance_id: []const u8) void {
+    switch (producer) {
+        .activation => |a| std.log.debug(
+            "rove-js propose: tenant={s} producer=activation req={x} src={s}",
+            .{ instance_id, a.request_id, @tagName(a.source) },
+        ),
+        .batch => |b| std.log.debug(
+            "rove-js propose: tenant={s} producer=batch n={d}",
+            .{ instance_id, b.activations },
+        ),
+        .engine => |e| std.log.debug(
+            "rove-js propose: tenant={s} producer=engine:{s}",
+            .{ instance_id, e.tag() },
+        ),
+    }
+}
+
+// There is no root-writeset proposer: cluster routing state is ordinary
+// envelope-0 in `__root__`'s own group, written by dispatched activations
+// (the retired type-2 slot is rejected loudly by the decoder).
 
 
 /// Propose a dynamic list of already-encoded, **non-multi** inner
@@ -137,7 +209,8 @@ pub fn proposeWriteSet(
 /// Returns the LAST propose's seq (the batch watermark). The H2
 /// dispatch path parks its txn on this seq and never exceeds the
 /// cap, so it always sees a single-propose seq.
-pub fn proposeMulti(worker: anytype, gid: u64, inner: []const []const u8) !Proposed {
+pub fn proposeMulti(worker: anytype, gid: u64, inner: []const []const u8, producer: Producer) !Proposed {
+    _ = producer; // identity is enforced at the type; the per-propose debug line is the caller's (proposeEncoded / proposeBatch).
     if (inner.len == 0) return .{};
     const allocator = worker.allocator;
     const CHUNK: usize = 255;
@@ -199,9 +272,11 @@ pub fn proposeBatch(
     writeset: *const kv_mod.WriteSet,
     anchor_id: []const u8,
     rs_bytes: []const u8,
+    producer: Producer,
 ) !Proposed {
     const allocator = worker.allocator;
     const gid = try worker.raft.registerTenant(anchor_id);
+    logProducer(producer, anchor_id);
 
     // Build each present envelope into a dynamic inner-list, then
     // hand off to proposeMulti. encodeTyped @memcpy's the payload so
@@ -236,13 +311,17 @@ pub fn proposeBatch(
     // Target envelopes carry empty rs_bytes — the readset
     // lives on the anchor envelope (inner[0]) above; one readset
     // per dispatch, not per envelope.
+    // The LAST admitted side-envelope surface: the deploy-staging scoped
+    // writes and the starter deploy, which the publish door removes by
+    // construction. When they go, this loop goes, `multi` loses its
+    // producer, and the type byte joins the retired list.
     for (worker.batch_side.targets.items) |*t| {
         if (t.ws.ops.items.len == 0) continue;
         const tb = try t.ws.encode(allocator);
         defer allocator.free(tb);
         try inner.append(allocator, try apply_mod.encodeWriteSetEnvelope(allocator, t.id, tb, ""));
     }
-    return proposeMulti(worker, gid, inner.items);
+    return proposeMulti(worker, gid, inner.items, producer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -290,4 +369,21 @@ test "proposeMulti chunking: the ordinary batch is untouched" {
     // (fewer raft entries per dispatch pass) is the reason this exists.
     var inners = [_][]const u8{ "a" ** 128, "b" ** 128, "c" ** 128 };
     try testing.expectEqual(@as(usize, 3), chunkEnd(&inners, 0, 255));
+}
+
+test "every producer variant is constructible, and the seam admits nothing else" {
+    // The acceptance shape of the propose gate: `proposeWriteSet` /
+    // `proposeBatch` take a `Producer`, so a call with neither an
+    // activation identity nor a declared engine write does not compile —
+    // this test is the readable inventory of what IS admitted. Adding an
+    // engine writer means adding an enum member above (and its doc line),
+    // never passing raw bytes around the seam.
+    const acts: Producer = .{ .activation = .{ .request_id = 1, .source = .inbound } };
+    const batch: Producer = .{ .batch = .{ .activations = 3 } };
+    inline for (@typeInfo(EngineWrite).@"enum".fields) |f| {
+        const e: Producer = .{ .engine = @field(EngineWrite, f.name) };
+        try testing.expect(e.engine.tag().len > 0);
+    }
+    try testing.expectEqual(@as(u64, 1), acts.activation.request_id);
+    try testing.expectEqual(@as(usize, 3), batch.batch.activations);
 }

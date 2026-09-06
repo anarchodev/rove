@@ -1325,6 +1325,7 @@ fn mirrorDeployConfig(
         &ws,
         slot.instance_id,
         "",
+        .{ .engine = .config_mirror },
     )) |proposed| {
         // The txn committed above (immediate-commit producer): its
         // writes are already fold-visible, so pre-ack the durabilize

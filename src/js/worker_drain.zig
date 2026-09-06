@@ -861,7 +861,12 @@ fn proposeAndParkContResume(
         return err;
     };
 
-    const seq = (raft_propose.proposeBatch(worker, writeset, tenant_id, rs_bytes) catch |err| {
+    // The producer identity is the resume's own log header (the record
+    // that explains the entry); a resume with none must not propose
+    // anonymously — the entry-producer invariant
+    // (`docs/architecture/consensus-and-storage.md`).
+    const plh = log_header_opt orelse return error.MissingProducer;
+    const seq = (raft_propose.proposeBatch(worker, writeset, tenant_id, rs_bytes, .{ .activation = .{ .request_id = plh.request_id, .source = plh.activation } }) catch |err| {
         // On propose failure: rollback txn, destroy it, free `next`'s
         // owned resources. ContDescriptor on the entity deinits
         // structurally when the entity is destroyed. Caller's catch path
