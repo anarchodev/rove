@@ -250,6 +250,87 @@ fn runOne(
     }
 }
 
+test "dispatch: scope_kv (baked) speaks the named view — user rows rooted, engine rows raw, raw writes refused" {
+    // The named-view mapping is the module's whole job (the successor of
+    // the scoped door's `SCOPE_RAW_PREFIXES` rule): a key the caller names
+    // resolves the way the target handler's own kv does — under the user
+    // root, except the engine-written rows. A mapping bug here is the
+    // writer/reader prefix-depth split, which only ever surfaces as an
+    // empty page far from the cause — so the real embedded source is
+    // exercised against real storage.
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    // Storage as it lies: a customer row under the user root, an engine
+    // row that never carried one.
+    try kv.put(uk("orders/1"), "A");
+    try kv.put("_deploy/current", "0abc");
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var qctx = try rt.newContext();
+    defer qctx.deinit();
+    const bytecode = try qctx.compileToBytecode(@embedFile("builtin_scope_kv_mjs"), "scope_kv.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(bytecode);
+
+    const run = struct {
+        fn go(dd: *Dispatcher, store: *kv_mod.KvStore, bc: []const u8, body: []const u8) !Response {
+            var txn = try store.beginTrackedImmediate();
+            errdefer txn.rollback() catch {};
+            var ws = kv_mod.WriteSet.init(testing.allocator);
+            defer ws.deinit();
+            var budget = Budget.fromNow(Budget.default_duration_ns);
+            const outcome = try dd.runOutcome(store, &txn, &ws, bc, null, null, null, null, 0, .{
+                .method = "POST",
+                .path = "/__system/scope_kv",
+                .body = body,
+                .is_system_module = true,
+                .activation = .{ .platform_dispatch = .{ .actor = .system } },
+            }, &budget);
+            try txn.commit();
+            switch (outcome) {
+                .terminal => |r| return r,
+                else => @panic("scope_kv returned a non-terminal outcome"),
+            }
+        }
+    }.go;
+
+    var resp = try run(&d, kv, bytecode,
+        \\{"ctx":{"gets":["orders/1","_deploy/current"],"prefixes":[{"prefix":""}],"pairs":[{"key":"note","value":"n"}]}}
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    // Both gets answered — the named row through the root, the engine row raw.
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"orders/1\":\"A\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"_deploy/current\":\"0abc\"") != null);
+    // The "" scan pages the USER keyspace: rows come back in the named
+    // spelling, and the engine row was never in the range.
+    try testing.expect(std.mem.indexOf(u8, resp.body, "_user/") == null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"key\":\"orders/1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"key\":\"_deploy/current\"") == null);
+    // The write landed under the user root, where the target's own handler
+    // reads it.
+    const wrote = try kv.get(uk("note"));
+    defer testing.allocator.free(wrote);
+    try testing.expectEqualStrings("n", wrote);
+
+    // A write that names an engine row is refused before anything lands.
+    var refused = try run(&d, kv, bytecode,
+        \\{"ctx":{"pairs":[{"key":"_deploy/current","value":"clobber"}]}}
+    );
+    defer refused.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 400), refused.status);
+    const cur = try kv.get("_deploy/current");
+    defer testing.allocator.free(cur);
+    try testing.expectEqualStrings("0abc", cur);
+}
+
 /// Test helper. The JS-shim `webhook.send` writes
 /// `_send/owed/{id}` as a JSON object marker (see
 /// `globals/webhook.js`). The caller owns the returned slice +

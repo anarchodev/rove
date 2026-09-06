@@ -116,6 +116,43 @@ for a laundered target and only a target list bounds it. A fetch issued from a b
 is itself `is_system_module`-gated) is engine-internal and exempt — that is how
 `webhook_fire` chains to `webhook_onresult` and `export_run` to itself.
 
+### Platform dispatch (`platform.dispatch`) and its result channel
+
+`platform.dispatch(tenant, "__system/…", {ctx, fn, actor})` is the admin-only
+verb that runs a baked module in ANOTHER tenant's scope — the replacement for
+every synchronous cross-tenant reach (`platform.root.*` writes, the scoped
+`platform.scope(t).kv.*` door). It is a webhook, not a held call: the caller
+writes a `_dispatch/owed/{id}` marker + watchdog in its OWN writeset (the
+intent and its recovery commit together), the target's activation is a new
+saga root in the target's log, and held ergonomics are composed by arming
+`after.kv` on the marker and parking.
+
+The return path is engine-sent (`worker_fire`): on the target's COMMITTED
+terminal outcome — and only then — the engine enqueues
+`__system/dispatch_result` in the origin's scope, which writes
+`_dispatch/result/{id}` (the target's terminal `{status, body}`, capped at
+`TERMINAL_CAPTURE_MAX` with truncation flagged as `overflow`) and deletes the
+owed marker in the SAME writeset — so the marker's kv wake cannot fire without
+the result being readable. The origin's wake consumes (deletes) the result
+row; the bytes are another tenant's output and carry a request body's trust
+posture. Every other exit — propose fault, throw, an unfinished continuation —
+leaves the marker standing and the watchdog re-fires, the safe direction:
+reporting completion tells another tenant it may stop retrying.
+
+A dispatch fires only on a node that HOSTS the target's raft group. A
+registry-row-only tenant (the operator-raw `createInstance` writes just the
+root `instance/{id}` row) has no group, so the fire is refused rather than run
+with writes that evaporate on the forgetful propose; the watchdog re-fires
+until a provision or move gives the tenant a group. For a hosted tenant no
+activation has touched since boot, the fire lazily opens the deploy slot the
+way inbound traffic would.
+
+`__system/scope_kv` is the dispatched successor of the scoped kv door: reads
+and named-view writes in the target's own scope, speaking the same keyspace
+the target's handler sees (user-rooted, with the engine-written
+`_deploy/`/`_release/` rows raw and write-refused — the release flip owns its
+own verb).
+
 ### The tenant door (inter-tenant fast path)
 
 When the worker is started with `REWIND_INTERNAL_FRONT=<ip>[,<ip>…]` (the

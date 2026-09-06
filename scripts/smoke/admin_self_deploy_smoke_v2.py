@@ -146,6 +146,41 @@ def main() -> int:
               "present" if found is not None
               else "absent after 20s — the writes left no account of themselves")
 
+        # 6. Scoped kv is a dispatched activation too: the browse routes
+        #    dispatch __system/scope_kv against the TARGET and park; the
+        #    response is released from the engine-carried result. The write
+        #    must land where the target's own handler reads it, the read
+        #    must come back in the named spelling, and the target's log —
+        #    not the admin's — carries the op. The target must be a
+        #    PROVISIONED tenant (group + placement): a registry-row-only
+        #    tenant (rootwrite-probe above) has no raft group, so a fire
+        #    there is refused rather than run with evaporating writes.
+        r = _curl(f"{node}/v1/instances/viadash/kv", method="PUT",
+                  headers={**auth, "Content-Type": "application/json"},
+                  data=_json.dumps({"key": "greet", "value": "hi"}))
+        check("scoped kv PUT → 200 (parked on the target activation)",
+              r.status == 200 and '"greet"' in r.body,
+              f"got {r.status} {r.body[:160]!r}")
+        r = _curl(f"{node}/v1/instances/viadash/kv?key=greet", headers=auth)
+        check("scoped kv GET reads the row back", r.status == 200 and r.body == "hi",
+              f"got {r.status} {r.body[:160]!r}")
+        r = _curl(f"{node}/v1/instances/viadash/kv?prefix=", headers=auth)
+        check("scoped kv LIST pages the named view",
+              r.status == 200 and '"key":"greet"' in r.body and "_user/" not in r.body,
+              f"got {r.status} {r.body[:200]!r}")
+        found_kv = None
+        deadline = _time.time() + 20.0
+        while _time.time() < deadline:
+            lr = c.log_get("viadash/list")
+            if lr.status == 200 and "scope_kv" in lr.body:
+                found_kv = lr
+                break
+            _time.sleep(0.5)
+        check("the scoped ops landed as activations in the TARGET's log",
+              found_kv is not None,
+              "present" if found_kv is not None
+              else "absent after 20s — the ops left no account of themselves")
+
     print()
     if failures:
         print(f"FAILURES ({len(failures)}): " + ", ".join(failures))

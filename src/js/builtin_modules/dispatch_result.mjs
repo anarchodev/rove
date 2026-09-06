@@ -26,6 +26,8 @@
 // derived, so that row is left behind as an orphan and the tick's own
 // orphan sweep collects it. Nothing durable is destroyed either way.
 const SCHED_REC_V = __rove.formats.sched;
+// `_dispatch/result/{id}` record version (`format-versioning.md` §1f).
+const DISPATCH_RESULT_V = __rove.formats.dispatchResult;
 
 // Durable-scheduler cancel, inlined over the ambient `kv`: a baked
 // `__system/*` module runs post-harden and cannot reach the private
@@ -52,7 +54,26 @@ export default function () {
 
     // Already resolved — a duplicate result, or a watchdog that fired once
     // more before this landed. Nothing to do, and saying so is not an error.
+    // Resolve-once also covers the result row below: only the FIRST result
+    // writes it, so a late duplicate cannot clobber a value the origin's
+    // wake may already have consumed and deleted.
     if (kv.get("_dispatch/owed/" + id) === null) return { status: 200 };
+
+    // The target's committed terminal outcome, engine-carried. Written in
+    // the SAME writeset as the marker delete so the origin's kv wake on the
+    // marker cannot fire without the result being readable. The bytes are
+    // another tenant's output — the reader treats them like a request body
+    // (untrusted data), and `overflow` says the engine's carry cap
+    // truncated them. The origin's wake consumes and deletes the row; a
+    // chain that dies parked leaks one bounded row; nothing re-fires it.
+    if (typeof msg.status === "number") {
+        kv.set("_dispatch/result/" + id, JSON.stringify({
+            v: DISPATCH_RESULT_V,
+            status: msg.status,
+            overflow: msg.overflow === true,
+            body: typeof msg.body === "string" ? msg.body : "",
+        }));
+    }
 
     kv.delete("_dispatch/owed/" + id);
     // Same writeset as the delete: the watchdog exists only to re-fire an
