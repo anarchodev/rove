@@ -617,6 +617,81 @@ pub const MAX_CANONICAL_ITEMS: usize = 256;
 /// wire format (decoder accepts any order), so two manifests with
 /// the same content but different encode-order would otherwise hash
 /// to different ids.
+/// The publish door's identity: `dep_id` over AUTHOR INPUTS only
+/// (`decisions.md` §11.7 — path, derived content type, source hash;
+/// bytecode is a derived artifact keyed by engine build and must never
+/// fold in). The door computes this BEFORE any byte moves — a repeated
+/// publish of an identical bundle returns the same id and uploads
+/// nothing. Packages fold as `(spec, pkg_hash)` when the door's wire
+/// grows them; the v1 wire carries files only.
+///
+/// Canonical encoding mirrors `computeDeploymentId` (sorted by path,
+/// NUL-separated fields, newline-terminated entries) so the two identity
+/// functions stay reviewable side by side while the old one retires with
+/// the JS deploy path.
+pub const SourceEntry = struct {
+    path: []const u8,
+    content_type: []const u8,
+    /// 64-hex sha256 of the file's bytes.
+    source_hex: []const u8,
+};
+
+/// The door's own bound — deliberately NOT `MAX_CANONICAL_ITEMS`, which is
+/// a compile-batch limit statics never pass through (the wrong bound to
+/// inherit for a bundle). Checked, never asserted: exceeding a fixed
+/// buffer is unsound, so the bound lives beside the buffer, failing
+/// closed (the `computeDeploymentId` overrun lesson).
+pub const MAX_DOOR_MANIFEST_FILES: usize = 4096;
+
+pub fn computeSourceDepId(entries: []const SourceEntry) Error!u64 {
+    if (entries.len > MAX_DOOR_MANIFEST_FILES) return Error.InvalidManifest;
+    var sorted_indices: [MAX_DOOR_MANIFEST_FILES]usize = undefined;
+    const n = entries.len;
+    for (0..n) |i| sorted_indices[i] = i;
+    const idx_slice = sorted_indices[0..n];
+    std.mem.sort(usize, idx_slice, entries, struct {
+        fn lt(ctx: []const SourceEntry, a: usize, b: usize) bool {
+            return std.mem.lessThan(u8, ctx[a].path, ctx[b].path);
+        }
+    }.lt);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for (idx_slice) |i| {
+        const e = entries[i];
+        hasher.update(e.path);
+        hasher.update(&.{0});
+        hasher.update(e.content_type);
+        hasher.update(&.{0});
+        hasher.update(e.source_hex);
+        hasher.update("\n");
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const id = std.mem.readInt(u64, digest[0..8], .big);
+    // 0 is the "nothing proposed / no deployment" sentinel everywhere a
+    // dep_id travels; coerce away from it the same way a gid does.
+    return if (id == 0) 1 else id;
+}
+
+test "computeSourceDepId: order-independent, input-sensitive, bytecode-free" {
+    const a1 = [_]SourceEntry{
+        .{ .path = "index.mjs", .content_type = "text/javascript; charset=utf-8", .source_hex = "aa" ** 32 },
+        .{ .path = "_static/x.css", .content_type = "text/css; charset=utf-8", .source_hex = "bb" ** 32 },
+    };
+    const a2 = [_]SourceEntry{ a1[1], a1[0] };
+    const id1 = try computeSourceDepId(&a1);
+    const id2 = try computeSourceDepId(&a2);
+    try std.testing.expectEqual(id1, id2);
+    // A changed source hash changes the identity.
+    var b = a1;
+    b[0].source_hex = "cc" ** 32;
+    try std.testing.expect(try computeSourceDepId(&b) != id1);
+    // A changed path changes the identity.
+    var c = a1;
+    c[0].path = "other.mjs";
+    try std.testing.expect(try computeSourceDepId(&c) != id1);
+}
+
 pub fn computeDeploymentId(
     entries: []const root.Entry,
     packages: []const Package,

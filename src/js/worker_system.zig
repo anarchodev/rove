@@ -140,7 +140,7 @@ pub fn tryHandleSystem(
     // (`deploy_door.zig`, and the plane note there for why a peer address
     // cannot express "private"). That separation is also what keeps the
     // tenant-scoped deploy capability a verifier swap rather than a re-plumb.
-    if (try deploy_door.tryHandleDeployDoor(server, allocator, worker, ent, sid, sess, method, sys_rest, rh, cors_origin)) {
+    if (try deploy_door.tryHandleDeployDoor(server, allocator, worker, ent, sid, sess, method, sys_rest, rh, body, cors_origin)) {
         return .answered;
     }
 

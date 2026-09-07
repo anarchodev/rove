@@ -119,6 +119,16 @@ pub const DeployThread = struct {
         /// chain. `key`=manifest key, `payload`=manifest JSON, `dep_id` for the
         /// event; `chain_tenant`/`fetch_id`/`name` route the resume.
         manifest_put,
+        /// The publish door's presence negotiation (`deploy_door.zig`): for
+        /// each hash in `door_hashes`, ask the SCOPE tenant's `file-blobs/`
+        /// store whether the blob exists; answer `200 {dep_id}` when all are
+        /// present, `409 {need:[…]}` otherwise. Completion is NATIVE — a
+        /// `DoorResult` pushed to the submitting worker's `door_reply` inbox,
+        /// matched back to the parked stream by `door_id`
+        /// (`drainDoorPending`); no JS chain, no router event. FIFO with the
+        /// deploy jobs, so a probe behind this deploy's own uploads sees
+        /// them.
+        door_probe,
     };
 
     pub const Job = struct {
@@ -175,6 +185,13 @@ pub const DeployThread = struct {
         /// the serving path reads from (#357). No default: a job cannot be
         /// enqueued without deciding it. `.token` bytes owned (see deinit).
         incarnation: tenant_mod.Incarnation,
+        // ── door_probe-only (empty/zero for other kinds) ──
+        /// The hashes to probe (unique, 64-hex). Each owned; the slice too.
+        door_hashes: [][]u8 = &.{},
+        /// The submitting worker's inbox (stable for the worker's lifetime).
+        door_reply: ?*DoorResultInbox = null,
+        /// Matches the parked entity's `DoorWait.door_id`.
+        door_id: u64 = 0,
         /// STAGE, don't link: content-address each input's source and return
         /// its hash without compiling. The first half of a deploy — a file
         /// uploaded on its own cannot be compiled, because compilation
@@ -263,9 +280,60 @@ pub const DeployThread = struct {
                 switch (job.kind) {
                     .compile_batch => self.processCompileBatch(rt_ptr, &job),
                     .manifest_put => self.processManifestPut(&job),
+                    .door_probe => self.processDoorProbe(&job),
                 }
                 freeJob(self.allocator, &job);
             }
+        }
+    }
+
+    /// The publish door's presence probe. Every outcome — including an
+    /// unopenable backend — must answer the parked stream: a dropped reply
+    /// leaves the client waiting out the full hold deadline for what is a
+    /// known failure.
+    fn processDoorProbe(self: *DeployThread, job: *Job) void {
+        const a = self.allocator;
+        const reply = job.door_reply orelse return;
+
+        const storage = tenant_mod.TenantStorage{ .id = job.tenant_id, .incarnation = job.incarnation };
+        var be = storage.openBackend(a, self.blob_cfg, "file-blobs") catch |err| {
+            std.log.warn("deploy thread: door probe: open {s}/file-blobs failed: {s}", .{ job.tenant_id, @errorName(err) });
+            pushDoorResult(a, reply, job.door_id, 503, "{\"errors\":[{\"code\":\"store_unavailable\",\"detail\":\"the blob store could not be opened\"}]}");
+            return;
+        };
+        defer be.deinit();
+
+        var need: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer need.deinit(a);
+        for (job.door_hashes) |h| {
+            const present = be.blobStore().exists(h) catch |err| {
+                std.log.warn("deploy thread: door probe: exists {s}/{s} failed: {s}", .{ job.tenant_id, h, @errorName(err) });
+                pushDoorResult(a, reply, job.door_id, 503, "{\"errors\":[{\"code\":\"store_unavailable\",\"detail\":\"presence check failed\"}]}");
+                return;
+            };
+            if (!present) need.append(a, h) catch {
+                pushDoorResult(a, reply, job.door_id, 503, "{\"errors\":[{\"code\":\"internal\",\"detail\":\"out of memory\"}]}");
+                return;
+            };
+        }
+
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(a);
+        if (need.items.len == 0) {
+            const dep_body = std.fmt.allocPrint(a, "{{\"dep_id\":\"{x:0>16}\"}}", .{job.dep_id}) catch return;
+            defer a.free(dep_body);
+            body.appendSlice(a, dep_body) catch return;
+            pushDoorResultOwned(a, reply, job.door_id, 200, &body);
+        } else {
+            body.appendSlice(a, "{\"need\":[") catch return;
+            for (need.items, 0..) |h, i| {
+                if (i > 0) body.append(a, ',') catch return;
+                body.append(a, '"') catch return;
+                body.appendSlice(a, h) catch return;
+                body.append(a, '"') catch return;
+            }
+            body.appendSlice(a, "]}") catch return;
+            pushDoorResultOwned(a, reply, job.door_id, 409, &body);
         }
     }
 
@@ -909,7 +977,72 @@ fn freeJob(allocator: std.mem.Allocator, job: *DeployThread.Job) void {
     job.incarnation.free(allocator);
     for (job.source_hashes) |h| allocator.free(h);
     if (job.source_hashes.len != 0) allocator.free(job.source_hashes);
+    for (job.door_hashes) |h| allocator.free(h);
+    if (job.door_hashes.len != 0) allocator.free(job.door_hashes);
 }
+
+/// Push a door result built from a static string. On allocation failure the
+/// reply is dropped and the parked stream answers on its hold deadline —
+/// the placeholder 504 staged at park time is the backstop.
+fn pushDoorResult(allocator: std.mem.Allocator, reply: *DoorResultInbox, door_id: u64, status: u16, body: []const u8) void {
+    const owned = allocator.dupe(u8, body) catch return;
+    reply.push(allocator, .{ .door_id = door_id, .status = status, .body = owned }) catch allocator.free(owned);
+}
+
+fn pushDoorResultOwned(allocator: std.mem.Allocator, reply: *DoorResultInbox, door_id: u64, status: u16, body: *std.ArrayList(u8)) void {
+    const owned = body.toOwnedSlice(allocator) catch return;
+    reply.push(allocator, .{ .door_id = door_id, .status = status, .body = owned }) catch allocator.free(owned);
+}
+
+/// Per-entity park record for a publish-door request parked on a door
+/// job (the manifest presence probe; the blob PUT completion joins it).
+/// Mirrors `ForwardWait`: `drainDoorPending` matches `DoorResult.door_id`
+/// back to the parked entity, and `deadline_ns` is the reap. The 504 the
+/// reap answers with is staged as a PLACEHOLDER at park time, so expiry
+/// is only a move.
+pub const DoorWait = struct {
+    /// Matches `DoorResult.door_id` (per-worker monotonic; never 0).
+    door_id: u64 = 0,
+    deadline_ns: i64 = 0,
+};
+
+/// One presence-probe answer, routed back to the worker that parked the
+/// stream. `body` is allocator-owned; ownership transfers to the drain
+/// (which hands it to the h2 response or frees it on a stale door_id).
+pub const DoorResult = struct {
+    door_id: u64,
+    status: u16,
+    body: []u8,
+};
+
+/// Per-worker mailbox for door results (mirrors `ProxyResultInbox`). The
+/// worker drains it every loop (`drainDoorPending`).
+pub const DoorResultInbox = struct {
+    mutex: std.Thread.Mutex = .{},
+    items: std.ArrayListUnmanaged(DoorResult) = .empty,
+
+    pub fn deinit(self: *DoorResultInbox, allocator: std.mem.Allocator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.items.items) |r| allocator.free(r.body);
+        self.items.deinit(allocator);
+    }
+
+    pub fn push(self: *DoorResultInbox, allocator: std.mem.Allocator, r: DoorResult) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.items.append(allocator, r);
+    }
+
+    /// Move all queued results into `out`; inbox empty after. Caller owns
+    /// each result body.
+    pub fn drainInto(self: *DoorResultInbox, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(DoorResult)) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try out.appendSlice(allocator, self.items.items);
+        self.items.clearRetainingCapacity();
+    }
+};
 
 // ── Tests ──────────────────────────────────────────────────────────
 //

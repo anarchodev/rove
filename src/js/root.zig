@@ -103,6 +103,7 @@ pub const dispatchOnce = worker.dispatchOnce;
 pub const drainRequestReceiving = worker.drainRequestReceiving;
 pub const drainRaftPending = worker.drainRaftPending;
 pub const drainForwardPending = worker.drainForwardPending;
+pub const drainDoorPending = worker.drainDoorPending;
 pub const drainSnapshotStreams = @import("v2_move.zig").drainSnapshotStreams;
 pub const drainSnapshotPushes = @import("v2_move.zig").drainSnapshotPushes;
 pub const drainBodyPending = worker.drainBodyPending;

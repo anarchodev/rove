@@ -401,6 +401,64 @@ pub fn isTestArtifactPath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "_tests/");
 }
 
+// ── path classification (the publish door's server-side derivation) ─────
+//
+// The client sends paths and hashes; the SERVER derives what a file is —
+// the classification is part of the versioned publish contract, not a
+// client convention (the door's version endpoint publishes it). This is
+// the engine's authoritative copy of the rules `cli/common.zig classify`
+// and `publish_tenant.py` transcribe; those copies retire onto this one.
+
+pub const PathClass = enum {
+    /// `*.mjs` outside the static/config trees — compiles and dispatches.
+    handler,
+    /// `_static/` + `_config/` — served (or config-mirrored) by content.
+    static,
+    /// `_tests/` (incl. `__snapshots__/`, `__fixtures__/`) — dev-repo
+    /// artifacts that never ship; a manifest naming one is refused.
+    test_artifact,
+    /// Anything else — a build input, not a shippable file. Refused
+    /// loudly rather than skipped: a client should strip these before
+    /// posting, and silence would read as "shipped".
+    unshippable,
+};
+
+pub fn classifyPath(path: []const u8) PathClass {
+    if (isTestArtifactPath(path)) return .test_artifact;
+    if (std.mem.startsWith(u8, path, "_static/") or std.mem.startsWith(u8, path, "_config/")) return .static;
+    if (std.mem.endsWith(u8, path, ".mjs")) return .handler;
+    return .unshippable;
+}
+
+/// Content type by extension — the derived half `dep_id` retains
+/// (`decisions.md` §11.7: `content_type` stays in the identity because a
+/// per-file author-supplied content type would turn it into a real input;
+/// `kind` is excluded as a pure derivation of the path).
+pub fn derivedContentType(path: []const u8) []const u8 {
+    const ext = std.fs.path.extension(path);
+    const map = .{
+        .{ ".mjs", "text/javascript; charset=utf-8" }, .{ ".js", "text/javascript; charset=utf-8" },
+        .{ ".html", "text/html; charset=utf-8" },      .{ ".css", "text/css; charset=utf-8" },
+        .{ ".json", "application/json" },              .{ ".svg", "image/svg+xml" },
+        .{ ".wasm", "application/wasm" },              .{ ".png", "image/png" },
+        .{ ".ico", "image/x-icon" },                   .{ ".woff2", "font/woff2" },
+    };
+    inline for (map) |pair| {
+        if (std.mem.eql(u8, ext, pair[0])) return pair[1];
+    }
+    return "application/octet-stream";
+}
+
+test "classifyPath: the four classes, by prefix and extension" {
+    try std.testing.expectEqual(PathClass.handler, classifyPath("index.mjs"));
+    try std.testing.expectEqual(PathClass.handler, classifyPath("v1/upload/index.mjs"));
+    try std.testing.expectEqual(PathClass.static, classifyPath("_static/app.css"));
+    try std.testing.expectEqual(PathClass.static, classifyPath("_config/oidc/rp/default.json"));
+    try std.testing.expectEqual(PathClass.test_artifact, classifyPath("_tests/t.mjs"));
+    try std.testing.expectEqual(PathClass.unshippable, classifyPath("README.md"));
+    try std.testing.expectEqual(PathClass.unshippable, classifyPath("codemirror-entry.txt"));
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;

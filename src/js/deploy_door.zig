@@ -57,6 +57,9 @@ const jwt = @import("rove-jwt");
 
 const respb = @import("response_builder.zig");
 const auth = @import("auth.zig");
+const files_mod = @import("rove-files");
+const tenant_mod = @import("rove-tenant");
+const deploy_thread_mod = @import("deploy_thread.zig");
 
 /// Oldest wire version this build accepts. Bumped only when support for an
 /// older shape is actually dropped — a self-hoster's pinned CLI reads this to
@@ -178,9 +181,12 @@ pub fn writeVersionBody(allocator: std.mem.Allocator) ![]u8 {
     var buf: std.ArrayList(u8) = .{};
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
+    // Limits a client must respect ride the handshake beside the
+    // accept-range, so it can refuse before uploading (the limits leaf
+    // audits + names the full set; the manifest bound is its first entry).
     try w.print(
-        "{{\"min\":{d},\"max\":{d},\"limits\":{{}},\"rules\":{{}}}}\n",
-        .{ WIRE_VERSION_MIN, WIRE_VERSION_MAX },
+        "{{\"min\":{d},\"max\":{d},\"limits\":{{\"manifest_max_files\":{d}}},\"rules\":{{}}}}\n",
+        .{ WIRE_VERSION_MIN, WIRE_VERSION_MAX, files_mod.manifest_json.MAX_DOOR_MANIFEST_FILES },
     );
     return buf.toOwnedSlice(allocator);
 }
@@ -284,6 +290,7 @@ pub fn tryHandleDeployDoor(
     method: []const u8,
     sys_rest: []const u8,
     rh: h2.ReqHeaders,
+    body: []const u8,
     cors_origin: ?[]const u8,
 ) !bool {
     if (!std.mem.eql(u8, sys_rest, PREFIX) and
@@ -302,8 +309,8 @@ pub fn tryHandleDeployDoor(
             try denyWith(server, allocator, ent, sid, sess, cors_origin, .not_implemented);
             return true;
         }
-        const body = try writeVersionBody(allocator);
-        try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "application/json");
+        const vbody = try writeVersionBody(allocator);
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 200, vbody, allocator, cors_origin, "application/json");
         return true;
     }
 
@@ -319,16 +326,262 @@ pub fn tryHandleDeployDoor(
         },
     }
 
-    // The manifest POST and the blob PUT answer in the door's own error shape
-    // until their leaves land, so a client never has to parse the family's bare
-    // 501 text to discover a route is not there yet.
-    if (std.mem.eql(u8, sub, "") or std.mem.startsWith(u8, sub, "blob/")) {
+    if (std.mem.eql(u8, sub, "")) {
+        if (!std.mem.eql(u8, method, "POST")) {
+            try denyWith(server, allocator, ent, sid, sess, cors_origin, .not_implemented);
+            return true;
+        }
+        try handleManifestPost(server, allocator, worker, ent, sid, sess, body, cors_origin);
+        return true;
+    }
+
+    // The blob PUT answers in the door's own error shape until its leaf
+    // lands, so a client never has to parse the family's bare 501 text to
+    // discover the route is not there yet.
+    if (std.mem.startsWith(u8, sub, "blob/")) {
         try denyWith(server, allocator, ent, sid, sess, cors_origin, .not_implemented);
         return true;
     }
 
     try denyWith(server, allocator, ent, sid, sess, cors_origin, .not_implemented);
     return true;
+}
+
+// ── the manifest POST — intake, validation, negotiation ─────────────────
+//
+// Parse + validate synchronously (a manifest is a few KB of JSON), compute
+// the identity, then hand the S3 presence probe to the worker's
+// DeployThread and PARK the stream — the worker poll loop must never wait
+// on the object store. The park mirrors `ForwardWait`/`forward_pending`:
+// a placeholder 504 is staged before the move, so the deadline reap is
+// only a move, and the probe's `DoorResult` overwrites it on arrival
+// (`drainDoorPending`).
+
+/// How long a parked manifest POST waits for its probe before the staged
+/// 504 ships. Generous: the probe is one `exists` HEAD per unique hash,
+/// FIFO behind any in-flight deploy work on the same thread.
+pub const DOOR_HOLD_NS: i64 = 30 * std.time.ns_per_s;
+
+const ManifestIssue = struct {
+    code: []const u8,
+    path: ?[]const u8 = null,
+    detail: []const u8,
+};
+
+fn writeIssuesBody(allocator: std.mem.Allocator, issues: []const ManifestIssue) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"errors\":[");
+    for (issues, 0..) |it, i| {
+        if (i > 0) try out.append(allocator, ',');
+        try out.appendSlice(allocator, "{\"code\":\"");
+        try out.appendSlice(allocator, it.code);
+        try out.appendSlice(allocator, "\"");
+        if (it.path) |pp| {
+            try out.appendSlice(allocator, ",\"path\":\"");
+            for (pp) |ch| {
+                // Paths passed validatePath are JSON-safe already; anything
+                // reported BEFORE validation escapes the two structural bytes.
+                if (ch == '"' or ch == '\\') try out.append(allocator, '\\');
+                try out.append(allocator, ch);
+            }
+            try out.appendSlice(allocator, "\"");
+        }
+        try out.appendSlice(allocator, ",\"detail\":\"");
+        try out.appendSlice(allocator, it.detail);
+        try out.appendSlice(allocator, "\"}");
+    }
+    try out.appendSlice(allocator, "]}");
+    return out.toOwnedSlice(allocator);
+}
+
+fn answerIssues(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    cors_origin: ?[]const u8,
+    status: u16,
+    issues: []const ManifestIssue,
+) !void {
+    const body_out = try writeIssuesBody(allocator, issues);
+    try respb.setSystemResponseOwned(server, ent, sid, sess, status, body_out, allocator, cors_origin, "application/json");
+}
+
+const WireManifest = struct {
+    v: u32 = 0,
+    tenant: []const u8 = "",
+    client: []const u8 = "",
+    files: []const WireFile = &.{},
+};
+const WireFile = struct {
+    path: []const u8 = "",
+    hash: []const u8 = "",
+};
+
+fn isHex64(h: []const u8) bool {
+    if (h.len != 64) return false;
+    for (h) |ch| {
+        const ok = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn handleManifestPost(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    body: []const u8,
+    cors_origin: ?[]const u8,
+) !void {
+    var parsed = std.json.parseFromSlice(WireManifest, allocator, body, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        try answerIssues(server, allocator, ent, sid, sess, cors_origin, 400, &.{
+            .{ .code = "bad_manifest", .detail = "the body is not a manifest object" },
+        });
+        return;
+    };
+    defer parsed.deinit();
+    const m = parsed.value;
+
+    if (!versionSupported(m.v)) {
+        try answerIssues(server, allocator, ent, sid, sess, cors_origin, 400, &.{
+            .{ .code = "unsupported_version", .detail = "declare v within the handshake's accept-range" },
+        });
+        return;
+    }
+
+    // Validate EVERYTHING before answering anything — a client bug rarely
+    // produces exactly one violation, and fixing them a round-trip at a
+    // time is the wrong loop.
+    var issues: std.ArrayListUnmanaged(ManifestIssue) = .empty;
+    defer issues.deinit(allocator);
+
+    if (m.files.len == 0) {
+        try issues.append(allocator, .{ .code = "empty_manifest", .detail = "a bundle declares at least one file" });
+    }
+    if (m.files.len > files_mod.manifest_json.MAX_DOOR_MANIFEST_FILES) {
+        try answerIssues(server, allocator, ent, sid, sess, cors_origin, 400, &.{
+            .{ .code = "too_many_files", .detail = "the bundle exceeds the declared manifest_max_files limit" },
+        });
+        return;
+    }
+    for (m.files, 0..) |f, i| {
+        files_mod.validatePath(f.path) catch {
+            try issues.append(allocator, .{ .code = "bad_path", .path = f.path, .detail = "path fails the bundle path rules" });
+            continue;
+        };
+        switch (files_mod.classifyPath(f.path)) {
+            .handler, .static => {},
+            .test_artifact => try issues.append(allocator, .{ .code = "test_artifact_path", .path = f.path, .detail = "_tests/ never ships" }),
+            .unshippable => try issues.append(allocator, .{ .code = "unshippable_path", .path = f.path, .detail = "a build input, not a shippable file — strip it before posting" }),
+        }
+        if (!isHex64(f.hash)) {
+            try issues.append(allocator, .{ .code = "bad_hash", .path = f.path, .detail = "hash must be 64 lowercase hex" });
+        }
+        for (m.files[0..i]) |prev| {
+            if (std.mem.eql(u8, prev.path, f.path)) {
+                try issues.append(allocator, .{ .code = "duplicate_path", .path = f.path, .detail = "a path appears twice" });
+                break;
+            }
+        }
+    }
+    if (issues.items.len > 0) {
+        try answerIssues(server, allocator, ent, sid, sess, cors_origin, 400, issues.items);
+        return;
+    }
+
+    // The target must be a real, deployable tenant — the door stages into
+    // ITS content-addressed store, under its live storage incarnation.
+    // `__root__` resolves in the registry but takes no deployments.
+    if (std.mem.eql(u8, m.tenant, tenant_mod.ROOT_INSTANCE_ID)) {
+        try answerIssues(server, allocator, ent, sid, sess, cors_origin, 400, &.{
+            .{ .code = "bad_tenant", .detail = "the cluster root takes no deployments" },
+        });
+        return;
+    }
+    const inst = (worker.node.tenant.getInstance(m.tenant) catch null) orelse {
+        try answerIssues(server, allocator, ent, sid, sess, cors_origin, 404, &.{
+            .{ .code = "unknown_tenant", .detail = "no such instance" },
+        });
+        return;
+    };
+
+    // Identity, before a byte moves: author inputs only (the source-identity
+    // rule, `decisions.md` §11.7) with the server-derived content type.
+    var entries = try allocator.alloc(files_mod.manifest_json.SourceEntry, m.files.len);
+    defer allocator.free(entries);
+    for (m.files, 0..) |f, i| {
+        entries[i] = .{
+            .path = f.path,
+            .content_type = files_mod.derivedContentType(f.path),
+            .source_hex = f.hash,
+        };
+    }
+    const dep_id = files_mod.manifest_json.computeSourceDepId(entries) catch {
+        try answerIssues(server, allocator, ent, sid, sess, cors_origin, 400, &.{
+            .{ .code = "too_many_files", .detail = "the bundle exceeds the declared manifest_max_files limit" },
+        });
+        return;
+    };
+
+    const dt = worker.deploy_thread orelse {
+        try answerIssues(server, allocator, ent, sid, sess, cors_origin, 503, &.{
+            .{ .code = "store_unavailable", .detail = "no deploy thread on this worker" },
+        });
+        return;
+    };
+
+    // Unique hashes, owned by the job.
+    var hashes: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (hashes.items) |h| allocator.free(h);
+        hashes.deinit(allocator);
+    }
+    outer: for (m.files) |f| {
+        for (hashes.items) |h| if (std.mem.eql(u8, h, f.hash)) continue :outer;
+        try hashes.append(allocator, try allocator.dupe(u8, f.hash));
+    }
+
+    const door_id = worker.nextDoorId();
+
+    // Stage the deadline answer FIRST: once parked, the only exits are the
+    // probe's overwrite or this 504 shipping on the reap — both just moves.
+    const timeout_body = try writeIssuesBody(allocator, &.{
+        .{ .code = "door_timeout", .detail = "the presence probe did not answer within the hold deadline" },
+    });
+    const resp_hdrs = try respb.buildSystemRespHeaders(allocator, cors_origin, false, "application/json");
+    try respb.stageResponse(server, ent, sid, sess, 504, resp_hdrs, timeout_body.ptr, @intCast(timeout_body.len));
+    try server.reg.set(ent, server.coll(.request_out), deploy_thread_mod.DoorWait, .{
+        .door_id = door_id,
+        .deadline_ns = @as(i64, @intCast(std.time.nanoTimestamp())) + DOOR_HOLD_NS,
+    });
+
+    dt.enqueue(.{
+        .compile_id = 0,
+        .kind = .door_probe,
+        .tenant_id = try allocator.dupe(u8, m.tenant),
+        .incarnation = try inst.storage.incarnation.dupe(allocator),
+        .door_hashes = try hashes.toOwnedSlice(allocator),
+        .door_reply = &worker.door_inbox,
+        .door_id = door_id,
+        .dep_id = dep_id,
+    }) catch {
+        // The park is not in place yet (the move below never ran), so the
+        // staged components just get overwritten by this inline answer.
+        try answerIssues(server, allocator, ent, sid, sess, cors_origin, 503, &.{
+            .{ .code = "store_unavailable", .detail = "the deploy thread refused the probe" },
+        });
+        return;
+    };
+
+    try server.reg.move(ent, server.coll(.request_out), worker.door_pending);
 }
 
 fn denyWith(
@@ -419,4 +672,25 @@ test "a worker config that says nothing gets the public plane" {
     // refuses root there.
     const Cfg = struct { plane: Plane = .public };
     try testing.expectEqual(Plane.public, (Cfg{}).plane);
+}
+
+test "manifest issues serialize as a list with path escaping" {
+    const testing = std.testing;
+    const body_out = try writeIssuesBody(testing.allocator, &.{
+        .{ .code = "bad_path", .path = "a\"b", .detail = "path fails the bundle path rules" },
+        .{ .code = "empty_manifest", .detail = "a bundle declares at least one file" },
+    });
+    defer testing.allocator.free(body_out);
+    try testing.expect(std.mem.startsWith(u8, body_out, "{\"errors\":["));
+    try testing.expect(std.mem.indexOf(u8, body_out, "a\\\"b") != null);
+    try testing.expect(std.mem.indexOf(u8, body_out, "empty_manifest") != null);
+    try testing.expect(std.mem.indexOf(u8, body_out, "},{") != null);
+}
+
+test "the wire hash is 64 lowercase hex, nothing else" {
+    const testing = std.testing;
+    try testing.expect(isHex64("ab" ** 32));
+    try testing.expect(!isHex64("AB" ** 32));
+    try testing.expect(!isHex64("ab" ** 31));
+    try testing.expect(!isHex64("zz" ** 32));
 }
