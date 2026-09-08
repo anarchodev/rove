@@ -28,23 +28,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import V2Cluster, rpc_wrap, PUBLIC_SUFFIX  # noqa: E402
 
-UP_SRC = 'export function handler() { return "upstream-body\\n"; }\n'
+UP_SRC = 'export function handler(_a) { return "upstream-body\\n"; }\n'
 
 HR_SRC = """\
 export function done1() {
   return { ok: true, hops: 1, marker: "held-terminal-1", upstream: request.status };
 }
-export function mid() {
+export function mid({ after, next }) {
   const u = (request.ctx && request.ctx.u) || "";
   after.fetch(u, { method: "GET", on: "done2", ctx: { u } });
   return next();
 }
-export function done2() {
+export function done2({ kv }) {
   kv.set("held/last", String(Date.now()));
   response.headers = { "x-held-terminal": "yes" };
   return { ok: true, hops: 2, marker: "held-terminal-2", upstream: request.status };
 }
-export default function () {
+export default function ({ after, next }) {
   const q = new URLSearchParams(request.query || "");
   const u = q.get("u") || "";
   if (request.path === "/plain") return { ok: true, hops: 0, marker: "held-terminal-0" };

@@ -44,7 +44,7 @@ from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 
 # acme's webhook-firing handler + on_result callback, verbatim from the demo
 # tenant (examples/loop46-demo-tenants/acme/cbfire/index.mjs + cbresult.mjs).
-CBFIRE_SRC = '''export function fire(url, tag) {
+CBFIRE_SRC = '''export function fire({ kv, webhook }, url, tag) {
     const id = webhook.send(url, {
         method: "POST",
         body: "ping",
@@ -57,7 +57,7 @@ CBFIRE_SRC = '''export function fire(url, tag) {
     return { id: id };
 }'''
 
-CBRESULT_SRC = '''export default function () {
+CBRESULT_SRC = '''export default function ({ kv }) {
     // Unified flattened on_result surface (handler-shape §7, Endpoint A):
     // response on request.body/.status (2xx = delivered; no request.ok),
     // echoed context IS request.ctx, delivery metadata on
@@ -73,12 +73,12 @@ CBRESULT_SRC = '''export default function () {
     kv.set("cb/result/" + a.id, JSON.stringify(record));
 }'''
 
-ACME_INDEX_SRC = 'export function handler() { return "acme-ready"; }\n'
+ACME_INDEX_SRC = 'export function handler(_a) { return "acme-ready"; }\n'
 
 # wb echo tenant — records receipt (path + the platform-stamped schedule
 # headers) to its own kv so the smoke can assert delivery + header stamping,
 # then echoes `echo:<body>` so cbresult sees a known body.
-WB_SRC = r"""export default function () {
+WB_SRC = r"""export default function ({ kv }) {
     const id = request.headers["x-rove-schedule-id"] || "<none>";
     const ver = request.headers["x-rove-schedule-version"] || "<none>";
     const body = request.text || "";

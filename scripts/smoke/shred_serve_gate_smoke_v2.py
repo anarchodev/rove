@@ -54,7 +54,7 @@ MARKER = "sardine-serve-gate-7c41"
 # destructure the caps once, route on ?fn= internally. Same wire as every
 # rpc_wrap smoke.
 SRC = (
-    'export default function ({ shredKey }) {\n'
+    'export default function ({ kv, shredKey }) {\n'
     '  const fn = ((request.query || "").match(/fn=([^&]+)/) || [])[1];\n'
     '  const fns = {\n'
     '    seal() {\n'
@@ -79,7 +79,7 @@ SRC = (
 
 # Reads ONE record back through the privileged door — the gate under test.
 # Self-tenant, so the engine pins the read to this handler's own id.
-PROBE_SRC = r"""export default function () {
+PROBE_SRC = r"""export default function ({ after, next }) {
     const rid = new URLSearchParams(request.query || "").get("rid") || "";
     after.fetch("http://rewind-logs.internal/v1/" + request.tenant + "/show/" + rid);
     return next();
@@ -93,13 +93,13 @@ export function onFetchResult() {
 # A STREAMED read of the same door. The gate rewrites a whole response
 # body, which a streamed transfer never has in hand, so the door refuses
 # rather than handing the chunks over unopened.
-STREAM_SRC = r"""export default function () {
+STREAM_SRC = r"""export default function ({ after, next }) {
     const rid = new URLSearchParams(request.query || "").get("rid") || "";
     after.fetch("http://rewind-logs.internal/v1/" + request.tenant + "/show/" + rid,
                 { stream: true });
     return next();
 }
-export function onFetchChunk() { return next(); }
+export function onFetchChunk({ next }) { return next(); }
 export function onFetchDone() {
     response.status = 200;
     return "status:" + (request.status || 0) + "\n";

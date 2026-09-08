@@ -38,7 +38,7 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 # to __admin__ for the success path and to a non-admin tenant for the gate.
 def handler_src(scope: str) -> str:
     return (
-        "export default function () {\n"
+        "export default function ({ next, platform }) {\n"
         "  platform.compile(\n"
         '    [{ path: "hello.mjs", source: "export default () => \'hi\';\\n" }],\n'
         f'    {{ scope: {json.dumps(scope)}, on: "onCompiled" }}\n'

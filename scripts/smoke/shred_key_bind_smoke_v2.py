@@ -53,7 +53,7 @@ SRC = (
     # object to named functions, and `shredKey` is a capability on it —
     # rove#849): destructure the caps once, route on ?fn= internally. Same
     # wire as every rpc_wrap smoke.
-    'export default function ({ shredKey }) {\n'
+    'export default function ({ kv, shredKey }) {\n'
     '  const q = request.query || "";\n'
     '  const fn = (q.match(/fn=([^&]+)/) || [])[1];\n'
     '  const qid = () => (q.match(/id=([^&]+)/) || [])[1] || "u_default";\n'

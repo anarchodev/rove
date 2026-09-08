@@ -42,12 +42,12 @@ TENANT = "writer"
 # A real WRITE: the 421 not-leader refusal is what a write earns on a follower,
 # and it is the 421 → re-aim path that this is about.
 SRC = """
-export function put() {
+export function put({ kv }) {
   const n = (parseInt(kv.get("n") || "0", 10) || 0) + 1;
   kv.set("n", String(n));
   return { n: n };
 }
-export function get() {
+export function get({ kv }) {
   return { n: parseInt(kv.get("n") || "0", 10) || 0 };
 }
 """

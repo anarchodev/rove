@@ -393,7 +393,7 @@ def main() -> int:
         # a working-tree change (--source-dir) surfaces a tape divergence.
         rep_dir = Path(tempfile.mkdtemp(prefix="replayapp"))
         (rep_dir / "index.mjs").write_text(
-            "export default function(){\n"
+            "export default function({ kv }){\n"
             "  const n = kv.get('hits');\n"
             "  const cur = n === null ? 0 : (+n);\n"
             "  kv.set('hits', String(cur + 1));\n"
@@ -481,7 +481,7 @@ def main() -> int:
             # — the "does my change still behave?" lever.
             local = Path(tempfile.mkdtemp(prefix="local"))
             (local / "index.mjs").write_text(
-                "export default function(){ const x = kv.get('not-on-tape');"
+                "export default function({ kv }){ const x = kv.get('not-on-tape');"
                 " response.status = 599; return 'x=' + x; }\n")
             r = rw("replay", str(fixture), "--source-dir", str(local))
             try:

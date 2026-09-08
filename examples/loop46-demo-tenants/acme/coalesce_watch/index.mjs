@@ -8,7 +8,7 @@
 //
 // Pairs with `acme/coalesce_burst` (writes N keys under `burst/` in one
 // txn → all N events broadcast → ONE fired-arm stamp on the watcher).
-export default function () {
+export default function ({ after, next, stream }) {
     response.status = 200;
     response.headers = {
         "Content-Type": "text/event-stream",
@@ -21,7 +21,7 @@ export default function () {
 }
 
 // One status frame per wake echoing the batch shape.
-export function onWake() {
+export function onWake({ after, next, stream }) {
     const a = request.activation;
     stream.start();
     const prefixes = a.wakes.filter((w) => w.kind === "kv").map((w) => w.prefix).join(",");

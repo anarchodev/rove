@@ -49,7 +49,7 @@ TENANT = "wsorder"
 HANDLER_SRC = """\
 export default function () { return "ready"; }
 
-export function onMessage() {
+export function onMessage({ kv, next, stream }) {
   const { opcode, data } = request.activation;
   if (data.startsWith("persist:")) {
     const v = data.slice(8);
@@ -66,7 +66,7 @@ export function onMessage() {
   return next();
 }
 
-export function onDisconnect() {
+export function onDisconnect({ kv }) {
   // Read-only onDisconnect (no writes) — exercises the disconnect-path
   // commit while a frame's propose may still be in flight.
   kv.get("ord/last");

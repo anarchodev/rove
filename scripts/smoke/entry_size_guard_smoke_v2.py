@@ -45,7 +45,7 @@ from smoke_lib_v2 import V2Cluster, metric_counter  # noqa: E402
 KV_VAL_MAX = 384 * 1024
 
 SRC = """
-export default function () {
+export default function ({ after, kv, next }) {
   const p = new URLSearchParams(request.query || "");
   const op = p.get("op");
   if (op === "one") {
@@ -105,7 +105,7 @@ export default function () {
   return "ok";
 }
 
-export function onMore() {
+export function onMore({ after, kv, next }) {
   const from = (request.ctx && request.ctx.from) || 0;
   for (let i = from; i < from + 3; i++) kv.set("chain/" + i, "z".repeat(100 * 1024));
   if (from + 3 >= 9) return "chained " + (from + 3);

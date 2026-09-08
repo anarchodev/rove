@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib_v2 import V2Cluster  # noqa: E402
 
 ONCHUNK_SRC = """
-export function onChunk() {
+export function onChunk({ kv, next }) {
   const ctx = request.ctx || { len: 0, n: 0, rw: true };
   // Per-upload kv counter (the x-upl header names the upload) — each
   // fire reads the previous fire's committed write, so `rw` proves

@@ -43,7 +43,7 @@ ROOM = "r1"
 PREFIX = f"msg/{ROOM}/"
 
 HOLD_SRC = """\
-export default function () {
+export default function ({ after, kv, next }) {
     kv.set("room/r1/lastwake", "none");
     after.ms(1200, { on: "onTimeout" });   // timer arm → onTimeout
     after.kv("msg/r1/", { on: "onMsg" });  // kv arm → onMsg
@@ -52,7 +52,7 @@ export default function () {
 
 // The kv arm's own export. Records which prefix fired, then re-holds
 // WITHOUT re-arming — the timer arm rides untouched.
-export function onMsg() {
+export function onMsg({ kv, next }) {
     const w = request.activation.wakes;
     kv.set("room/r1/lastwake", "onMsg:" + ((w[0] && w[0].prefix) || "?"));
     return next({ room: "r1" });
@@ -60,21 +60,21 @@ export function onMsg() {
 
 // The timer arm's own export. Terminal — resolves the held GET. If per-arm
 // routing is broken the timer routes here to onMsg instead and this never runs.
-export function onTimeout() {
+export function onTimeout({ kv }) {
     response.status = 200;
     return "onTimeout:" + (kv.get("room/r1/lastwake") || "?");
 }
 """
 
 POKE_SRC = """\
-export default function () {
+export default function ({ kv }) {
     kv.set("msg/r1/x", "hello");   // fires the after.kv("msg/r1/") arm
     response.status = 204;
     return "";
 }
 """
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 
 def main() -> int:

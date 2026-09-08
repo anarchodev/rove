@@ -30,15 +30,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 
 # Upstream: return an exact status per path. `response.status = N; return body`.
-UP_ROOT = 'export function handler() { return "up-ready"; }\n'
-UP_OK = 'export default function () { response.status = 200; return "OK"; }\n'
+UP_ROOT = 'export function handler(_a) { return "up-ready"; }\n'
+UP_OK = 'export default function ({ after, next }) { response.status = 200; return "OK"; }\n'
 UP_ERR = 'export default function () { response.status = 500; return "boom"; }\n'
 UP_REDIR = ('export default function () { response.status = 302; '
             'response.headers = { location: "/ok" }; return ""; }\n')
 
 # Client: buffered on.fetch, echo the flattened result surface.
-CLI_ROOT = 'export function handler() { return "cli-ready"; }\n'
-PROBE_SRC = r"""export default function () {
+CLI_ROOT = 'export function handler(_a) { return "cli-ready"; }\n'
+PROBE_SRC = r"""export default function ({ after, next }) {
     const url = new URLSearchParams(request.query || "").get("url");
     after.fetch(url);
     return next();

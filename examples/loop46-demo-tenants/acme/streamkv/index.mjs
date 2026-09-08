@@ -10,7 +10,7 @@
 // Proves: stream.start/write + on.kv + next() → finishResponse bridge →
 // stream pipeline (stream_response_in → stream_data_out) →
 // serviceParkedStreams → resumeStream → (re-dispatch) → bridge again.
-export default function () {
+export default function ({ after, next, stream }) {
     // The head is the ambient response.* (no descriptor head).
     response.status = 200;
     response.headers = {
@@ -28,7 +28,7 @@ export default function () {
 // one frame per new entry, then re-arm. A zero-frame wake (woke, nothing
 // new past the cursor) re-holds via the plain `next()` below — no
 // `stream.start()` ritual needed to stay parked.
-export function onWake() {
+export function onWake({ after, kv, next, stream }) {
     const cursor = request.ctx ? request.ctx.cursor : null;
     const rows = kv.prefix("streamkv/in/", cursor);
     for (const r of rows) {

@@ -45,7 +45,7 @@ TENANT = "kvbudget"
 # in one writing activation did not.
 SEED_BYTES = 300_000
 SRC = """
-export default function () {
+export default function ({ kv }) {
   const p = new URLSearchParams(request.query || "");
   const op = p.get("op");
   if (op === "seed") {

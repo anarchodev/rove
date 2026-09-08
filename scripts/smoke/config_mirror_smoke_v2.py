@@ -57,7 +57,7 @@ CONFIG_KEY = "_config/oauth/google"
 # The `/cfg` probe handler. `config.get` is the only door to deploy-time
 # config (rove#830): the raw `kv.get("_config/…")` spelling reroots into the
 # handler's own keyspace under the rooted kv, so it can never see config.
-CFG_SRC = r"""export default function () {
+CFG_SRC = r"""export default function ({ config }) {
   const raw = config.get("oauth/google");
   if (raw == null) {
     response.status = 404;
@@ -69,7 +69,7 @@ CFG_SRC = r"""export default function () {
 }
 """
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 
 def main() -> int:

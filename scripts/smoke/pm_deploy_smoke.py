@@ -55,12 +55,12 @@ HANDLER_SRC = (
     'import { jwtv } from "@rewind/oidc";\n'
     'import { v } from "@rewind/jwt";\n'
     'import { combined } from "@acme/multi";\n'
-    'export function handler() { return "app=" + v + " oidc=" + jwtv + " multi=" + combined + "\\n"; }\n'
+    'export function handler(_a) { return "app=" + v + " oidc=" + jwtv + " multi=" + combined + "\\n"; }\n'
 )
 
 BAD_HANDLER_SRC = (
     'import { x } from "@rewind/undeclared";\n'
-    'export function handler() { return String(x); }\n'
+    'export function handler(_a) { return String(x); }\n'
 )
 
 # PM P2: a package whose source names the privileged surface must be

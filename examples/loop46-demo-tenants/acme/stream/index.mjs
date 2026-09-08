@@ -4,7 +4,7 @@
 // ship as one concatenated body (the terminal-close path prepends the
 // buffered chunks to the terminal body). The smoke verifies all three
 // chunks land in the body and the header is set.
-export default function () {
+export default function ({ stream }) {
     response.status = 200;
     response.headers = {
         "Content-Type": "text/event-stream",

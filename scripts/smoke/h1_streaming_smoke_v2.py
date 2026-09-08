@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 ONCHUNK_SRC = """
-export function onChunk() {
+export function onChunk({ kv, next }) {
   const ctx = request.ctx || { len: 0, n: 0, rw: true };
   const key = "upl/" + (request.headers["x-upl"] || "k");
   const prev = kv.get(key);
@@ -84,7 +84,7 @@ export default function () {
 }
 """
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 def h1_curl(url: str, host: str, *, data: bytes | None = None,
             headers: dict | None = None, timeout: int = 90):

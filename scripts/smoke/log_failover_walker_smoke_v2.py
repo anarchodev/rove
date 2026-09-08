@@ -69,8 +69,8 @@ os.environ["REWIND_LOG_FLUSH_RECORDS"] = str(RECORD_THRESHOLD)
 from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, _curl  # noqa: E402
 
 HANDLER_SRC = """
-export function ready() { return "ok"; }
-export function walk(request) {
+export function ready(_a) { return "ok"; }
+export function walk({ kv }, request) {
   kv.set("walker/mark", "1");
   console.log("walker-target-hit");
   return "written";

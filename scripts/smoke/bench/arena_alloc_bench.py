@@ -45,7 +45,7 @@ CLIENTS = int(sys.argv[2]) if len(sys.argv) > 2 else 10
 STREAMS = int(sys.argv[3]) if len(sys.argv) > 3 else 10
 
 SRC = """
-export default function () {
+export default function ({ kv }) {
   if (request.path === "/read") {
     const v = kv.get("greeting");   // a miss is fine: the read path is what runs
     return { greeting: v ?? null, n: 1 };

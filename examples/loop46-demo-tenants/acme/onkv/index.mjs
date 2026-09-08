@@ -16,7 +16,7 @@
 //
 // The held client request blocks until a SECOND request writes
 // `<prefix>flag`, then returns "woke:<value>".
-export default function () {
+export default function ({ after, kv, next }) {
     const req = request.text ? request.json : {};
     const prefix = req.prefix || "onkv/";
     // Read the watched key so read_version baselines AFTER this read —
@@ -30,7 +30,7 @@ export default function () {
 // (Endpoint A) — `onWake` re-reads authoritative kv state ("go look"
 // edge wake) and returns a terminal flushed to the held socket,
 // completing the one synchronous request.
-export function onWake() {
+export function onWake({ kv }) {
     const ctx = request.ctx || {};
     const v = kv.get(ctx.prefix + "flag");
     return "woke:" + (v ?? "none");

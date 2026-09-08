@@ -49,7 +49,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET  # noqa: E402
 
 # POST {key,value} → replicated kv.set; GET ?key=K → "value:" + kv.get(K).
 HANDLER_SRC = """\
-export function handler() {
+export function handler({ kv }) {
     if (request.method === "POST") {
         const b = JSON.parse(request.text || "{}");
         kv.set(b.key, b.value);

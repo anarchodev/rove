@@ -1,6 +1,6 @@
 export default function () { return "ready"; }
 
-export function onMessage() {
+export function onMessage({ kv, next, stream }) {
   const { opcode, data } = request.activation;
   if (opcode === 2) {              // binary → echo bytes back verbatim
     stream.write(data);
@@ -31,7 +31,7 @@ export function onMessage() {
   return next();
 }
 
-export function onDisconnect() {
+export function onDisconnect({ kv }) {
   const tag = kv.get("ws/tag") ?? "none";
   kv.set("ws/disc_" + tag, "1");
 }

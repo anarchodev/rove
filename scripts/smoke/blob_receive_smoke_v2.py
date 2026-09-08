@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 RECEIVE_SRC = """\
-export function onHeaders() {
+export function onHeaders({ blob, next }) {
     if (!request.headers["x-upload-auth"]) {
         response.status = 401;
         return "unauthorized";
@@ -50,7 +50,7 @@ export function onHeaders() {
     return next();
 }
 
-export function onStored() {
+export function onStored({ kv }) {
     if (request.activation.status < 200 || request.activation.status >= 300) {
         response.status = 502;
         return "store failed";
@@ -62,7 +62,7 @@ export function onStored() {
 
 # blob.receive from a buffered (non-onHeaders) activation must throw.
 MISUSE_SRC = """\
-export default function () {
+export default function ({ blob }) {
     blob.receive({ on: "onStored" });
     return "should not reach";
 }
@@ -71,7 +71,7 @@ export default function () {
 # Reader: blob.get the stored hash, answer with the fetched bytes'
 # sha256 + length so the smoke can verify the round trip at any size.
 READER_SRC = """\
-export default function () {
+export default function ({ blob, next }) {
     const hash = (request.query || "").replace("hash=", "");
     blob.get(hash, { on: "onBlob" });
     return next();
@@ -86,7 +86,7 @@ export function onBlob() {
 }
 """
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 
 def main() -> int:

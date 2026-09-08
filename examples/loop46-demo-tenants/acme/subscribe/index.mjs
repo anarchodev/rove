@@ -8,7 +8,7 @@
 //
 // The smoke later issues `POST /cancel_subscribe?id=<id>` to stop
 // the subscription cleanly.
-export default function () {
+export default function ({ http }) {
     const q = request.query || "";
     let url = null;
     for (const pair of q.split("&")) {

@@ -46,19 +46,19 @@ export default function () {
 # A target module with BOTH a default and a named `weekly` export; each
 # records its own fire so the smoke can tell which one the wake hit.
 # Underscore keys (no slash) so admin_kv_get's raw query read works.
-JOBS_SRC = r"""function bump(which) {
+JOBS_SRC = r"""function bump(kv, which) {
     const k = "fired_" + which;
     kv.set(k, String(parseInt(kv.get(k) || "0", 10) + 1));
     kv.set("last_export", which);
 }
-export default function () {
+export default function ({ kv }) {
     if (request.activation.kind !== "durable_wake") return { status: 200 };
-    bump("default");
+    bump(kv, "default");
     return { status: 200 };
 }
-export function weekly() {
+export function weekly({ kv }) {
     if (request.activation.kind !== "durable_wake") return { status: 200 };
-    bump("weekly");
+    bump(kv, "weekly");
     return { status: 200 };
 }
 """

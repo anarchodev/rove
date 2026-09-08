@@ -46,7 +46,7 @@ from smoke_lib_v2 import (  # noqa: E402
 )
 
 TENANT = "tobedeleted"
-SRC = 'export function handler() { return "alive\\n"; }\n'
+SRC = 'export function handler(_a) { return "alive\\n"; }\n'
 
 
 def main() -> int:
@@ -141,7 +141,7 @@ def main() -> int:
         r = cp("provision", {"tenant": TENANT})
         check("re-provision the same name → 200", r.status == 200, f"got {r.status} {r.body!r}")
         dep2 = c.deploy_handlers(TENANT, {"index.mjs": rpc_wrap(
-            'export function handler() { kv.set("reborn_key", "reborn_val");'
+            'export function handler({ kv }) { kv.set("reborn_key", "reborn_val");'
             ' return "reborn\\n"; }\n')})
         check("deploy to the reborn tenant → dep_id", bool(dep2), f"dep_id={dep2}")
         r = c.wait_for_handler(TENANT, "/?fn=handler", want_body="reborn")
@@ -179,7 +179,7 @@ def main() -> int:
         check("provision the same name → 200 (mints a fresh incarnation)",
               r.status == 200, f"got {r.status} {r.body!r}")
         dep = c.deploy_handlers(T2, {"index.mjs": rpc_wrap(
-            'export function handler() { kv.set("alive531", "yes");'
+            'export function handler({ kv }) { kv.set("alive531", "yes");'
             ' return "reborn531-alive\\n"; }\n')})
         check("deploy despite the planted residue → dep_id", bool(dep),
               f"dep_id={dep}")

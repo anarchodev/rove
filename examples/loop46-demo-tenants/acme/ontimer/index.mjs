@@ -12,7 +12,7 @@
 //   -> resumeContinuation(wake) -> onWake -> resolveParked.
 //
 // The single client request blocks for ~ms, then returns "woke:<tag>".
-export default function () {
+export default function ({ after, next }) {
     const req = request.text ? request.json : {};
     after.ms(req.ms || 150);
     return next({ tag: req.tag || "t" });

@@ -5,7 +5,7 @@
 // GET → 200 with the raw JSON string from the kv row.
 //   404 if the row is absent (mirror didn't run, file missing, etc.)
 
-export default function () {
+export default function ({ kv }) {
   const raw = kv.get("_config/oauth/google");
   if (raw == null) {
     response.status = 404;

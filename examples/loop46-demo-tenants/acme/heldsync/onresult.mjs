@@ -12,7 +12,7 @@
 // socket, completing the one synchronous request. Returning another
 // __rove_next RE-PARKS (recipe-1: customer-composed retry, exercised
 // via `ctx.retry_to`).
-export function onResult() {
+export function onResult({ webhook }) {
     const ctx = request.ctx || {};
     if (request.status < 200 || request.status >= 300) {
         // Recipe-1: compose a retry yourself. One re-issue to a

@@ -32,25 +32,25 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 READY_SRC = (
     # `schedule` is the `@rewind/schedule` package, not an ambient global.
     'import schedule from "@rewind/schedule";\n'
-    'export function handler() { return "ready"; }\n'
+    'export function handler(_a) { return "ready"; }\n'
     # Arms a durable wake targeting the second module's named export.
     # The fired activation ROOTS ITS OWN saga (the durability boundary);
     # the arming saga rides its record as the reserved `_parent` tag.
-    'export function arm() {\n'
+    'export function arm(_a) {\n'
     '  schedule({ in: 1000 }, "wakes.mjs.fired", { note: "hi" }, { key: "smoke-parent" });\n'
     '  return "armed";\n'
     '}\n'
     # kv-touching probe for the seam assertions: ?w= writes a key,
     # ?r= reads one — the ops land on the record's kv tape / write-key
     # list, which is what /seam intersects.
-    'export function touch() {\n'
+    'export function touch({ kv }) {\n'
     '  const q = new URLSearchParams(request.query || "");\n'
     '  const w = q.get("w"); if (w) kv.set(w, "1");\n'
     '  const r = q.get("r"); kv.get(r || "never/set");\n'
     '  return "touched";\n'
     '}\n'
 )
-WAKES_SRC = 'export function fired() { return "fired"; }\n'
+WAKES_SRC = 'export function fired(_a) { return "fired"; }\n'
 FIXTURE = {"index.mjs": rpc_wrap(READY_SRC), "wakes.mjs": WAKES_SRC}
 
 N_REQUESTS = 8

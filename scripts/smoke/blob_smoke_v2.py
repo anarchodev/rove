@@ -52,13 +52,13 @@ TENANT = "blobtest"
 # so a held route can't lean on the index.mjs fallback the way plain
 # request/response routes can.
 GET_SRC = """
-export default function () {
+export default function ({ blob, next }) {
   const hash = new URLSearchParams(request.query || "").get("hash");
   blob.get(hash, { on: "onBlob" });
   return next();
 }
 
-export function onBlob() {
+export function onBlob({ next }) {
   if (!request.done) return next();
   const body = request.text || "";
   if (request.status !== 200) {
@@ -72,7 +72,7 @@ export function onBlob() {
 # `on_result` is a MODULE path (default export runs as a fresh
 # connectionless activation), not a `module/export` pair.
 PUTRESULT_SRC = """
-export default function () {
+export default function ({ kv }) {
   // Unified flattened on_result surface (handler-shape §7, Endpoint A):
   // request.status top-level (2xx = stored; no request.ok),
   // blob hash on request.activation.hash, echoed context IS request.ctx.
@@ -89,14 +89,14 @@ export default function () {
 # Content addressing makes the test self-validating: mirrored bytes
 # must produce the ORIGINAL object's hash.
 MIRROR_SRC = """
-export default function () {
+export default function ({ after, next }) {
   const src = new TextDecoder().decode(
     hex.decode(new URLSearchParams(request.query || "").get("src")));
   after.fetch(src, { stream: true, maxChunkBytes: 16384, on: "onChunk" });
   return next();
 }
 
-export function onChunk() {
+export function onChunk({ blob, next }) {
   if (!request.done) {
     if (request.bytes && request.bytes.length) blob.write(request.bytes);
     return next();
@@ -113,7 +113,7 @@ export function onChunk() {
 # threaded ctx arrives as request.ctx, the object hash on
 # request.activation.hash, {hash, totalBytes} as the JSON body.
 SEALEDNOTE_SRC = """
-export default function () {
+export default function ({ kv }) {
   kv.set("sealed/" + (request.ctx && request.ctx.tag || "unknown"), JSON.stringify({
     hash: request.activation.hash,
     ok: request.status >= 200 && request.status < 300,
@@ -127,7 +127,7 @@ export default function () {
 # _blob/pending/{hash} row still present (early dereference would
 # throw); note = the completion module's proof row.
 SEALCHECK_SRC = """
-export default function () {
+export default function ({ kv }) {
   const q = new URLSearchParams(request.query || "");
   const raw = kv.get("sealed/" + q.get("tag"));
   return JSON.stringify({
@@ -142,7 +142,7 @@ export default function () {
 # sha256 of the same deterministic content.
 GEN_CHUNK = "rewindjs-blob-p2!" * 1024  # 17 KiB
 GEN_SRC = f"""
-export default function () {{
+export default function ({{ blob }}) {{
   let chunk = "";
   for (let i = 0; i < 1024; i++) chunk += "rewindjs-blob-p2!";
   for (let i = 0; i < 8; i++) blob.write(chunk);
@@ -156,7 +156,7 @@ export default function () {{
 # slices via the recipe helper.
 SEGGET_SRC = """
 import segments from "@rewind/segments";
-export default function () {
+export default function ({ next }) {
   const qp = new URLSearchParams(request.query || "");
   const v = segments.get(qp.get("stream"), Number(qp.get("seq")), { on: "onSeg" });
   if (typeof v === "string") return "hot:" + v;
@@ -164,7 +164,7 @@ export default function () {
   return next();
 }
 
-export function onSeg() {
+export function onSeg({ next }) {
   if (!request.done) return next();
   if (request.status !== 200) { response.status = 502; return "segment fetch failed"; }
   return "sealed:" + segments.record();
@@ -173,7 +173,7 @@ export function onSeg() {
 
 HANDLER_SRC = """
 import segments from "@rewind/segments";
-export default function () {
+export default function ({ blob, kv }) {
   const path = request.path;
   const qp = new URLSearchParams(request.query || "");
   const q = {};

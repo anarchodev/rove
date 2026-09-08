@@ -57,7 +57,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET  # noqa: E402
 
 # POST {key, value} writes a distinct kv pair; GET ?key= reads one back.
 HANDLER_SRC = """\
-export function handler() {
+export function handler({ kv }) {
     if (request.method === "POST") {
         const body = JSON.parse(request.text || "{}");
         kv.set(body.key, body.value);

@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import V2Cluster, rpc_wrap, _curl, MOVE_SECRET  # noqa: E402
 
-SRC = 'export function hello() { return "hi\\n"; }\n'
+SRC = 'export function hello(_a) { return "hi\\n"; }\n'
 
 
 def main() -> int:

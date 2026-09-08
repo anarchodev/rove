@@ -6,7 +6,7 @@
 // = never reached; no `request.ok`, issue #7), the echoed customer
 // `context` IS `request.ctx`, and the delivery metadata ({id, attempts,
 // error}) is on `request.activation.*` (Endpoint A).
-export default function () {
+export default function ({ kv }) {
     const a = request.activation || {};
     const record = {
         id: a.id,

@@ -5,7 +5,7 @@
 // that holds a `/watch` stream for this tenant. (Status set via
 // the global `response.status` — the handler's return value
 // becomes the response body when it's not a Response object.)
-export default function () {
+export default function ({ kv }) {
     const body = JSON.parse(request.text || "{}");
     const id = body.id ?? "x";
     const value = body.value ?? "";

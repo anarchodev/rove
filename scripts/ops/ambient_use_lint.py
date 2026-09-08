@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Ratchet for the received-not-ambient migration (tracker #753).
 
-Counts places where customer-shaped JS — the scanned trees plus the shim
-JSDoc's `@example` blocks — still reaches a **capability** as
+Counts places where customer-shaped JS — the scanned trees, the shim
+JSDoc's `@example` blocks, and the smoke-embedded handler strings — still
+reaches a **capability** as
 an ambient global rather than receiving it from the activation object
 (`docs/architecture/package-isolation.md`). The count is the size of the
 remaining migration, and it may only ever go DOWN — a rising number means
@@ -42,6 +43,7 @@ one).
 from __future__ import annotations
 
 import argparse
+import ast
 import re
 import sys
 from pathlib import Path
@@ -78,6 +80,9 @@ TREES = (
     "web",
     "src/replay/testdata",
     "src/js/surface_tests",
+    # The demo tenants are the handler corpus the smokes deploy from disk
+    # (`_src()` in the bound-fetch family) — customer-shaped by definition.
+    "examples/loop46-demo-tenants",
 )
 
 SKIP_PARTS = ("_static", "node_modules", ".git")
@@ -266,7 +271,68 @@ def scan() -> tuple[int, dict[str, dict[str, int]]]:
                 total += n
     if acc:
         per_tree["doctests(src/js/globals)"] = acc
+    # The smoke-embedded handlers: JS source carried as Python string
+    # literals in scripts/smoke/**/*.py, deployed at run time. Each
+    # extracted block counts as its own scope, same as a doctest.
+    acc = {}
+    for path in sorted((REPO / "scripts" / "smoke").rglob("*.py")):
+        for block in _embedded_js_blocks(path.read_text(encoding="utf-8", errors="replace")):
+            for name, n in _count_source(_strip_literals(block)).items():
+                acc[name] = acc.get(name, 0) + n
+                total += n
+    if acc:
+        per_tree["smoke-embedded(scripts/smoke)"] = acc
     return total, per_tree
+
+
+def _embedded_js_blocks(py_src: str) -> list[str]:
+    """String literals that carry handler JS — an `export` marker is the
+    discriminator (assertion text and doc prose don't declare exports).
+
+    AST-based, not regex: the smokes carry JS both as triple-quoted blocks
+    and as parenthesized runs of adjacent single-quoted lines, and Python
+    folds adjacent literals into ONE Constant at parse, so both arrive
+    here whole. `+`-joined and f-string fragments are folded best-effort
+    below; a fragment this cannot reach is an under-count, which is the
+    ratchet's safe direction.
+    """
+    try:
+        tree = ast.parse(py_src)
+    except SyntaxError:
+        return []
+
+    def _fold(node) -> str | None:
+        # A best-effort constant fold over the shapes the smokes use:
+        # literals, implicit concatenation (already one Constant), binary
+        # `+` chains, and f-strings (static parts kept, interpolations
+        # dropped — they are Python values, not JS the corpus owns).
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = _fold(node.left), _fold(node.right)
+            if left is not None and right is not None:
+                return left + right
+            return left if right is None else right
+        if isinstance(node, ast.JoinedStr):
+            return "".join(
+                v.value
+                for v in node.values
+                if isinstance(v, ast.Constant) and isinstance(v.value, str)
+            )
+        return None
+
+    out: list[str] = []
+    consumed: set[int] = set()
+    for node in ast.walk(tree):
+        if id(node) in consumed:
+            continue
+        if isinstance(node, (ast.BinOp, ast.JoinedStr, ast.Constant)):
+            text = _fold(node)
+            if text is not None and ("export default" in text or "export function" in text):
+                out.append(text)
+                for child in ast.walk(node):
+                    consumed.add(id(child))
+    return out
 
 
 def _doctest_blocks(src: str) -> list[str]:

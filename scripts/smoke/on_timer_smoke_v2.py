@@ -40,7 +40,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 # The `ontimer` handler — verbatim from the V1 demo tenant
 # (examples/loop46-demo-tenants/acme/ontimer/index.mjs).
 ONTIMER_SRC = """\
-export default function () {
+export default function ({ after, next }) {
     const req = request.text ? request.json : {};
     after.ms(req.ms || 150);
     return next({ tag: req.tag || "t" });
@@ -55,7 +55,7 @@ export function onWake() {
 # A trivial root route, deployed alongside, so `wait_for_handler` can poll a
 # non-holding GET to confirm the deployment loaded (the ontimer route HOLDS,
 # so it can't be used as a readiness probe).
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 
 def main() -> int:

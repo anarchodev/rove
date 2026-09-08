@@ -9,7 +9,7 @@
 // `proposeForgetfulWrites`; the frame ships live and the kv state lands
 // durably via `drainRaftPending` (chunks gated on commit per
 // streaming-model §2).
-export default function () {
+export default function ({ after, next, stream }) {
     response.status = 200;
     response.headers = {
         "Content-Type": "text/event-stream",
@@ -25,7 +25,7 @@ export default function () {
 // matched keys); scan under it and relay everything not yet processed
 // (the out-key marker doubles as the dedupe cursor, so coalesced wakes
 // relay each key exactly once).
-export function onWake() {
+export function onWake({ after, kv, next, stream }) {
     stream.start(); // keep the stream alive even on a zero-frame wake
     for (const w of request.activation.wakes) {
         if (w.kind !== "kv") continue;

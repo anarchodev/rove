@@ -22,12 +22,12 @@
 //   default                       — 200 "ok" (liveness probe; never
 //        touches the speculative key).
 
-export function write(k, v) {
+export function write({ kv }, k, v) {
     kv.set(k, v);
     return JSON.stringify({ wrote: k });
 }
 
-export function read(k) {
+export function read({ kv }, k) {
     const v = kv.get(k);
     return JSON.stringify({ k: k, v: v, found: v !== null });
 }

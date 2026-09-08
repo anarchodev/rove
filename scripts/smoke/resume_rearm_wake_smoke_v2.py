@@ -55,7 +55,7 @@ FETCHED_LEN = len(EXPECTED_BODY)  # 170
 # `onFetchResult` (the bound-fetch chunk resume) — which arms a FRESH kv wake
 # and re-parks. That arm is exactly the one a resume-armed wake must not drop.
 HOLDFETCH_SRC = """\
-export default function () {
+export default function ({ after, next }) {
     const q = request.query || "";
     let url = null;
     for (const pair of q.split("&")) {
@@ -71,13 +71,13 @@ export default function () {
 
 // Bound-fetch chunk resume (resumeBoundFetchChain). Writing hop (kv.set) →
 // WRITE repark: the after.kv arm must survive the raft round-trip.
-export function onFetchResult() {
+export function onFetchResult({ after, kv, next }) {
     kv.set("rearm/fetched", String((request.text || "").length));
     after.kv("rearm/wake/", { on: "onWake" });
     return next();
 }
 
-export function onWake() {
+export function onWake({ kv }) {
     response.status = 200;
     return "woke:" + (kv.get("rearm/fetched") || "?");
 }
@@ -85,14 +85,14 @@ export function onWake() {
 
 # A separate inbound write that fires the re-armed kv wake on the held chain.
 POKE_SRC = """\
-export default function () {
+export default function ({ kv }) {
     kv.set("rearm/wake/x", "go");
     response.status = 204;
     return "";
 }
 """
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 WB_HANDLERS = {
     "index.mjs": _src("wb/index.mjs"),

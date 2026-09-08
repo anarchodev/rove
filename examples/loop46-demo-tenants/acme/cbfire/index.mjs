@@ -1,4 +1,4 @@
-export function fire(url, tag) {
+export function fire({ kv, webhook }, url, tag) {
     const id = webhook.send(url, {
         method: "POST",
         body: "ping",

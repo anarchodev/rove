@@ -45,7 +45,7 @@ def _src(rel: str) -> str:
     return (DEMO / rel).read_text()
 
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 
 def _stream(c: V2Cluster, path: str, max_time: float) -> "subprocess.Popen":

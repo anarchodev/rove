@@ -3,7 +3,7 @@
 // URL with a tagged context the on_result handler echoes back into
 // kv so the smoke can assert end-to-end shape. Returns { id } so the
 // smoke can correlate the receipt.
-export function fire(target_url, tag) {
+export function fire({ kv, webhook }, target_url, tag) {
     const id = webhook.send(target_url, {
         method: "POST",
         body: JSON.stringify({ from: "acme", tag: tag }),
@@ -20,7 +20,7 @@ export function fire(target_url, tag) {
 // (production.md #7) — schedules a fire, kills the leader during
 // the delay window, then asserts the new leader picked up the row
 // and the on_result handler still ran.
-export function fireDelayed(target_url, tag, delay_ms) {
+export function fireDelayed({ kv, webhook }, target_url, tag, delay_ms) {
     const now_ms = Date.now();
     const fire_at_ns = BigInt(now_ms) * 1_000_000n + BigInt(delay_ms) * 1_000_000n;
     const id = webhook.send(target_url, {

@@ -48,7 +48,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 # Handler JS verbatim from the V1 demo tenant
 # (examples/loop46-demo-tenants/acme/{watch,writekey}/index.mjs).
 WATCH_SRC = """\
-export default function () {
+export default function ({ after, next, stream }) {
     response.status = 200;
     response.headers = {
         "Content-Type": "text/event-stream",
@@ -60,7 +60,7 @@ export default function () {
     return next({ cursor: null });
 }
 
-export function onWake() {
+export function onWake({ after, kv, next, stream }) {
     stream.start(); // keep the stream alive even on a zero-frame wake
     // Go-look drain: the wake names the fired prefix, never
     // the matched keys; emit everything past the ctx cursor.
@@ -75,7 +75,7 @@ export function onWake() {
 """
 
 WRITEKEY_SRC = """\
-export default function () {
+export default function ({ kv }) {
     const body = JSON.parse(request.text || "{}");
     const id = body.id ?? "x";
     const value = body.value ?? "";
@@ -85,7 +85,7 @@ export default function () {
 }
 """
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 
 def _stream_watch(c: V2Cluster, path: str, max_time: float) -> "subprocess.Popen":

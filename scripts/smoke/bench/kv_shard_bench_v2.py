@@ -72,7 +72,7 @@ STREAMS = int(sys.argv[3]) if len(sys.argv) > 3 else 10
 # One kv.set per request against a fixed key — the same shape the V1 sharded
 # leg used, so the workload is a write path and not a router benchmark.
 SRC = """
-export default function () {
+export default function ({ kv }) {
   kv.set("k", "v".repeat(32));
   return "w";
 }

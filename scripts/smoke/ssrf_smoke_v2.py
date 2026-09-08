@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 
-HELDSYNC_SRC = r"""export default function () {
+HELDSYNC_SRC = r"""export default function ({ next, webhook }) {
     const req = request.json;
     webhook.send(req.target, {
         method: "POST",
@@ -73,7 +73,7 @@ WB_SRC = r"""export default function () {
 }
 """
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 FIXTURE = {
     "index.mjs": rpc_wrap(READY_SRC),

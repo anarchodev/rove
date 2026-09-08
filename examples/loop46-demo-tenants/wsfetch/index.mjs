@@ -1,6 +1,6 @@
 export default function () { return "ready"; }
 
-export function onMessage() {
+export function onMessage({ after, next, stream }) {
   const { data } = request.activation;
   if (data.startsWith("fetch:")) {
     // READ-ONLY frame: on.fetch binds to the held chain and the result
@@ -25,7 +25,7 @@ export function onMessage() {
   return next();
 }
 
-export function onUpstream() {
+export function onUpstream({ next, stream }) {
   // Bound-fetch surface: bytes on request.body, status/done at top level.
   if (!request.done) return next();
   const body = request.text || "";
@@ -33,14 +33,14 @@ export function onUpstream() {
   return next();
 }
 
-export function onUpstreamCtx() {
+export function onUpstreamCtx({ next, stream }) {
   if (!request.done) return next();
   // No fetch ctx → request.ctx = the connection's next({tag}).
   stream.write("ctx:" + (request.ctx && request.ctx.tag));
   return next();
 }
 
-export function onUpstreamBoth() {
+export function onUpstreamBoth({ next, stream }) {
   if (!request.done) return next();
   // Fetch carried a ctx → request.ctx is the fetch's ({f}), not the chain's.
   stream.write("ctx:" + (request.ctx && request.ctx.f));

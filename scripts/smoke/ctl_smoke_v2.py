@@ -25,12 +25,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
-ROOT_SRC = 'export function handler() { return "ctl-root\\n"; }\n'
+ROOT_SRC = 'export function handler(_a) { return "ctl-root\\n"; }\n'
 API_SRC = (
-    'export function handler() { return "ctl-api\\n"; }\n'
+    'export function handler(_a) { return "ctl-api\\n"; }\n'
     # request.path excludes the query string; request.query carries it
     # (handler-shape.md) — pathq echoes both for the step-3 assertion.
-    'export function pathq() { return request.path + "|" + (request.query || ""); }\n'
+    'export function pathq(_a) { return request.path + "|" + (request.query || ""); }\n'
 )
 
 

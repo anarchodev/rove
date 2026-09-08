@@ -5,7 +5,7 @@
 // subscriptions ALWAYS terminate with ok=false ("subscription
 // ended") — whether the upstream closed cleanly or the customer
 // cancelled.
-export default function () {
+export default function ({ kv }) {
     const a = request.activation;
     if (a.kind !== "fetch_chunk") {
         return { status: 500, body: "unexpected activation " + a.kind };

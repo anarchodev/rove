@@ -7,7 +7,7 @@
 // connection closed — so it proves the FetchPool's libcurl path is
 // genuinely streaming (CURLOPT_WRITEFUNCTION): chunks must arrive
 // incrementally, well before the fetch's timeout fires.
-export default function () {
+export default function ({ after, next, stream }) {
     response.status = 200;
     response.headers = { "Content-Type": "text/plain" };
     stream.start();
@@ -18,7 +18,7 @@ export default function () {
 
 // One frame per timer tick — never returns terminal, so the stream
 // runs until the fetch times out + libcurl FINs.
-export function onWake() {
+export function onWake({ after, next, stream }) {
     stream.start();
     stream.write("drip\n");
     after.ms(120);

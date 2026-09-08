@@ -40,12 +40,12 @@ _REMAP = [
     ("trigger_payload_tape_b64", "trigger_payload_b64"), ("activation_bytes_b64", "activation_bytes_b64"),
 ]
 
-INBOUND_SRC = 'export default function () { return "inbound-ok:" + (request.query || ""); }'
+INBOUND_SRC = 'export default function ({ after, next }) { return "inbound-ok:" + (request.query || ""); }'
 # NB: a {on:'onUpstream'} override with NO onFetchResult export — this doubles as
 # the G3 check: if the resolved export weren't recorded, replay would call the
 # (missing) conventional onFetchResult and fail. Reproduction proves G3.
 FETCH_SRC = """
-export default function () {
+export default function ({ after, kv, next }) {
   const q = request.query || "";
   let url = null;
   for (const p of q.split("&")) { const i = p.indexOf("="); if (i<0) continue;
@@ -60,7 +60,7 @@ export function onUpstream() {
 }
 """
 WS_SRC = """
-export function onMessage() {
+export function onMessage({ kv }) {
   const m = request.activation;
   kv.set("last_frame", m.opcode === 1 ? m.data : "(binary)");
   return "";
@@ -71,14 +71,14 @@ export function onMessage() {
 # conventional onWake and fail. The body + write fold in the batch's fired
 # prefix AND the threaded ctx, so reproduction proves both recorded inputs.
 WAKE_SRC = """
-export default function () {
+export default function ({ kv, after, next }) {
   const q = request.query || "";
   if (q.includes("op=write")) { kv.set("wk/flag", "1"); response.status = 204; return ""; }
   kv.get("wk/flag");
   after.kv("wk/", { on: "onFired" });
   return next({ armed: true });
 }
-export function onFired() {
+export function onFired({ kv }) {
   const fired = request.activation.wakes.filter((w) => w.kind === "kv").map((w) => w.prefix).join(",");
   const ms_ok = request.activation.wakes.every((w) => w.firedAt > 1e12 && w.firedAt < 1e13);
   kv.set("observed", fired);
@@ -93,7 +93,7 @@ export function onFired() {
 # envelope carries the callee outcome (status + bytes), the bare threaded
 # ctx, and the delivery metadata bag.
 SCB_INDEX_SRC = """
-export default function () {
+export default function ({ kv, webhook }) {
   const q = request.query || "";
   if (q.includes("op=echo")) { response.status = 202; return "echo-payload"; }
   if (q.includes("op=read")) { response.status = 200; return kv.get("delivered") || ""; }
@@ -107,7 +107,7 @@ export default function () {
 }
 """
 SCB_HOOKS_SRC = """
-export default function () {
+export default function ({ kv }) {
   const a = request.activation;
   kv.set("delivered", String(request.status) + ":" + request.text + ":"
     + String(request.ctx && request.ctx.orderId === 7) + ":" + String(a.attempts));

@@ -11,7 +11,7 @@
 // construction (project-connection-actor-unified-trigger). The platform
 // decides when the stream ends: client disconnect, or the per-stream
 // activation cap (MAX_STREAM_ACTIVATIONS).
-export default function () {
+export default function ({ after, next, stream }) {
     response.status = 200;
     response.headers = {
         "Content-Type": "text/event-stream",
@@ -24,7 +24,7 @@ export default function () {
 }
 
 // Timer wake — emit a heartbeat per timer entry, re-arm.
-export function onWake() {
+export function onWake({ after, next, stream }) {
     stream.start(); // keep the stream alive even if zero frames this wake
     for (const w of request.activation.wakes) {
         if (w.kind === "timer") stream.write(":heartbeat\n\n");

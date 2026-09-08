@@ -38,7 +38,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 # Handler JS verbatim from the demo tenant
 # (examples/loop46-demo-tenants/acme/{coalesce_watch,coalesce_burst}/index.mjs).
 COALESCE_WATCH_SRC = """\
-export default function () {
+export default function ({ after, next, stream }) {
     response.status = 200;
     response.headers = {
         "Content-Type": "text/event-stream",
@@ -50,7 +50,7 @@ export default function () {
     return next();
 }
 
-export function onWake() {
+export function onWake({ after, next, stream }) {
     const a = request.activation;
     stream.start();
     const prefixes = a.wakes.filter((w) => w.kind === "kv").map((w) => w.prefix).join(",");
@@ -62,7 +62,7 @@ export function onWake() {
 """
 
 COALESCE_BURST_SRC = """\
-export default function () {
+export default function ({ kv }) {
     const body = JSON.parse(request.text || "{}");
     const count = body.count ?? 50;
     for (let i = 0; i < count; i++) {
@@ -73,7 +73,7 @@ export default function () {
 }
 """
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 
 def _stream_watch(c: V2Cluster, path: str, max_time: float) -> "subprocess.Popen":

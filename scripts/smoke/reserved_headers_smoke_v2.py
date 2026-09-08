@@ -60,14 +60,14 @@ INNOCENT = {
 
 SRC = (
     # Echo the header NAMES the handler can see, sorted, newline-joined.
-    "export function seen() {\n"
+    "export function seen(_a) {\n"
     "  return Object.keys(request.headers).sort().join(',') + '\\n';\n"
     "}\n"
     # Try to emit reserved response headers alongside an ordinary one.
     # The response head is AMBIENT (`response.headers`, handler-shape.md) —
     # an object returned from the handler is just a body, so setting the
     # head any other way tests nothing.
-    "export function emit() {\n"
+    "export function emit(_a) {\n"
     "  response.headers = {\n"
     "    'x-rewind-leader': '3',\n"
     "    'x-rewind-tenant': '__admin__',\n"

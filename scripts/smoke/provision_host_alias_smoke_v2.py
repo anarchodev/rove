@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 CUSTOM_HOST = "alias-test.example"
-HANDLER = 'export function handler() { return "alias-ok\\n"; }\n'
+HANDLER = 'export function handler(_a) { return "alias-ok\\n"; }\n'
 
 
 def main() -> int:

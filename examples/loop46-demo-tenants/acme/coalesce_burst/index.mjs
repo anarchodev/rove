@@ -4,7 +4,7 @@
 // stream, however large N is; issue #8 / decisions.md §3.10).
 //
 // Body shape: `{ "count": <int> }` (default 50). Response: 204.
-export default function () {
+export default function ({ kv }) {
     const body = JSON.parse(request.text || "{}");
     const count = body.count ?? 50;
     for (let i = 0; i < count; i++) {
