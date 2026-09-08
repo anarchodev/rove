@@ -687,7 +687,10 @@ const EPILOGUE_BODY_TAIL =
     \\        if (!handler) continue;
     \\        const event = { key, value: evValue, previousValue: prev, op, timing, timestamp: (D.now_ms || 0), actor: null, depth: __triggerDepth - 1 };
     \\        let ret;
-    \\        try { ret = handler(event); }
+    \\        // The received caps — the index-maintainer grant, mirroring the
+    \\        // worker's trigger convention: `handler({ kv }, event)`. The
+    \\        // sim's kv is the per-run recorder installed on globalThis.
+    \\        try { ret = handler({ kv: globalThis.kv }, event); }
     \\        catch (e) { const err = new Error(t.module + ": " + ((e && e.message) || String(e))); err.code = "trigger_rejected"; throw err; }
     \\        if (op === "put" && timing === "before" && typeof ret === "string") { value = ret; evValue = ret; }
     \\      }

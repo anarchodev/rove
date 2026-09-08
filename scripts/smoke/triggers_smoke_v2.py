@@ -35,17 +35,17 @@ from smoke_lib_v2 import V2Cluster  # noqa: E402
 TENANT = "trig"
 
 # Trigger module + handler verbatim from scripts/triggers_smoke.py (V1).
-TRIGGER_SRC = '''export function beforePut(event) {
+TRIGGER_SRC = '''export function beforePut({ kv }, event) {
   const sess = JSON.parse(event.value);
   if (!sess.user_id) throw new Error("session missing user_id");
   return JSON.stringify({ ...sess, user_id: sess.user_id.toLowerCase() });
 }
-export function afterPut(event) {
+export function afterPut({ kv }, event) {
   const sess = JSON.parse(event.value);
   const sid = event.key.split("/").pop();
   kv.set("users/by-session/" + sid, sess.user_id);
 }
-export function afterDelete(event) {
+export function afterDelete({ kv }, event) {
   if (event.previousValue) {
     const sess = JSON.parse(event.previousValue);
     const sid = event.key.split("/").pop();
