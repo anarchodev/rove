@@ -78,57 +78,10 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     // markers ride the `_blob/`-rooted marker kv.
     "\n;" ++ @embedFile("g_blob") ++
     // Invoke the registered factories — after every shim, before the
-    // `_system` delete, mirroring the worker's `_factories_invoke.js`
-    // (per-shim caps, dependency-ordered, unconsumed-registration check)
-    // over THIS prelude's shim subset. The sim's kv recorder is
-    // EPILOGUE-local (per run), and the rooted marker views forward to
-    // `globalThis.kv` at call time — exactly the late binding the ambient
-    // reference used to provide. The other caps are the base recorders.
-    "\n;(function () {" ++
-    "\n  const reg = globalThis.__rove_factories;" ++
-    "\n  const pending = new Set(Object.keys(reg));" ++
-    "\n  const invoke = (name, caps) => {" ++
-    "\n    if (!pending.delete(name))" ++
-    "\n      throw new Error(\"factory not registered: \" + name);" ++
-    "\n    return reg[name](caps);" ++
-    "\n  };" ++
-    "\n  const rooted = (root) => ({" ++
-    "\n    get: (k) => globalThis.kv.get(root + k)," ++
-    "\n    set: (k, v) => globalThis.kv.set(root + k, v)," ++
-    "\n    delete: (k) => globalThis.kv.delete(root + k)," ++
-    "\n    prefix: (p, c, l) =>" ++
-    "\n      (globalThis.kv.prefix(root + p, c == null || c === \"\" ? c : root + c, l) || [])" ++
-    "\n        .map((e) => ({ key: e.key.slice(root.length), value: e.value }))," ++
-    "\n  });" ++
-    "\n  globalThis.crypto = invoke(\"crypto\", { crypto: _system.crypto });" ++
-    "\n  globalThis.http = invoke(\"http\", { http: _system.http });" ++
-    "\n  globalThis.stream = invoke(\"stream\", { stream: _system.stream });" ++
-    "\n  globalThis.next = invoke(\"next\", { next: _system.continuation.next });" ++
-    "\n  globalThis.after = invoke(\"after\", { after: _system.after, http: _system.http });" ++
-    "\n  globalThis.__rove_request_proto = invoke(\"__rove_request_proto\", {});" ++
-    "\n  globalThis.btoa = invoke(\"btoa\", {});" ++
-    "\n  globalThis.atob = invoke(\"atob\", {});" ++
-    "\n  globalThis.base64url = invoke(\"base64url\", {});" ++
-    "\n  globalThis.hex = invoke(\"hex\", {});" ++
-    "\n  globalThis.URLSearchParams = invoke(\"URLSearchParams\", {});" ++
-    "\n  globalThis.time = invoke(\"time\", {});" ++
-    "\n  const sched = invoke(\"sched\", {" ++
-    "\n    kv: rooted(\"_sched/\"), formats: __rove.formats," ++
-    "\n  });" ++
-    "\n  globalThis.platform = invoke(\"platform\", {" ++
-    "\n    platform: _system.platform, after: _system.after," ++
-    "\n    blobReceive: _system.blob.receive, blobPresign: _system.blob.presign," ++
-    "\n    sched: sched, kv: rooted(\"_dispatch/\"), formats: __rove.formats," ++
-    "\n  });" ++
-    "\n  globalThis.webhook = invoke(\"webhook\", {" ++
-    "\n    http: _system.http, sched: sched, kv: rooted(\"_send/\")," ++
-    "\n    formats: __rove.formats," ++
-    "\n  });" ++
-    "\n  globalThis.blob = invoke(\"blob\", {" ++
-    "\n    http: _system.http, blob: _system.blob, kv: rooted(\"_blob/\")," ++
-    "\n    after: globalThis.after, formats: __rove.formats," ++
-    "\n  });" ++
-    "\n  if (pending.size > 0)" ++
-    "\n    throw new Error(\"unconsumed factories: \" + Array.from(pending).join(\", \"));" ++
-    "\n})();" ++
+    // `_system` delete. THE invoker is `globals/_invoke.js`, shared
+    // verbatim with the worker and the browser arena generator; it is
+    // subset-tolerant, so this prelude's smaller shim set (no
+    // kv/config/console/textcodec — the sim's kv is per-run,
+    // epilogue-installed) skips the entries with no registration.
+    "\n;" ++ @embedFile("g__invoke") ++
     "\n;delete globalThis._system;\n";

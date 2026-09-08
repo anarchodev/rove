@@ -268,7 +268,7 @@ pub fn build(b: *std.Build) void {
         fn f(bb: *std.Build, mod: *std.Build.Module) void {
             // schedule stays (installs the private `_system.sched` the sim
             // webhook shim captures); the 11 lifted customer globals are gone.
-            const names = [_][]const u8{ "crypto", "http", "request", "base64", "urlsearchparams", "platform", "time", "schedule", "webhook", "after", "stream", "next", "blob" };
+            const names = [_][]const u8{ "crypto", "http", "request", "base64", "urlsearchparams", "platform", "time", "schedule", "webhook", "after", "stream", "next", "blob", "_invoke" };
             inline for (names) |nm| {
                 mod.addAnonymousImport("g_" ++ nm, .{ .root_source_file = bb.path("src/js/globals/" ++ nm ++ ".js") });
             }
@@ -909,6 +909,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "handler_shape_md", .path = "docs/handler-shape.md" },
         .{ .name = "request_js", .path = "src/js/globals/request.js" },
         .{ .name = "blob_js", .path = "src/js/globals/blob.js" },
+        // THE factory invoker — one definition of the per-shim caps, shared
+        // verbatim with the CLI sim prelude and the browser arena generator.
+        .{ .name = "invoke_js", .path = "src/js/globals/_invoke.js" },
 
         // Built-in handler modules — compiled to bytecode at NodeState
         // init, resolved via the `__system/` module-path prefix

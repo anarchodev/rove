@@ -96,62 +96,14 @@ PIECES = [
 ]
 
 # The factory registry precedes the shims, and the invoker follows them —
-# the same pair the worker's installStatic evals (`_factories.js` /
-# `_factories_invoke.js`) and the CLI sim's prelude splices
-# (sim_globals.zig): per-shim caps, dependency-ordered, with an
-# unconsumed-registration check, over THIS prelude's shim subset. The
-# arena's kv binding is engine-installed per shell, and the rooted marker
-# views forward to `globalThis.kv` at call time — the late binding the
-# ambient reference used to provide.
+# the same pair the worker's installStatic evals and the CLI sim's prelude
+# splices. THE invoker is `src/js/globals/_invoke.js`, read verbatim: one
+# definition of the per-shim caps for all three engines. It is
+# subset-tolerant, so this prelude's shim set (no kv/config/console/
+# textcodec/request — the arena's kv is engine-installed per shell and the
+# shell's epilogue owns request) skips entries with no registration.
 REGISTRY = "\n;globalThis.__rove_factories = {};\n"
-INVOKER = """
-;(function () {
-  const reg = globalThis.__rove_factories;
-  const pending = new Set(Object.keys(reg));
-  const invoke = (name, caps) => {
-    if (!pending.delete(name))
-      throw new Error("factory not registered: " + name);
-    return reg[name](caps);
-  };
-  const rooted = (root) => ({
-    get: (k) => globalThis.kv.get(root + k),
-    set: (k, v) => globalThis.kv.set(root + k, v),
-    delete: (k) => globalThis.kv.delete(root + k),
-    prefix: (p, c, l) =>
-      (globalThis.kv.prefix(root + p, c == null || c === "" ? c : root + c, l) || [])
-        .map((e) => ({ key: e.key.slice(root.length), value: e.value })),
-  });
-  globalThis.crypto = invoke("crypto", { crypto: _system.crypto });
-  globalThis.http = invoke("http", { http: _system.http });
-  globalThis.stream = invoke("stream", { stream: _system.stream });
-  globalThis.next = invoke("next", { next: _system.continuation.next });
-  globalThis.after = invoke("after", { after: _system.after, http: _system.http });
-  globalThis.btoa = invoke("btoa", {});
-  globalThis.atob = invoke("atob", {});
-  globalThis.base64url = invoke("base64url", {});
-  globalThis.hex = invoke("hex", {});
-  globalThis.URLSearchParams = invoke("URLSearchParams", {});
-  globalThis.time = invoke("time", {});
-  const sched = invoke("sched", {
-    kv: rooted("_sched/"), formats: __rove.formats,
-  });
-  globalThis.platform = invoke("platform", {
-    platform: _system.platform, after: _system.after,
-    blobReceive: _system.blob.receive, blobPresign: _system.blob.presign,
-    sched: sched, kv: rooted("_dispatch/"), formats: __rove.formats,
-  });
-  globalThis.webhook = invoke("webhook", {
-    http: _system.http, sched: sched, kv: rooted("_send/"),
-    formats: __rove.formats,
-  });
-  globalThis.blob = invoke("blob", {
-    http: _system.http, blob: _system.blob, kv: rooted("_blob/"),
-    after: globalThis.after, formats: __rove.formats,
-  });
-  if (pending.size > 0)
-    throw new Error("unconsumed factories: " + Array.from(pending).join(", "));
-})();
-"""
+INVOKER = "\n;" + (ROVE / "src" / "js" / "globals" / "_invoke.js").read_text() + "\n"
 
 # Evaled last: `_system` is the shims' private construction material, not
 # customer surface. Every shim above captured what it needs in a closure —
