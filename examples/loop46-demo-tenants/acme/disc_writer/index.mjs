@@ -9,7 +9,7 @@
 // on — fire-and-forget).
 // Inbound: open the heartbeat stream. Timer wakes → onWake; client
 // disconnect → onDisconnect.
-export default function () {
+export default function ({ after, next, stream }) {
     response.status = 200;
     response.headers = {
         "Content-Type": "text/event-stream",
@@ -23,7 +23,7 @@ export default function () {
 
 // The cleanup write — set a marker key. The smoke reads it back via
 // /readkey after the client disconnects.
-export function onDisconnect() {
+export function onDisconnect({ kv }) {
     const id = (request.ctx && request.ctx.id) || "1";
     kv.set("disc_marker/" + id, "fired");
     return "";
@@ -31,7 +31,7 @@ export function onDisconnect() {
 
 // Timer-fired heartbeat (no kv wakes registered → timer-only batch).
 // One frame per timer entry.
-export function onWake() {
+export function onWake({ after, next, stream }) {
     stream.start();
     for (const w of request.activation.wakes) {
         if (w.kind === "timer") stream.write(":hb\n\n");

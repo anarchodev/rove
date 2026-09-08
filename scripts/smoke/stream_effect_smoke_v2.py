@@ -56,7 +56,7 @@ from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 
 # Handlers verbatim from the V1 demo tenant
 # (examples/loop46-demo-tenants/acme/{streamkv,writekv}/index.mjs).
-STREAMKV_SRC = r"""export default function () {
+STREAMKV_SRC = r"""export default function ({ after, next, stream }) {
     response.status = 200;
     response.headers = {
         "content-type": "text/event-stream",
@@ -68,7 +68,7 @@ STREAMKV_SRC = r"""export default function () {
     return next({ cursor: null });
 }
 
-export function onWake() {
+export function onWake({ after, kv, next, stream }) {
     // Go-look drain: the wake names the fired prefix, never
     // the matched keys; emit everything past the ctx cursor. A zero-frame
     // wake re-holds via the plain next() — no stream.start() ritual.
@@ -82,7 +82,7 @@ export function onWake() {
 }
 """
 
-WRITEKV_SRC = r"""export default function () {
+WRITEKV_SRC = r"""export default function ({ kv }) {
     const body = JSON.parse(request.text || "{}");
     if (!body.key || typeof body.key !== "string") {
         response.status = 400;
@@ -94,7 +94,7 @@ WRITEKV_SRC = r"""export default function () {
 }
 """
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 
 def main() -> int:

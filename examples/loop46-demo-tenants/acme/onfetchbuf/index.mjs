@@ -8,7 +8,7 @@
 // ONE terminal event that dispatches to the conventional `onFetchResult`
 // export (not onFetchChunk / onFetchDone — those are the streaming
 // split). No stream.* output; the held client gets the buffered body.
-export default function () {
+export default function ({ after, next }) {
     const q = request.query || "";
     let url = null;
     for (const pair of q.split("&")) {

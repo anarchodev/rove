@@ -46,7 +46,7 @@ from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 # `next(targetModule, ctx)` (the widened public `next`; there is no bare
 # `__rove_next` for customer code), which resumes the target's DEFAULT
 # export on the send_callback activation.
-HELDSYNC_SRC = r"""export default function () {
+HELDSYNC_SRC = r"""export default function ({ next, webhook }) {
     const req = request.json;
     const opts = {
         method: "POST",
@@ -60,7 +60,7 @@ HELDSYNC_SRC = r"""export default function () {
 }
 """
 
-ONRESULT_SRC = r"""export default function () {
+ONRESULT_SRC = r"""export default function ({ next, webhook }) {
     // Endpoint A: threaded ctx IS request.ctx; the webhook result is
     // flattened on request.status/.text (2xx = delivered; no request.ok);
     // delivery metadata (error) is on request.activation.*.
@@ -91,7 +91,7 @@ WB_SRC = r"""export default function () {
 }
 """
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 
 def main() -> int:

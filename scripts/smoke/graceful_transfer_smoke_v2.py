@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 HANDLER_SRC = """\
-export function handler() {
+export function handler({ kv }) {
     if (request.method === "POST") {
         const body = JSON.parse(request.text || "{}");
         kv.set("xfer/value", body.value ?? "");

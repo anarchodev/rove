@@ -51,7 +51,7 @@ from smoke_lib_v2 import V2Cluster, _curl  # noqa: E402
 # boxes the tenant well under a millisecond of spinning, and a boxed tenant
 # 503s every request, which would prove nothing about the lease.
 SRC = """
-export default function () {
+export default function ({ kv }) {
   kv.set("last", request.path);
   response.status = 200;
   return "served";

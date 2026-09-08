@@ -115,11 +115,11 @@ def main() -> int:
 
     # Recorded read order: a, b → base64 tape → transcode to the ONE format.
     tape = _kv_tape([("a", "1"), ("b", "2")])
-    orig = 'export default function(){ const a=kv.get("a"); const b=kv.get("b"); return JSON.stringify({a,b}); }'
+    orig = 'export default function({ kv }){ const a=kv.get("a"); const b=kv.get("b"); return JSON.stringify({a,b}); }'
     world = _export_to_world(_fixture(tape, orig))
 
     # 1. Reordered reads (b then a) — must NOT diverge.
-    reordered = 'export default function(){ const b=kv.get("b"); const a=kv.get("a"); return JSON.stringify({a,b}); }'
+    reordered = 'export default function({ kv }){ const b=kv.get("b"); const a=kv.get("a"); return JSON.stringify({a,b}); }'
     art = _replay(world, _srcdir(reordered))
     res = art.get("body")
     check("reordered independent reads do not diverge",
@@ -130,7 +130,7 @@ def main() -> int:
     #    not_found (null), no divergence, and surfaces in the effect log as a
     #    read with present:false (the honest "your code read something the world
     #    doesn't have" signal — visible, not a hard divergence).
-    newkey = 'export default function(){ const a=kv.get("a"); const c=kv.get("c"); return JSON.stringify({a,c}); }'
+    newkey = 'export default function({ kv }){ const a=kv.get("a"); const c=kv.get("c"); return JSON.stringify({a,c}); }'
     art = _replay(world, _srcdir(newkey))
     res = art.get("body")
     read_c = next((e for e in art.get("effects", [])

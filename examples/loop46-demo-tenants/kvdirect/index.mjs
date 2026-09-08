@@ -8,7 +8,7 @@
 // Read-only on purpose: reads skip raft + WAL fsync, so the JS call
 // frame is the largest possible fraction of per-op cost. This is the
 // worst case for the shim and the number that decides the design.
-export function handler() {
+export function handler({ kv }) {
     let acc = 0;
     for (let i = 0; i < 200; i++) acc += (kv.get("seed") || "").length;
     return "direct " + acc + "\n";

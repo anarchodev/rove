@@ -4,7 +4,7 @@
 // chunk-transfer. The fault gate freezes followers BEFORE the timer wake
 // fires, so the wake_batch hop's propose can't quorum; the staged chunk
 // must NOT leak. (Handler-surface Phase 2 `stream.*` surface.)
-export default function () {
+export default function ({ after, next, stream }) {
     response.status = 200;
     response.headers = {
         "Content-Type": "text/event-stream",
@@ -22,7 +22,7 @@ export default function () {
 // wake_batch + writes: the arm Phase 4.0.b gates. A raft fault during
 // the commit-wait window must discard the staged "tick" chunk; the
 // customer must NOT see this frame until the kv.set durably commits.
-export function onWake() {
+export function onWake({ after, kv, next, stream }) {
     const ctr = parseInt(kv.get("counter") ?? "0") + 1;
     kv.set("counter", String(ctr));
     stream.start();

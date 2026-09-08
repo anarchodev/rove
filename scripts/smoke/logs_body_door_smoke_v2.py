@@ -52,7 +52,7 @@ export default function () {
     return "len:" + data.length;
 }
 """
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 # Comfortably over INBOUND_INLINE_THRESHOLD / REQUEST_BODY_CAP (16 KiB),
 # so the spill is forced by construction rather than by timing.

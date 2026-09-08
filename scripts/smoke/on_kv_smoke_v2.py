@@ -54,7 +54,7 @@ WRITE_DELAY_S = 0.5
 # (examples/loop46-demo-tenants/acme/{onkv,writekv}/index.mjs), with
 # `__rove_next` already spelled `next()` (the V1 handler used `next()` too).
 ONKV_SRC = """\
-export default function () {
+export default function ({ after, kv, next }) {
     const req = request.text ? request.json : {};
     const prefix = req.prefix || "onkv/";
     kv.get(prefix + "flag");
@@ -62,7 +62,7 @@ export default function () {
     return next({ prefix });
 }
 
-export function onWake() {
+export function onWake({ kv }) {
     const ctx = request.ctx || {};
     const v = kv.get(ctx.prefix + "flag");
     return "woke:" + (v ?? "none");
@@ -70,7 +70,7 @@ export function onWake() {
 """
 
 WRITEKV_SRC = """\
-export default function () {
+export default function ({ kv }) {
     const body = JSON.parse(request.text || "{}");
     if (!body.key || typeof body.key !== "string") {
         response.status = 400;
@@ -84,7 +84,7 @@ export default function () {
 
 # A trivial root route for the readiness probe (the onkv/writekv routes
 # either hold or mutate — neither is a clean GET probe).
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 
 def main() -> int:

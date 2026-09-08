@@ -47,7 +47,7 @@ from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 # acme's delayed-webhook handler + on_result callback. Shaped after the V1
 # demo tenant's httpfire.fireDelayed / httpresult, adapted to the V2
 # webhook.js shim (fire_at_ns sweep-only path).
-CBFIRE_SRC = r'''export function fireDelayed(url, tag, delay_ms) {
+CBFIRE_SRC = r'''export function fireDelayed({ kv, webhook }, url, tag, delay_ms) {
     const now_ms = Date.now();
     const fire_at_ns = BigInt(now_ms) * 1_000_000n + BigInt(delay_ms) * 1_000_000n;
     const id = webhook.send(url, {
@@ -63,7 +63,7 @@ CBFIRE_SRC = r'''export function fireDelayed(url, tag, delay_ms) {
     return { id: id, fire_at_ns: String(fire_at_ns), now_ms: now_ms };
 }'''
 
-CBRESULT_SRC = r'''export default function () {
+CBRESULT_SRC = r'''export default function ({ kv }) {
     // Unified flattened on_result surface (handler-shape §7, Endpoint A).
     const a = request.activation || {};
     const record = {
@@ -76,10 +76,10 @@ CBRESULT_SRC = r'''export default function () {
     kv.set("cb/result/" + a.id, JSON.stringify(record));
 }'''
 
-ACME_INDEX_SRC = 'export function handler() { return "acme-ready"; }\n'
+ACME_INDEX_SRC = 'export function handler(_a) { return "acme-ready"; }\n'
 
 # wb echo tenant — records receipt to its own kv + echoes `echo:<body>`.
-WB_SRC = r"""export default function () {
+WB_SRC = r"""export default function ({ kv }) {
     const id = request.headers["x-rove-schedule-id"] || "<none>";
     const ver = request.headers["x-rove-schedule-version"] || "<none>";
     const body = request.text || "";

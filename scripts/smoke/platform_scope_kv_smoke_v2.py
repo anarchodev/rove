@@ -46,16 +46,16 @@ TARGET = "scopekv-target"
 PROBE = (
     'const T = "%s";\n' % TARGET
     # cross-tenant
-    + 'export function xset(){ platform.scope(T).kv.set("k/x","XVAL"); return "ok"; }\n'
-    + 'export function xget(){ return JSON.stringify({v: platform.scope(T).kv.get("k/x")}); }\n'
-    + 'export function xprefix(){ return JSON.stringify(platform.scope(T).kv.prefix("k/","",100)); }\n'
-    + 'export function xdel(){ platform.scope(T).kv.delete("k/x"); return "ok"; }\n'
+    + 'export function xset({ platform }){ platform.scope(T).kv.set("k/x","XVAL"); return "ok"; }\n'
+    + 'export function xget({ platform }){ return JSON.stringify({v: platform.scope(T).kv.get("k/x")}); }\n'
+    + 'export function xprefix({ platform }){ return JSON.stringify(platform.scope(T).kv.prefix("k/","",100)); }\n'
+    + 'export function xdel({ platform }){ platform.scope(T).kv.delete("k/x"); return "ok"; }\n'
     # self-scope (__admin__ writing itself)
-    + 'export function sset(){ platform.scope("__admin__").kv.set("k/self","SELF"); return "ok"; }\n'
-    + 'export function sget(){ return JSON.stringify({v: platform.scope("__admin__").kv.get("k/self")}); }\n'
-    + 'export function sdel(){ platform.scope("__admin__").kv.delete("k/self"); return "ok"; }\n'
+    + 'export function sset({ platform }){ platform.scope("__admin__").kv.set("k/self","SELF"); return "ok"; }\n'
+    + 'export function sget({ platform }){ return JSON.stringify({v: platform.scope("__admin__").kv.get("k/self")}); }\n'
+    + 'export function sdel({ platform }){ platform.scope("__admin__").kv.delete("k/self"); return "ok"; }\n'
     # release history (read back the keys the __admin__ release wrote)
-    + 'export function rel(){ return JSON.stringify(platform.scope("__admin__").kv.prefix("_release/","",100)); }\n'
+    + 'export function rel({ platform }){ return JSON.stringify(platform.scope("__admin__").kv.prefix("_release/","",100)); }\n'
 )
 
 

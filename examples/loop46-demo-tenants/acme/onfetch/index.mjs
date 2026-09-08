@@ -8,7 +8,7 @@
 // reconstructed body to the held client.
 //
 //   GET /onfetch?url=<upstream>
-export default function () {
+export default function ({ after, kv, next }) {
     const q = request.query || "";
     let url = null;
     for (const pair of q.split("&")) {
@@ -30,7 +30,7 @@ export default function () {
 
 // Per upstream chunk (bound via after.fetch's {on}). Accumulate in kv; on
 // the terminal chunk, return the reconstructed body to the held client.
-export function onUpstream() {
+export function onUpstream({ kv, next }) {
     if (request.done) {
         response.status = 200;
         return kv.get("onfetch/acc") || "";

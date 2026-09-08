@@ -37,7 +37,7 @@ export default function () {
 }
 """
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 # onHeaders module: decides from headers alone — 401 without the magic
 # header (body never accepted), 200 with it (still no body read).

@@ -4,7 +4,7 @@
 // (no need to thread cancellation through the subscriber chain).
 //
 //   GET /cancel_subscribe?id=<subscription_id>
-export default function () {
+export default function ({ http }) {
     const q = request.query || "";
     let id = null;
     for (const pair of q.split("&")) {

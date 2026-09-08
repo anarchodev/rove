@@ -1,7 +1,7 @@
 // Read a single kv key, return its value as text/plain. Body shape:
 //   `?key=<keyname>` (URL-encoded). Missing key → 404. Used by
 // smokes to verify writes from other paths committed.
-export default function () {
+export default function ({ kv }) {
     const q = request.query || "";
     let key = null;
     for (const pair of q.split("&")) {

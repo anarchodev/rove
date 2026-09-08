@@ -69,7 +69,7 @@ STREAMFI_SRC = (DEMO / "streaming_fault_inj" / "index.mjs").read_text()
 
 # A trivial root readiness probe so we can poll the deployment-loaded
 # state without opening the (held) default stream.
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 
 def _open_stream_direct(node_base: str, path: str, host: str,

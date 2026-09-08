@@ -26,29 +26,29 @@ function overrunRequested() {
     return (request.query || "").indexOf("overrun=1") !== -1;
 }
 
-function emit() {
+function emit(stream) {
     stream.write("event: burst\ndata: start\n\n");
     const n = overrunRequested() ? OVERRUN_CHUNKS : ABSORB_CHUNKS;
     for (let i = 0; i < n; i++) stream.write(FAT_CHUNK);
 }
 
-export default function () {
+export default function ({ after, next, stream }) {
     response.status = 200;
     response.headers = {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
     };
     stream.start();
-    emit();
+    emit(stream);
     after.ms(100);
     return next();
 }
 
 // Timer wake — same burst again, so the smoke can watch several activations
 // stream losslessly rather than judging from one.
-export function onWake() {
+export function onWake({ after, next, stream }) {
     stream.start();
-    emit();
+    emit(stream);
     after.ms(100);
     return next();
 }

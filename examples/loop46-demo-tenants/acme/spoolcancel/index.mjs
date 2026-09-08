@@ -12,7 +12,7 @@
 // by `bound_fetch_spool_dropped_total`. Exercises the "handler cancels
 // its own fetch mid-dispatch" reentrancy (the spool must survive its
 // own key being freed during the resume).
-export default function () {
+export default function ({ after, kv, next }) {
     const q = request.query || "";
     let url = null;
     for (const pair of q.split("&")) {
@@ -31,7 +31,7 @@ export default function () {
     return next();
 }
 
-export function onFetchChunk() {
+export function onFetchChunk({ after, kv, next }) {
     const seq = request.chunkSeq;
     if (seq >= 2) {
         // Cancel our own fetch mid-stream + terminate the held chain.

@@ -70,7 +70,7 @@ os.environ["REWIND_AUTO_DEMOTE_LAG"] = "0"
 from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET  # noqa: E402
 
 HANDLER_SRC = """\
-export function handler() {
+export function handler({ kv }) {
     if (request.method === "POST") {
         const body = JSON.parse(request.text || "{}");
         kv.set(body.key ?? "cc/value", body.value ?? "");

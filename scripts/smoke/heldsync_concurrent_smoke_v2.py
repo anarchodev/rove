@@ -45,7 +45,7 @@ N_CONCURRENT = 20
 # echo) — same JS the heldsync_smoke_v2 template provisions: the
 # cross-module continuation is `next(targetModule, ctx)`, resuming the
 # target's default export.
-HELDSYNC_SRC = r"""export default function () {
+HELDSYNC_SRC = r"""export default function ({ next, webhook }) {
     const req = request.json;
     const opts = {
         method: "POST",
@@ -78,7 +78,7 @@ WB_SRC = r"""export default function () {
 }
 """
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 
 def one_request(c: V2Cluster, wb_url: str, i: int) -> tuple[int, str, float]:

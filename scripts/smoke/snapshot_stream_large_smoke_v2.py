@@ -51,7 +51,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET  # noqa: E402
 # request bodies small); POST {key, value} writes a literal; GET ?key= returns
 # "len:<n>" so a reader can verify a value's length without shipping it back.
 HANDLER_SRC = """\
-export function handler() {
+export function handler({ kv }) {
     if (request.method === "POST") {
         const b = JSON.parse(request.text || "{}");
         if (b.size) { kv.set(b.key, "v".repeat(b.size)); }

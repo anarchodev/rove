@@ -54,7 +54,7 @@ function _param(name) {
     }
     return "";
 }
-export function seed() {
+export function seed({ kv }) {
     const n = parseInt(_param("n") || "0", 10);
     for (let i = 0; i < n; i++) {
         kv.set("data/" + String(i).padStart(4, "0"), "value-" + i);
@@ -69,12 +69,12 @@ export function seed() {
 // the response says nothing about whether it landed. The platform's record is
 // the owed marker: cleared on success, kept and stamped on failure (the same
 // observation `storage_cap_smoke_v2.py` makes).
-export function store() {
+export function store({ blob, kv }) {
     const hash = blob.put("payload-" + _param("k"));
     kv.set("h/" + _param("k"), hash);
     return hash;
 }
-export function marker() {
+export function marker({ kv }) {
     const h = kv.get("h/" + _param("k"));
     if (!h) return "no-hash";
     const m = kv.get("_blob/owed/" + h);
@@ -95,10 +95,10 @@ function _param(name) {
     }
     return "";
 }
-export function begin() {
+export function begin(_a) {
     return start();
 }
-export function status() {
+export function status(_a) {
     const st = get(_param("id"));
     if (!st) return "none";
     // `links()`, not `blob.url`: parts live in the tenant's unmetered
@@ -111,7 +111,7 @@ export function status() {
 }
 // The code slice's pointer half: a bundle manifest entry's hash presigns
 // out of the tenant's own file-blobs (rove#340).
-export function fileurl() {
+export function fileurl({ blob }) {
     return blob.fileUrl(_param("h"));
 }
 """

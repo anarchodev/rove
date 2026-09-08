@@ -3,7 +3,7 @@
 // arbitrary keys (the `/writekey` helper hardcodes the `watch/`
 // prefix for the kv-wake smoke and can't be repurposed without
 // breaking that smoke).
-export default function () {
+export default function ({ kv }) {
     const body = JSON.parse(request.text || "{}");
     if (!body.key || typeof body.key !== "string") {
         response.status = 400;

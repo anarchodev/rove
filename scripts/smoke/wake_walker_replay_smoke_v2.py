@@ -72,7 +72,7 @@ from replay_matrix_smoke_v2 import find_record, replay  # noqa: E402
 # The wake arm names a NON-conventional export, so the resolved export is part
 # of the recording: replay through `onWake` would find nothing to call.
 WAKE_SRC = """
-export default function () {
+export default function ({ after, kv, next }) {
   const q = request.query || "";
   if (q.includes("op=write")) { kv.set("wk/flag", "1"); response.status = 204; return ""; }
   if (q.includes("op=burst")) { kv.set("burst/mark", "1"); return "b"; }
@@ -81,7 +81,7 @@ export default function () {
   after.kv("wk/", { on: "onFired" });
   return next({ armed: true });
 }
-export function onFired() {
+export function onFired({ kv }) {
   const fired = request.activation.wakes.filter((w) => w.kind === "kv").map((w) => w.prefix).join(",");
   kv.set("observed", fired);
   response.status = 200;

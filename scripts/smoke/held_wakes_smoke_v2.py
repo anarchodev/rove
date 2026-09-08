@@ -37,7 +37,7 @@ WRITE_DELAY_S = 0.5
 # worker_drain (the path that dropped wakes[] before #8). `onWake` echoes the
 # surfaced batch so the smoke can assert the prefix-fired contract.
 HELD_SRC = """\
-export default function () {
+export default function ({ after, kv, next }) {
     kv.get("hw/flag");                       // read baseline → the write is 'after'
     after.kv("hw/", { on: "onWake" });
     return next({ prefix: "hw/" });          // held BUFFERED (no stream.start)
@@ -54,7 +54,7 @@ export function onWake() {
 """
 
 WRITEKV_SRC = """\
-export default function () {
+export default function ({ kv }) {
     const body = JSON.parse(request.text || "{}");
     if (!body.keys) { response.status = 400; return "missing keys"; }
     for (const k of body.keys) kv.set(k, body.value ?? "");
@@ -63,7 +63,7 @@ export default function () {
 }
 """
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 
 def main() -> int:

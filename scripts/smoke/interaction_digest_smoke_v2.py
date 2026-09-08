@@ -39,7 +39,7 @@ from smoke_lib_v2 import V2Cluster, APPS_DIR  # noqa: E402
 # the RESPONSE stays the same in both cases.
 FIXTURE = {
     "index.mjs": """
-export default function () {
+export default function ({ after, kv }) {
   const seen = kv.get("counter") ?? "0";
   const mode = request.query && request.query.includes("mode=b") ? "b" : "a";
   kv.set("mark", mode === "b" ? "value-b" : "value-a");
@@ -62,7 +62,7 @@ export default function () {
 # target + key + value the same way.)
 PLATFORM_FIXTURE = {
     "index.mjs": """
-export default function () {
+export default function ({ platform }) {
   const q = request.query || "";
   const mode = q.includes("mode=b") ? "b" : "a";
   platform.scope("tgt").kv.set("_digest/probe-" + mode, mode === "b" ? "B" : "A");

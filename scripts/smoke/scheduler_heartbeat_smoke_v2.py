@@ -42,7 +42,7 @@ from smoke_lib_v2 import V2Cluster  # noqa: E402
 SEED_SRC = r'''// `schedule` is the `@rewind/schedule` package, not an ambient global.
 import schedule from "@rewind/schedule";
 
-export default function () {
+export default function ({ kv }) {
     schedule({ in: 1000 }, "heartbeat", { n: 0 }, { key: "heartbeat" });
     kv.set("hb-seeded", "1");
     return "seeded";
@@ -52,7 +52,7 @@ export default function () {
 # carries {kind:"durable_wake", id, key, scheduled_at_ns, msg}.
 HEARTBEAT_SRC = r'''import schedule from "@rewind/schedule";
 
-export default function () {
+export default function ({ kv }) {
     const a = request.activation;
     if (a.kind !== "durable_wake") return { status: 200 };
     const count = parseInt(kv.get("hb-fire-count") ?? "0", 10) + 1;

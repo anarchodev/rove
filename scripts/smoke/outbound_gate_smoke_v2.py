@@ -59,23 +59,23 @@ GRANTED_PLAN = json.dumps({"tier": "pro"})
 FIRE_WAIT_S = 25.0
 
 HANDLER_SRC = r'''
-export function handler() { return "ready"; }
+export function handler(_a) { return "ready"; }
 
 // The other side of the gate: platform-internal doors (`*.internal`) are
 // storage / control-plane I/O, not third-party egress, so a tenant with no
 // outbound budget still reads and writes its own objects. `blob.put` lowers
 // to `rove-blob.internal` through the same fetch native the gate sits on —
 // if the gate ever stops discriminating, this is what breaks.
-export function storage() {
+export function storage({ blob, kv }) {
     kv.set("gate/probe", "kv-ok");
     const hash = blob.put("bytes", { contentType: "text/plain", on: "stored" });
     return "storage-ok:" + kv.get("gate/probe") + ":" + (hash ? "hashed" : "nohash");
 }
 
-export function stored() { return { status: 200 }; }
+export function stored(_a) { return { status: 200 }; }
 
 // (A) inline third-party egress from handler context.
-export function inline(url, tag) {
+export function inline({ webhook }, url, tag) {
     try {
         webhook.send(url, { method: "POST", body: tag });
         return "sent";
@@ -86,7 +86,7 @@ export function inline(url, tag) {
 
 // (B) deferred egress — the same verb with `at:`. No fetch is issued from
 // handler context; `__system/webhook_fire` issues it when the wake is due.
-export function deferred(url, tag, delay_ms) {
+export function deferred({ webhook }, url, tag, delay_ms) {
     const at = BigInt(Date.now() + delay_ms) * 1_000_000n;
     try {
         webhook.send(url, { method: "POST", body: tag, at: at });
@@ -98,7 +98,7 @@ export function deferred(url, tag, delay_ms) {
 
 // (C) laundered egress — hand-write the marker + scheduler rows the shim
 // would have written, as ordinary customer kv writes.
-export function launder(url, tag, delay_ms) {
+export function launder({ kv }, url, tag, delay_ms) {
     const id = "laundered-" + tag;
     kv.set("_send/owed/" + id, JSON.stringify({
         url: url,

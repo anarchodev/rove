@@ -1,3 +1,3 @@
-export function handler() {
+export function handler({ kv }) {
     return "readonly: " + (kv.get("greeting") ?? "(unset)") + "\n";
 }

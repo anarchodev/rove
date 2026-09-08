@@ -37,12 +37,12 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 TENANT = "recorded"
 SRC = """
-export function put() {
+export function put({ kv }) {
   const n = (parseInt(kv.get("n") || "0", 10) || 0) + 1;
   kv.set("n", String(n));
   return { n: n };
 }
-export function get() {
+export function get({ kv }) {
   return { n: parseInt(kv.get("n") || "0", 10) || 0 };
 }
 """

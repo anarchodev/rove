@@ -60,7 +60,7 @@ from smoke_lib_v2 import (  # noqa: E402
 
 # POST writes a kv key (fsync pressure on the leader's pump); GET returns "ready".
 HANDLER_SRC = """\
-export function handler() {
+export function handler({ kv }) {
     if (request.method === "POST") {
         const body = JSON.parse(request.text || "{}");
         kv.set("soak/" + (body.k ?? "x"), body.v ?? "");

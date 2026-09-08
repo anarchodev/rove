@@ -38,7 +38,7 @@ _REMAP = [
 ]
 
 SRC = """
-export default function () {
+export default function ({ kv }) {
   if (request.path === "/setup") { kv.set("pfx/foreign", "seeded"); response.status = 200; return "setup"; }
   kv.set("pfx/own", "written");
   const scan = kv.prefix("pfx/", "", 100);

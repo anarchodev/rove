@@ -33,7 +33,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 # acme/onfetchbuf example). The door's setup errors (e.g. LogsDoorForbidden for
 # a non-admin tenant) surface as a terminal event with `request.status === 0`
 # (a hard transport failure — the outbound was refused at the door).
-PROBE_SRC = r"""export default function () {
+PROBE_SRC = r"""export default function ({ after, next }) {
     const t = new URLSearchParams(request.query || "").get("t") || "acme";
     after.fetch("http://rewind-logs.internal/v1/" + t + "/list?limit=5");
     return next();
@@ -50,7 +50,7 @@ export function onFetchResult() {
 }
 """
 
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 FIXTURE = {
     "index.mjs": rpc_wrap(READY_SRC),

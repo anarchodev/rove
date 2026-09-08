@@ -19,7 +19,7 @@
 // smoke can assert each is byte-exact (no drops, in order).
 const SPLIT = "@@MULTIBIND-SPLIT@@";
 
-export default function () {
+export default function ({ after, kv, next }) {
     const q = request.query || "";
     let u1 = null;
     let u2 = null;
@@ -48,7 +48,7 @@ export default function () {
     return next();
 }
 
-export function onFetchChunk() {
+export function onFetchChunk({ kv, next }) {
     const fid = request.fetchId;
     const text = request.text;
     const prev = kv.get("mb/acc/" + fid) || "";
@@ -58,7 +58,7 @@ export function onFetchChunk() {
 
 // One terminal event per bound fetch (handler-shape.md §3). Count the
 // two completions; once BOTH are done return the reconstructed bodies.
-export function onFetchDone() {
+export function onFetchDone({ kv, next }) {
     const ndone = parseInt(kv.get("mb/ndone") || "0", 10) + 1;
     kv.set("mb/ndone", String(ndone));
     if (ndone < 2) {

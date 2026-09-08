@@ -19,7 +19,7 @@
 // before the next chunk dispatches). On the terminal chunk the handler
 // returns the fully reconstructed body to the held client, so the
 // smoke can assert byte-exactness directly.
-export default function () {
+export default function ({ after, kv, next }) {
     const q = request.query || "";
     let url = null;
     for (const pair of q.split("&")) {
@@ -40,7 +40,7 @@ export default function () {
     return next({ tag: "spoolsink" });
 }
 
-export function onFetchChunk() {
+export function onFetchChunk({ kv, next }) {
     const text = request.text;
     const prev = kv.get("spoolsink/full") || "";
     kv.set("spoolsink/full", prev + text);
@@ -49,7 +49,7 @@ export function onFetchChunk() {
 }
 
 // Terminal event — hand the reconstructed body back to the held client.
-export function onFetchDone() {
+export function onFetchDone({ kv }) {
     response.status = 200;
     return kv.get("spoolsink/full") || "";
 }

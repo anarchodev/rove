@@ -42,7 +42,7 @@ TENANT = "nexttar"
 
 # Root probe + query-driven kv read/write (the wswake shape: writes go
 # through a handler so the commit-gated kv_wake_broadcast fires).
-INDEX_SRC = r"""export default function () {
+INDEX_SRC = r"""export default function ({ kv }) {
   const params = new URLSearchParams(request.query || "");
   const setk = params.get("set");
   if (setk) { kv.set(setk, params.get("val") || ""); return "set:" + setk; }
@@ -53,7 +53,7 @@ INDEX_SRC = r"""export default function () {
 """
 
 # Leg A: the lobby hands the connection off to rooms/chat.mjs on join.
-LOBBY_SRC = r"""export function onMessage() {
+LOBBY_SRC = r"""export function onMessage({ kv, next, stream }) {
   const { data } = request.activation;
   if (data === "join") {
     kv.set("lobby/joined", "1");
@@ -67,7 +67,7 @@ LOBBY_SRC = r"""export function onMessage() {
 }
 """
 
-CHAT_SRC = r"""export function onMessage() {
+CHAT_SRC = r"""export function onMessage({ kv, next, stream }) {
   const { data } = request.activation;
   const room = request.ctx ? request.ctx.room : "<noctx>";
   kv.set("chat/got", data + ":" + room);
@@ -77,7 +77,7 @@ CHAT_SRC = r"""export function onMessage() {
 """
 
 # Leg B: SSE first hop parks the chain at flows/sink.mjs.
-SSE_SRC = r"""export default function () {
+SSE_SRC = r"""export default function ({ after, next, stream }) {
   response.status = 200;
   response.headers = { "content-type": "text/event-stream" };
   stream.start();
@@ -87,14 +87,14 @@ SSE_SRC = r"""export default function () {
 }
 
 // Decoy: a wake that re-enters THIS module (ignoring the target) writes it.
-export function onWake() {
+export function onWake({ after, kv, next }) {
   kv.set("sse/decoy", "1");
   after.kv("job/");
   return next();
 }
 """
 
-SINK_SRC = r"""export function onWake() {
+SINK_SRC = r"""export function onWake({ after, kv, next, stream }) {
   kv.set("sink/woke", request.ctx ? request.ctx.origin : "<noctx>");
   stream.write("event: sink\n\n");
   after.kv("job/");
@@ -103,7 +103,7 @@ SINK_SRC = r"""export function onWake() {
 """
 
 # Leg C: a park with no possible resume source.
-ORPHAN_SRC = r"""export default function () {
+ORPHAN_SRC = r"""export default function ({ next }) {
   return next({ n: 1 });
 }
 """

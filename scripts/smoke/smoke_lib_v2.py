@@ -180,7 +180,12 @@ RPC_SHIM = """\
 // platform invokes only the conventional export, so named-function
 // routing is handler JS.
 function __rpc(fns) {
-  return function () {
+  // The default receives the activation object and forwards it as every
+  // named fn's LEADING argument (`f(a, ...args)`) — the received-not-
+  // ambient idiom applied to the rpc recipe: fns destructure their caps
+  // from the first parameter, wire args follow. The `?fn=`/`{fn,args}`
+  // wire is unchanged.
+  return function (a) {
     let fn = null, args = [];
     for (const part of (request.query || "").split("&")) {
       const eq = part.indexOf("=");
@@ -198,7 +203,7 @@ function __rpc(fns) {
     }
     const f = fn ? fns[fn] : null;
     if (!f) { response.status = 404; return "no such fn: " + fn; }
-    return f(...args);
+    return f(a, ...args);
   };
 }
 """

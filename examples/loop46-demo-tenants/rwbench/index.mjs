@@ -4,7 +4,7 @@
 // the first write lands) return null, which still exercises the
 // read path. Math.random is captured by the replay tape, so this
 // handler is deterministic on replay despite the coin flip.
-export function handler() {
+export function handler({ kv }) {
     if (Math.random() < 0.1) {
         kv.set("k", "0123456789abcdef0123456789abcdef");
     } else {

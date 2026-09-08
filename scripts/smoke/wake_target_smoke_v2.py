@@ -45,11 +45,11 @@ TENANT = "acme"
 HANDLER_SRC = r'''
 import schedule from "@rewind/schedule";
 
-export function handler() { return "ready"; }
+export function handler(_a) { return "ready"; }
 
 // Arm a wake by hand at an arbitrary baked module — the raw shape the
 // `schedule` shim writes, which any handler can write directly.
-export function armBaked(target) {
+export function armBaked({ kv }, target) {
     const sid = "hand-" + target.replace(/[^a-z_]/g, "");
     const when = String(BigInt(Date.now()) * 1_000_000n);
     kv.set("_sched/by_id/" + sid, JSON.stringify({
@@ -68,26 +68,26 @@ export function armBaked(target) {
 
 // Did the entry survive? A refused target must leave nothing behind, or the
 // tick re-offers it forever.
-export function schedRow(sid) {
+export function schedRow({ kv }, sid) {
     return kv.get("_sched/by_id/" + sid) === null ? "gone" : "present";
 }
 
 // A legitimate wake at the tenant's OWN module — the supported path, which
 // the gate must not touch.
-export function armSchedule() {
+export function armSchedule(_a) {
     schedule({ in: 1000 }, "index.mjs.onWake", { tag: "own" }, { key: "own-wake" });
     return "armed";
 }
 
-export function onWake() {
+export function onWake({ kv }) {
     kv.set("wake/fired", "yes");
     return { status: 200 };
 }
 
-export function wakeFired() { return kv.get("wake/fired") || "no"; }
+export function wakeFired({ kv }) { return kv.get("wake/fired") || "no"; }
 
 // A legitimate wake at a BAKED module, through the supported verb.
-export function armSend(url) {
+export function armSend({ webhook }, url) {
     const at = BigInt(Date.now() + 1500) * 1_000_000n;
     webhook.send(url, { method: "POST", body: "scheduled", at: at });
     return "armed";

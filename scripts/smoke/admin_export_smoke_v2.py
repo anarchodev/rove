@@ -60,23 +60,23 @@ function _param(name) {
     }
     return "";
 }
-function _scoped() { return exp.forScope(platform.scope(_param("t"))); }
-export function seedx() {
+function _scoped(platform) { return exp.forScope(platform.scope(_param("t"))); }
+export function seedx({ platform }) {
     const n = parseInt(_param("n") || "0", 10);
     const skv = platform.scope(_param("t")).kv;
     for (let i = 0; i < n; i++) skv.set("data/" + String(i).padStart(4, "0"), "value-" + i);
     return "seeded:" + n;
 }
-export function xstart() {
-    return _scoped().start();
+export function xstart({ platform }) {
+    return _scoped(platform).start();
 }
-export function xget() {
-    const st = _scoped().get(_param("id"));
+export function xget({ platform }) {
+    const st = _scoped(platform).get(_param("id"));
     if (!st) return "none";
-    if (st.state === "done") st.links = _scoped().links(_param("id"));
+    if (st.state === "done") st.links = _scoped(platform).links(_param("id"));
     return JSON.stringify(st);
 }
-export function xfileurl() {
+export function xfileurl({ platform }) {
     return platform.scope(_param("t")).blob.fileUrl(_param("h"));
 }
 """

@@ -57,7 +57,7 @@ def _src(rel: str) -> str:
 HTTPFIRE_SRC = _src("acme/httpfire/index.mjs")
 HTTPRESULT_SRC = _src("acme/httpresult.mjs")
 WB_SRC = _src("wb/index.mjs")
-ACME_INDEX_SRC = 'export function handler() { return "acme-ready"; }\n'
+ACME_INDEX_SRC = 'export function handler(_a) { return "acme-ready"; }\n'
 
 TAG = "via-tenant-door"
 

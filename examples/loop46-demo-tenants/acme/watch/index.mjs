@@ -17,7 +17,7 @@
 // A disconnect needs no cleanup here, so there's no `onDisconnect`.
 // Inbound (the default export): open the stream + arm the kv wake. The
 // kv-write wake lands in onWake (Phase 4 named-export dispatch).
-export default function () {
+export default function ({ after, next, stream }) {
     response.status = 200;
     response.headers = {
         "Content-Type": "text/event-stream",
@@ -33,7 +33,7 @@ export default function () {
 // past the cursor. Coalesced wakes lose nothing — the drain always
 // starts where the last one stopped. Timer entries are ignored — this
 // handler only registered kv wakes.
-export function onWake() {
+export function onWake({ after, kv, next, stream }) {
     stream.start(); // keep the stream alive even on a zero-frame wake
     const cursor = request.ctx ? request.ctx.cursor : null;
     const rows = kv.prefix("watch/", cursor);

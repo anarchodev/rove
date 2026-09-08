@@ -1,4 +1,4 @@
-export default function () {
+export default function ({ kv }) {
   // GET /?set=<key>&val=<value> writes via a handler so the commit-gated
   // kv_wake_broadcast fires (admin /_system/v2-kv does not wake watchers).
   const q = request.query || "";
@@ -8,7 +8,7 @@ export default function () {
   return "ready";
 }
 
-export function onMessage() {
+export function onMessage({ after, next, stream }) {
   const { data } = request.activation;
   if (data.startsWith("watch:")) {            // arm an on.kv wake
     const prefix = data.slice(6);
@@ -25,7 +25,7 @@ export function onMessage() {
   return next();
 }
 
-export function onWake() {                      // kv under the prefix changed
+export function onWake({ kv, next, stream }) {                      // kv under the prefix changed
   // Edge "go look" wake: request.activation.wakes[] names WHICH armed
   // prefix fired (issue #8 — never the matched keys); re-read
   // authoritative kv under it for the data.
@@ -39,7 +39,7 @@ export function onWake() {                      // kv under the prefix changed
   return next();
 }
 
-export function onTimer() {                     // the timer elapsed
+export function onTimer({ next, stream }) {                     // the timer elapsed
   stream.write("tick");
   return next();
 }

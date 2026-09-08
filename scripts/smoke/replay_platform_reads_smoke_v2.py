@@ -50,14 +50,14 @@ REWIND_BIN = REPO_ROOT / "zig-out" / "bin" / "rewind"
 
 TARGET = "crossread"
 NS = "__rove_store/"
-HANDLER_SRC = 'export default function () { return "cross-read-ok\\n"; }'
+HANDLER_SRC = 'export default function ({ kv, platform }) { return "cross-read-ok\\n"; }'
 
 # The replay subject (rove#411): an ADMIN handler whose entire observable output
 # is cross-store reads. If the captured world replays, every link in the chain
 # holds — the reads were taped under the namespaced key, export-fixture carried
 # them into the world's map, and the offline facade resolved them there.
 ADMIN_PROBE_SRC = """
-export default function () {
+export default function ({ kv, platform }) {
   const root = platform.root.get("probe/root");
   const scoped = platform.scope("REPLACE_TARGET").kv.get("probe/scoped");
   const rows = platform.scope("REPLACE_TARGET").kv.prefix("probe/p/", "", 10)

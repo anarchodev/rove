@@ -39,9 +39,9 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 TENANT = "acme"
 
 HANDLER_SRC = r'''
-export function handler() { return "ready"; }
+export function handler(_a) { return "ready"; }
 
-export function seed() {
+export function seed({ kv }) {
     for (let i = 0; i < 40; i++) kv.set("k/" + i, "v".repeat(256));
     return "seeded";
 }
@@ -49,7 +49,7 @@ export function seed() {
 // Name the engine's export door directly, with the body its rewrite parses.
 // The refusal is synchronous at the fetch native, so it lands as a throw here
 // rather than as a failed transfer later.
-export function probe(cursor) {
+export function probe({ after, next }, cursor) {
     try {
         after.fetch("http://rove-kvexport.internal/", {
             method: "POST",
@@ -62,7 +62,7 @@ export function probe(cursor) {
     return next();
 }
 
-export function onres() {
+export function onres({ next }) {
     if (!request.done) return next();
     const p = (request.ctx && request.ctx.part) || request.ctx || {};
     return "reached:status=" + request.status + " ctx=" + JSON.stringify(p);
@@ -71,12 +71,12 @@ export function onres() {
 // The control: an ordinary internal door, reached the way customer code
 // always reaches one. This must keep working — a gate that closed every
 // `.internal` origin would look like a pass above and a broken product here.
-export function storage() {
+export function storage({ blob }) {
     const hash = blob.put("bytes", { contentType: "text/plain", on: "stored" });
     return "storage-ok:" + (hash ? "hashed" : "nohash");
 }
 
-export function stored() { return { status: 200 }; }
+export function stored(_a) { return { status: 200 }; }
 '''
 
 

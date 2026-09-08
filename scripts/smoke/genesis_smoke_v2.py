@@ -46,7 +46,7 @@ APP = "genesisapp"
 KEY = "greeting"
 V1 = "cold-multi-formed"
 V2 = "after-leader-kill"
-APP_SRC = 'export function handler() { return "genesis-served\\n"; }\n'
+APP_SRC = 'export function handler(_a) { return "genesis-served\\n"; }\n'
 
 
 def main() -> int:

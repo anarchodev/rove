@@ -31,7 +31,7 @@ function rollDie() {
     return 1 + Math.floor(Math.random() * 6);
 }
 
-export function handler() {
+export function handler({ kv }) {
     if (request && request.path && request.path.includes("/throw")) {
         // Date.now() in the throw message verifies that
         // worker_dispatch.zig preserves tape state captured BEFORE

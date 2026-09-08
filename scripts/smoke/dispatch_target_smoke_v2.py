@@ -60,10 +60,10 @@ TENANT = "acme"
 # that prefix can only mean the BAKED module ran (it is in no tenant's
 # deployment). `export_run` is the capability target.
 HANDLER_SRC = r'''
-export function handler() { return "ready"; }
+export function handler(_a) { return "ready"; }
 
 // (4) the continuation route. `on` is dispatched by `blob_onresult`'s next().
-export function putTo(target, log) {
+export function putTo({ blob }, target, log) {
     const h = blob.put(new TextEncoder().encode("x-" + Date.now() + "-" + log), {
         on: target,
         ctx: { log: log, first_seq: 0, last_seq: 0, count: 1, id: "probe" },
@@ -74,21 +74,21 @@ export function putTo(target, log) {
 // A hop into `webhook_onresult` would advance this tenant's own send state
 // machine out of band: it reads `_send/owed/{ctx.id}` and either drops the
 // marker or re-arms a `_sched/` retry. Untouched ⇒ the hop never landed.
-export function armOwed() {
+export function armOwed({ kv }) {
     kv.set("_send/owed/probe", JSON.stringify({
         url: "http://127.0.0.1:1/never", method: "POST", body: "", attempts: 0,
     }));
     return "armed";
 }
 
-export function owedRow() { return kv.get("_send/owed/probe") === null ? "gone" : "present"; }
+export function owedRow({ kv }) { return kv.get("_send/owed/probe") === null ? "gone" : "present"; }
 
-export function schedRows() {
+export function schedRows({ kv }) {
     return JSON.stringify((kv.prefix("_sched/", "", 20) || []).map(r => r.key));
 }
 
 // (1) the gate, at the issuing call.
-export function sub(url, target) {
+export function sub({ http }, url, target) {
     try {
         const id = http.subscribe({
             url: url,
@@ -102,13 +102,13 @@ export function sub(url, target) {
 }
 
 // Did the baked module run? Any row here is a dispatch that should not exist.
-export function seg() {
+export function seg({ kv }) {
     return JSON.stringify((kv.prefix("_seg/", "", 50) || []).map(r => r.key));
 }
 
 // (2) the capability. `_export/` is customer-writable by design, so the record
 // is forgeable; what must not be reachable is the door that acts on it.
-export function armExport(id) {
+export function armExport({ kv }, id) {
     kv.set("data/one", "hello");
     kv.set("_export/" + id, JSON.stringify({
         state: "running", cursor: "", parts: [], bytes: 0, entries: 0,
@@ -117,9 +117,9 @@ export function armExport(id) {
     return "armed";
 }
 
-export function exportRow(id) { return kv.get("_export/" + id) || "none"; }
+export function exportRow({ kv }, id) { return kv.get("_export/" + id) || "none"; }
 
-export function doorDirect() {
+export function doorDirect({ after }) {
     try {
         after.fetch("http://rove-kvexport.internal/", { on: "onNothing" });
         return "ALLOWED";
@@ -127,12 +127,12 @@ export function doorDirect() {
 }
 
 // (3) the shims, which name baked result handlers from customer context.
-export function send(url) {
+export function send({ webhook }, url) {
     webhook.send(url, { method: "POST", body: "shim-still-works" });
     return "sent";
 }
 
-export function put() {
+export function put({ blob, kv }) {
     const hash = blob.put(new TextEncoder().encode("blob-bytes-" + Date.now()));
     kv.set("probe/hash", hash);
     return hash;
@@ -140,7 +140,7 @@ export function put() {
 
 // The owed marker is deleted by `__system/blob_onresult` — its disappearance
 // IS the proof the allowlisted result target still fires.
-export function putSettled() {
+export function putSettled({ kv }) {
     const hash = kv.get("probe/hash");
     if (!hash) return "no-hash";
     return kv.get("_blob/owed/" + hash) === null ? "settled" : "owed";

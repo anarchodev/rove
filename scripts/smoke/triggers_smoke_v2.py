@@ -53,7 +53,7 @@ export function afterDelete(event) {
   }
 }'''
 
-HANDLER_SRC = '''export default function () {
+HANDLER_SRC = '''export default function ({ kv }) {
   const path = request.path;
   if (path === "/create") {
     const body = request.json;

@@ -6,7 +6,7 @@
 // reads current committed state under the prefix and reconciles: one
 // `sub-react-out/<tail>` marker per present row. At-least-once: a
 // redundant re-fire re-reads and rewrites the same values.
-export function onSubscription() {
+export function onSubscription({ kv }) {
     const a = request.activation;
     const rows = kv.prefix(a.source.prefix, "", 100);
     for (const r of rows) {

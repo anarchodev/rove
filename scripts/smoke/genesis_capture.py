@@ -36,7 +36,7 @@ APP = "genesisapp"
 KEY = "greeting"
 V1 = "born-self-then-grown"
 V2 = "after-leader-kill"
-APP_SRC = 'export function handler() { return "genesis-served\\n"; }\n'
+APP_SRC = 'export function handler(_a) { return "genesis-served\\n"; }\n'
 
 H = {"X-Rewind-Move-Secret": MOVE_SECRET}
 

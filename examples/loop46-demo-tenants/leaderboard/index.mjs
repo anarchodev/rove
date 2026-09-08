@@ -10,7 +10,7 @@
 
 const NAME_RE = /^[a-z0-9_-]{1,32}$/i;
 
-export default function () {
+export default function ({ kv }) {
   if (request.method === "POST") {
     const body = JSON.parse(request.text || "{}");
     const name = String(body.name || "").trim();

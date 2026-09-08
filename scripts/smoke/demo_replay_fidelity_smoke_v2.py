@@ -44,7 +44,7 @@ export const fmt = (c) => "$" + (c / 100).toFixed(2);
 # Relative to each module's OWN directory, as ES resolution requires: the
 # entry sits beside lib.mjs, the /order route module a directory below it.
 INDEX_SRC = 'import { PRICES, fmt } from "./lib.mjs";\n' + """
-export function catalogue() {
+export function catalogue(_a) {
   const items = ["mug", "shirt", "sticker"];
   return { items: items.map((i) => ({ item: i, price: fmt(PRICES[i]) })) };
 }
@@ -56,7 +56,7 @@ ORDER_SRC = 'import { PRICES, fmt } from "../lib.mjs";\n' + """
 // Reads, then writes, then answers. The digest folds the read (including
 // whether the key was PRESENT), the write, and the response, so a replay that
 // took a different branch cannot match by accident.
-export function place() {
+export function place({ kv }) {
   const q = request.query || "";
   const item = q.includes("item=")
     ? decodeURIComponent(q.split("item=")[1].split("&")[0])

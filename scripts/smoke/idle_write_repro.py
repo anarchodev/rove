@@ -31,7 +31,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 # A write on POST, a read on GET — same handler, so an asymmetry between the
 # two is about the method's replay-safety, not about different code paths.
 SRC = """\
-export function handler() {
+export function handler({ kv }) {
     if (request.method === "POST") {
         kv.set("probe", "v");
         response.status = 204;

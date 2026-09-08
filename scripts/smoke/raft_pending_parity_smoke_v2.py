@@ -63,16 +63,16 @@ SEQ_WRITES = int(os.environ.get("SEQ_WRITES", "16"))
 # per-index keys so the concurrency test depends only on the commit
 # machinery, not on serializable read-modify-write.
 HANDLER_SRC = '''
-export function ryw(n) {
+export function ryw({ kv }, n) {
   // Read-your-writes inside one activation (speculative overlay).
   kv.set("val", String(n));
   return kv.get("val");
 }
-export function put(i) {
+export function put({ kv }, i) {
   kv.set("k/" + i, String(i));
   return "ok";
 }
-export function get(i) {
+export function get({ kv }, i) {
   return kv.get("k/" + i) || "";
 }
 '''

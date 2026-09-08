@@ -41,7 +41,7 @@ from smoke_lib_v2 import (  # noqa: E402
 )
 
 TENANT = "shopdemo"
-SRC = 'export function handler() { return "self-serve ok\\n"; }\n'
+SRC = 'export function handler(_a) { return "self-serve ok\\n"; }\n'
 
 
 def main() -> int:

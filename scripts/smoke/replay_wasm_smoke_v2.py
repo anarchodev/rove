@@ -82,7 +82,7 @@ def _run_wasm_driver(bundle_path: Path, *, stop_at: int | None = None,
 HANDLER_SRC = """\
 function bumpCount(prior) { return prior + 1; }
 function rollDie() { return 1 + Math.floor(Math.random() * 6); }
-export function handler() {
+export function handler({ kv }) {
   const at = Date.now();
   const die = rollDie();
   const probe = request.headers["x-replay-probe"] ?? "none";

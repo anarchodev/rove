@@ -35,17 +35,17 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap, _curl, MOVE_SECRET, metric_counter
 USAGE_TTL_SEC = 2.0
 
 SRC = (
-    'export function fill() {\n'
+    'export function fill({ kv }) {\n'
     '  const m = (request.query || "").match(/i=(\\d+)/);\n'
     '  const i = m ? m[1] : "0";\n'
     '  kv.set("blob/" + i, "x".repeat(2048));\n'
     '  return "filled " + i + "\\n";\n'
     '}\n'
-    'export function read() {\n'
+    'export function read({ kv }) {\n'
     '  const v = kv.get("blob/0");\n'
     '  return v ? "len=" + v.length + "\\n" : "missing\\n";\n'
     '}\n'
-    'export function del() {\n'
+    'export function del({ kv }) {\n'
     '  kv.delete("blob/0");\n'
     '  return "deleted\\n";\n'
     '}\n'

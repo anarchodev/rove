@@ -16,7 +16,7 @@
 
 // GET `/?fn=start&args=[count,depth,url]`: kick `count` chains of
 // `depth` from a single client request (one writeset / one propose).
-export function start(count, depth, url) {
+export function start({ kv, webhook }, count, depth, url) {
     const n = count | 0;
     for (let i = 0; i < n; i++) {
         const cid = "c" + i;
@@ -31,7 +31,7 @@ export function start(count, depth, url) {
 }
 
 // POST `/` body {id, depth, url}: one chain link.
-export default function () {
+export default function ({ kv, webhook }) {
     const step = request.json;
     const id = step.id;
     const depth = step.depth | 0;
@@ -59,6 +59,6 @@ export default function () {
 
 // GET `/?fn=status`: ONE aggregate read — the only thing the bench
 // polls during the measured window. No entropy, no webhook.send.
-export function status() {
+export function status({ kv }) {
     return JSON.stringify({ count: (kv.get("chain/donecount") | 0) });
 }

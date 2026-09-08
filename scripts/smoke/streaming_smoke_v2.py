@@ -35,7 +35,7 @@ def _src(rel: str) -> str:
 
 # A trivial root readiness probe (acme's real index.mjs exports `handler`,
 # served via /?fn=handler — but /stream is the path under test).
-READY_SRC = 'export function handler() { return "ready"; }\n'
+READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
 EXPECTED_BODY = (
     "event: tick\ndata: alpha\n\n"

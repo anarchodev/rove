@@ -10,7 +10,7 @@
 //   sched-last-msg              JSON of the most recent request.ctx payload
 //   sched-last-scheduled-at-ns  scheduledAtNs of the most recent fire
 //   sched-fires/{id}            per-id fire count (idempotency observation)
-export default function () {
+export default function ({ kv }) {
     const a = request.activation;
     // Defensive: only act on durable_wake activations.
     if (a.kind !== "durable_wake") return { status: 200 };

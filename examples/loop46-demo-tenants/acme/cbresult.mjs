@@ -5,7 +5,7 @@
 // customer's opaque `context` IS `request.ctx`, and the delivery
 // metadata ({id, attempts, error, headers}) is on `request.activation.*`
 // (Endpoint A).
-export default function () {
+export default function ({ kv }) {
     const a = request.activation || {};
     const record = {
         ok: request.status >= 200 && request.status < 300,

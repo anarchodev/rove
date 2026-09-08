@@ -13,7 +13,7 @@ function resumeCtx() {
 }
 
 // Inbound: register the session + open the SSE tick stream.
-export default function () {
+export default function ({ after, kv, next, stream }) {
     const id = (request.query || "").split("&")
         .map(p => p.split("="))
         .find(p => decodeURIComponent(p[0]) === "id");
@@ -32,13 +32,13 @@ export default function () {
 }
 
 // Mirror the open: deregister the session when the client disconnects.
-export function onDisconnect() {
+export function onDisconnect({ kv }) {
     kv.set("sessions/" + resumeCtx().session_id, "offline");
     return "";
 }
 
 // Timer-driven tick; one frame per fire.
-export function onWake() {
+export function onWake({ after, next, stream }) {
     const ctx = resumeCtx();
     stream.start();
     for (const w of request.activation.wakes) {

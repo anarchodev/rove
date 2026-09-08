@@ -50,14 +50,14 @@ TARGET_HANDLER_SRC = "export default function(){ return 'deployed-by-admin\\n'; 
 # is durable, and returns the dep_id (no race, no sleep).
 ADMIN_SRC = (
     'const TARGET = "%s";\n' % TARGET
-    + "export default function () {\n"
+    + "export default function ({ next, platform }) {\n"
     + "  platform.compile(\n"
     + "    [{ path: \"index.mjs\", source: %s }],\n" % json.dumps(TARGET_HANDLER_SRC)
     + '    { scope: TARGET, on: "onCompiled" }\n'
     + "  );\n"
     + "  return next();\n"
     + "}\n"
-    + "export function onCompiled() {\n"
+    + "export function onCompiled({ next, platform }) {\n"
     + "  try {\n"
     + "  const ctx = request.ctx;\n"
     + "  if (!ctx || !ctx.ok) { response.status = 500; return JSON.stringify({ stage: \"compile\", ctx: ctx || null }); }\n"

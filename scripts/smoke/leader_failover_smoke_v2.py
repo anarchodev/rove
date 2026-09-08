@@ -52,7 +52,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap, metric_counter, metric_hist_mean_u
 # A single handler: POST {value} writes kv["failover/value"]; GET reads it
 # back. Verbatim-shape kv.get/kv.set bindings (matches on_kv_smoke_v2).
 HANDLER_SRC = """\
-export function handler() {
+export function handler({ kv }) {
     if (request.method === "POST") {
         const body = JSON.parse(request.text || "{}");
         kv.set("failover/value", body.value ?? "");

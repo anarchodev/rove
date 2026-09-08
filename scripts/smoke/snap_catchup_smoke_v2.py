@@ -43,7 +43,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 # POST {value} writes kv["catchup/value"]; GET reads it back.
 HANDLER_SRC = """\
-export function handler() {
+export function handler({ kv }) {
     if (request.method === "POST") {
         const body = JSON.parse(request.text || "{}");
         kv.set("catchup/value", body.value ?? "");

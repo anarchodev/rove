@@ -18,7 +18,7 @@
 //   send_timeout_ms(optional) webhook libcurl timeout; set high +
 //                  point target at an unreachable IP to exercise the
 //                  §6.4 mandatory-timeout (deadline) path
-export default function () {
+export default function ({ webhook }) {
     const req = request.json;
     const opts = {
         method: "POST",

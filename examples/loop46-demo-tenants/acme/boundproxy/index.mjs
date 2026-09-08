@@ -16,7 +16,7 @@
 // the entity in parked_continuations (cont→stream transition fires);
 // subsequent chunks arrive with the entity in stream_data_out
 // (stream wake via resumeBoundFetchStream).
-export default function () {
+export default function ({ after, next }) {
     const q = request.query || "";
     let url = null;
     for (const pair of q.split("&")) {
@@ -43,7 +43,7 @@ export default function () {
 // chunk.
 // Per intermediate upstream chunk on a bound, streaming fetch. The
 // terminal event dispatches to onFetchDone (handler-shape.md §3).
-export function onFetchChunk() {
+export function onFetchChunk({ next, stream }) {
     const text = request.text;
     // Headers ride only on the first activation (ignored once the head
     // is committed).
