@@ -1032,7 +1032,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // The factory registry (tracker #753, the shims-as-factories shape): a
     // factory-shaped shim registers `__rove_factories.<name> = function
     // (caps) {...}` instead of assigning `globalThis.<name>` from an IIFE,
-    // and `_factories_invoke.js` below calls each one with the capabilities
+    // and the shared invoker (`globals/_invoke.js`) calls each one with the capabilities
     // a platform shim receives, installing the result. The registry itself
     // carries no authority — authority flows in through the caps argument —
     // so it stays nameable; it is deleted with the rest of the ambient
@@ -1075,87 +1075,14 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // (dual-support: the templates below pick it up by shorthand, and the
     // ambient global goes away at the #753 cutover, not here).
     //
-    // The caps a platform shim receives, assembled by the engine and passed
-    // as ONE argument — a shim names what it was handed, nothing else, and
-    // each factory gets exactly its slice (`package-isolation.md` §4.3:
-    // narrowing is the normal case). Two kinds of member: an internal
-    // `_system.*` slice (the capability the shim wraps), and a
-    // namespace-rooted marker kv for the durable-effect shims. Names that
-    // STAY ambient at the cutover (`crypto`, `time`, `console`,
-    // `TextDecoder`, …) are read ambiently by factory bodies — handing them
-    // through caps would claim an authority distinction that does not
-    // exist.
-    //
-    // Invocation is explicit and dependency-ordered — the scheduler core
-    // precedes the shims that arm through it — and a registered factory the
-    // list does not consume fails loudly rather than installing with
-    // whatever caps a loop would guess.
-    evalSnippet(ctx, "_factories_invoke.js",
-        \\(function () {
-        \\  const reg = globalThis.__rove_factories;
-        \\  const pending = new Set(Object.keys(reg));
-        \\  const invoke = (name, caps) => {
-        \\    if (!pending.delete(name))
-        \\      throw new Error("factory not registered: " + name);
-        \\    return reg[name](caps);
-        \\  };
-        \\  // A namespace-rooted kv view — the per-shim narrowing: every key
-        \\  // the holder spells resolves under `root`, so the holder
-        \\  // structurally cannot touch a row outside its namespace. Keys
-        \\  // come back in the holder's spelling (the root strips on the way
-        \\  // out), so a prefix page's last key round-trips as the next
-        \\  // cursor. Call-time forwarding to `globalThis.kv` keeps one text
-        \\  // across the three engines (the sim's kv is per-run,
-        \\  // epilogue-installed).
-        \\  const rooted = (root) => ({
-        \\    get: (k) => globalThis.kv.get(root + k),
-        \\    set: (k, v) => globalThis.kv.set(root + k, v),
-        \\    delete: (k) => globalThis.kv.delete(root + k),
-        \\    prefix: (p, c, l) =>
-        \\      (globalThis.kv.prefix(root + p, c == null || c === "" ? c : root + c, l) || [])
-        \\        .map((e) => ({ key: e.key.slice(root.length), value: e.value })),
-        \\  });
-        \\  // Thin public shims over one native slice each.
-        \\  globalThis.kv = invoke("kv", { kv: _system.kv });
-        \\  globalThis.config = invoke("config", { config: _system.config });
-        \\  globalThis.console = invoke("console", { console: _system.console });
-        \\  globalThis.crypto = invoke("crypto", { crypto: _system.crypto });
-        \\  globalThis.http = invoke("http", { http: _system.http });
-        \\  globalThis.stream = invoke("stream", { stream: _system.stream });
-        \\  globalThis.next = invoke("next", { next: _system.continuation.next });
-        \\  globalThis.after = invoke("after", { after: _system.after, http: _system.http });
-        \\  // Web-platform + pure names (these stay ambient at the cutover).
-        \\  globalThis.TextEncoder = invoke("TextEncoder", { textcodec: _system.textcodec });
-        \\  globalThis.TextDecoder = invoke("TextDecoder", { textcodec: _system.textcodec });
-        \\  globalThis.__rove_request_proto = invoke("__rove_request_proto", {});
-        \\  globalThis.btoa = invoke("btoa", {});
-        \\  globalThis.atob = invoke("atob", {});
-        \\  globalThis.base64url = invoke("base64url", {});
-        \\  globalThis.hex = invoke("hex", {});
-        \\  globalThis.URLSearchParams = invoke("URLSearchParams", {});
-        \\  globalThis.time = invoke("time", {});
-        \\  // The durable scheduler CORE — private, never a global; the
-        \\  // durable-effect shims receive it as `sched`.
-        \\  const sched = invoke("sched", {
-        \\    kv: rooted("_sched/"), formats: __rove.formats,
-        \\  });
-        \\  globalThis.platform = invoke("platform", {
-        \\    platform: _system.platform, after: _system.after,
-        \\    blobReceive: _system.blob.receive, blobPresign: _system.blob.presign,
-        \\    sched: sched, kv: rooted("_dispatch/"), formats: __rove.formats,
-        \\  });
-        \\  globalThis.webhook = invoke("webhook", {
-        \\    http: _system.http, sched: sched, kv: rooted("_send/"),
-        \\    formats: __rove.formats,
-        \\  });
-        \\  globalThis.blob = invoke("blob", {
-        \\    http: _system.http, blob: _system.blob, kv: rooted("_blob/"),
-        \\    after: globalThis.after, formats: __rove.formats,
-        \\  });
-        \\  if (pending.size > 0)
-        \\    throw new Error("unconsumed factories: " + Array.from(pending).join(", "));
-        \\})();
-    );
+    // The per-shim caps live in ONE file — `globals/_invoke.js`, shared
+    // verbatim with the CLI sim prelude (sim_globals.zig) and the browser
+    // arena generator (gen_replay_prelude.py) — so which capabilities a
+    // shim receives is decided in exactly one place. The invoker is
+    // subset-tolerant (each engine embeds only the shims it serves); the
+    // capability-template test below is what catches a worker shim that
+    // silently failed to register.
+    evalSnippet(ctx, "_invoke.js", INVOKE_JS);
 
     // Reachability hardening (docs/architecture/builtin-libs.md).
     // Every factory above received its `_system.*` slice from the invoker
@@ -1574,6 +1501,7 @@ const GLOBAL_BUILTINS = [_]FnBinding{};
 
 // Public shims (docs/architecture/builtin-libs.md Phase A). JSDoc-carrying
 // JS over `_system.*`; this is the documentation source of truth.
+const INVOKE_JS = @embedFile("invoke_js");
 const KV_JS = @embedFile("kv_js");
 const CONFIG_JS = @embedFile("config_js");
 const CONSOLE_JS = @embedFile("console_js");
@@ -2030,7 +1958,7 @@ test "factories: a factory's return must not expose a capability it was handed" 
         \\  if (names.length === 0)
         \\    throw new Error("no factories registered");
         \\  // One marker per caps member any factory receives
-        \\  // (`_factories_invoke.js` is the authority on the set).
+        \\  // (`globals/_invoke.js` is the authority on the set).
         \\  const markers = {
         \\    http: {}, sched: function () {}, kv: {}, formats: {},
         \\    platform: {}, after: {}, blob: {},
