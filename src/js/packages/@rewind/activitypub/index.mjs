@@ -168,7 +168,7 @@ function _splitUrl(u) {
 }
 
 // Parse a draft-cavage `Signature:` header into a flat map.
-function _parseSigHeader(h) {
+function _parseSigHeader(config, kv, webhook, h) {
   const out = {};
   const re = /([a-zA-Z]+)="([^"]*)"/g;
   let m;
@@ -178,7 +178,7 @@ function _parseSigHeader(h) {
 
 // Rebuild the signing string from the `headers` list, drawing values
 // from a captured request snapshot (so it is identical on replay).
-function _signingStringFromSnapshot(snap, headerList) {
+function _signingStringFromSnapshot(config, kv, webhook, snap, headerList) {
   const lines = [];
   for (const name of headerList.split(" ")) {
     if (name === "(request-target)") {
@@ -259,13 +259,13 @@ class ActivityPubActor {
    *   return "ok";
    * }
    */
-  ensureKeypair() {
+  ensureKeypair({ kv }) {
     if (kv.get(this.cfg.key_path) != null) return;
     const k = crypto.oidcGenerateKey();
     kv.set(this.cfg.key_path, JSON.stringify({ priv: k.priv, jwk: k.jwk }));
   }
 
-  _key() {
+  _key({ kv }) {
     const raw = kv.get(this.cfg.key_path);
     if (raw == null) {
       throw new Error("activitypub: no keypair — call ensureKeypair() first");
@@ -360,7 +360,7 @@ class ActivityPubActor {
    * @example
    * export default () => activitypub.fromConfig().outbox();
    */
-  outbox(limit) {
+  outbox({ kv }, limit) {
     limit = limit > 0 ? limit : 20;
     const rows = kv.prefix(this.cfg.outbox_path + "/", null, 1000);
     const items = rows
@@ -392,7 +392,7 @@ class ActivityPubActor {
    * // ap/inbox/index.mjs
    * export default () => activitypub.fromConfig().inbox();
    */
-  inbox() {
+  inbox({ config, kv, webhook }) {
     const sigHeader = request.headers["signature"];
     if (!sigHeader) {
       response.status = 400;
@@ -405,7 +405,7 @@ class ActivityPubActor {
       response.status = 400;
       return "bad activity JSON";
     }
-    const sig = _parseSigHeader(sigHeader);
+    const sig = _parseSigHeader(config, kv, webhook, config, kv, webhook, sigHeader);
     if (!sig.keyId || !sig.signature) {
       response.status = 400;
       return "malformed Signature header";
@@ -467,7 +467,7 @@ class ActivityPubActor {
    * export default (event) =>
    *   activitypub.fromConfig().completeInbox(event);
    */
-  completeInbox(event) {
+  completeInbox({ config, kv, webhook }, event) {
     const ctx = (event && event.context) || {};
     if (!event || !event.ok) {
       return { ok: false, error: "actor fetch failed" };
@@ -490,7 +490,7 @@ class ActivityPubActor {
       }
     }
     // 2. Verify the signature over the reconstructed signing string.
-    const signingStr = _signingStringFromSnapshot(snap, ctx.headerList);
+    const signingStr = _signingStringFromSnapshot(config, kv, webhook, config, kv, webhook, snap, ctx.headerList);
     let jwk;
     try { jwk = _jwkFromPem(pem); }
     catch (e) { return { ok: false, error: "bad signer key: " + e.message }; }
@@ -505,7 +505,7 @@ class ActivityPubActor {
     return this._dispatch(ctx.activity, signerActor);
   }
 
-  _dispatch(activity, signerActor) {
+  _dispatch({ kv }, activity, signerActor) {
     const type = activity && activity.type;
     if (type === "Follow") {
       kv.set(this.cfg.followers_path + "/" + _safeKey(signerActor.id),
@@ -552,7 +552,7 @@ class ActivityPubActor {
    *   return JSON.stringify(activitypub.fromConfig().publishNote(content));
    * }
    */
-  publishNote(content, opts) {
+  publishNote({ kv }, content, opts) {
     opts = opts || {};
     const now = Date.now();
     const uid = crypto.randomUUID();
@@ -598,7 +598,7 @@ class ActivityPubActor {
   }
 
   // Signed POST of an activity to a remote inbox, as a durable Cmd.
-  _deliver(targetInbox, activity) {
+  _deliver({ webhook }, targetInbox, activity) {
     const key = this._key();
     const body = JSON.stringify(activity);
     const u = _splitUrl(targetInbox);
@@ -656,7 +656,7 @@ const activitypub = {
    * @example
    * const ap = activitypub.fromConfig();
    */
-  fromConfig(arg) {
+  fromConfig({ config }, arg) {
     if (arg == null || typeof arg === "string") {
       const path = arg ? "activitypub/" + arg : "activitypub";
       const raw = config.get(path);

@@ -86,8 +86,10 @@ const segments = {
    *   monotonic per log).
    *
    * @example
-   * const seq = segments.append(`room-${id}`, JSON.stringify(event));
-   * kv.set(`latest/${id}`, String(seq));
+   * export default ({ kv }) => {
+   *   const seq = segments.append({ kv }, `room-${id}`, JSON.stringify(event));
+   *   kv.set(`latest/${id}`, String(seq));
+   * };
    */
   /**
    * List the log ids that currently exist (kv-visible: hot rows,
@@ -107,7 +109,7 @@ const segments = {
    * // page.logs → ["audit-2026", "inbox"], page.cursor → null
    * if (page.logs.indexOf("inbox") < 0) throw new Error("missing log");
    */
-  logs(cursor, limit) {
+  logs({ kv }, cursor, limit) {
     limit = Math.min(Math.max(Number(limit) || 20, 1), 200);
     const P = "_seg/";
     const out = [];
@@ -134,7 +136,7 @@ const segments = {
     return { logs: out, cursor: cur };
   },
 
-  append(log, value) {
+  append({ kv }, log, value) {
     assertLog(log, "segments.append");
     if (typeof value !== "string")
       throw new TypeError("segments.append: value must be a string");
@@ -160,18 +162,18 @@ const segments = {
    *   return `next()` and finish in the `{on}` export).
    *
    * @example
-   * export default function () {
-   *   const v = segments.get("room-7", 42, { on: "onSeg" });
+   * export default function ({ blob, kv, next }) {
+   *   const v = segments.get({ blob, kv }, "room-7", 42, { on: "onSeg" });
    *   if (typeof v === "string") return v;          // hot
    *   if (v === null) { response.status = 404; return "gone"; }
    *   return next();                                 // sealed
    * }
-   * export function onSeg() {
+   * export function onSeg({ next }) {
    *   if (!request.done) return next();
    *   return segments.record();
    * }
    */
-  get(log, seq, opts) {
+  get({ blob, kv }, log, seq, opts) {
     assertLog(log, "segments.get");
     opts = opts || {};
     const on_key = typeof opts.on === "string" ? opts.on : undefined;
@@ -246,12 +248,12 @@ const segments = {
    *
    * @example
    * // cron("*\/5 * * * *", "sealRooms") in your module:
-   * export function sealRooms() {
+   * export function sealRooms({ blob, kv }) {
    *   for (const s of JSON.parse(kv.get("rooms") ?? "[]"))
-   *     segments.seal(`room-${s}`);
+   *     segments.seal({ blob, kv }, `room-${s}`);
    * }
    */
-  seal(log, opts) {
+  seal({ blob, kv }, log, opts) {
     assertLog(log, "segments.seal");
     opts = opts || {};
     const min = opts.min != null ? opts.min : 64;

@@ -65,7 +65,7 @@ SEED_FUTURE_VERSION = """
 // the arm — the tick can never observe the v1 record.
 import schedule from "@rewind/schedule";
 export default ({ kv }) => {
-    const id = schedule({ in: 4000 }, "schedtarget", { tag: "futurev" });
+    const id = schedule({ kv }, { in: 4000 }, "schedtarget", { tag: "futurev" });
     const byId = "_sched/by_id/" + id;
     const rec = JSON.parse(kv.get(byId));
     rec.v = 99;

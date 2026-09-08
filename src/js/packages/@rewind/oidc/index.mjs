@@ -143,7 +143,8 @@ class OIDCProvider {
    *   optional and default sensibly.
    * @param {string} name - Config name; namespaces the kv key paths.
    */
-  constructor(config, name) {
+  constructor(caps, config, name) {
+    this._caps = caps;
     this.cfg = {
       clients: Array.isArray(config.clients) ? config.clients : [],
       login_path: config.login_path || "/login",
@@ -214,7 +215,7 @@ class OIDCProvider {
   //    leadership double-fire dedup-safe with no schedule-version
   //    header (see §4.6 "Grounded correction 2026-05-16"). ──
   _keyset() {
-    const raw = kv.get(this.cfg.keyset_path);
+    const raw = this._caps.kv.get(this.cfg.keyset_path);
     if (raw != null) {
       const ks = _readRec(raw);
       // The one record here that must NOT fail soft. Every other read
@@ -244,7 +245,7 @@ class OIDCProvider {
         since: now,
       }],
     };
-    kv.set(this.cfg.keyset_path, JSON.stringify(_rec(keyset)));
+    this._caps.kv.set(this.cfg.keyset_path, JSON.stringify(_rec(keyset)));
     this._armRotation(now + this.cfg.rotation_period_ms);
     return keyset;
   }
@@ -261,7 +262,7 @@ class OIDCProvider {
   // sets the synthesized request's authority to the routed host), so
   // no explicitly-threaded host / genesis capture is needed.
   _armRotation(fire_at_ms) {
-    webhook.send("https://" + request.host + "/_oidc/rotate", {
+    this._caps.webhook.send("https://" + request.host + "/_oidc/rotate", {
       key: this.cfg.rot_handle,
       method: "POST",
       body: "",
@@ -337,7 +338,7 @@ class OIDCProvider {
     const keyset = this._keyset(); // genesis if somehow absent
     const now = Date.now();
     const next_deadline = this._advance(keyset, now);
-    kv.set(this.cfg.keyset_path, JSON.stringify(_rec(keyset)));
+    this._caps.kv.set(this.cfg.keyset_path, JSON.stringify(_rec(keyset)));
     this._armRotation(next_deadline);
     response.status = 200;
     response.headers = { "content-type": "application/json" };
@@ -357,7 +358,7 @@ class OIDCProvider {
       kid: k.kid, status: "current", priv: k.priv, jwk: k.jwk, since: now,
     }];
     keyset.min_iat = Math.floor(now / 1000);
-    kv.set(this.cfg.keyset_path, JSON.stringify(_rec(keyset)));
+    this._caps.kv.set(this.cfg.keyset_path, JSON.stringify(_rec(keyset)));
     this._armRotation(now + this.cfg.rotation_period_ms);
   }
 
@@ -469,7 +470,7 @@ class OIDCProvider {
   // No id_token_hint required (v1): the session row keys on the platform sid.
   _endSession() {
     const sid = request.session && request.session.id;
-    if (sid) kv.delete(this.cfg.session_path + "/" + sid);
+    if (sid) this._caps.kv.delete(this.cfg.session_path + "/" + sid);
     const q = new URLSearchParams(request.query || "");
     const plru = q.get("post_logout_redirect_uri");
     if (plru && this.isRegisteredClientOrigin(plru)) {
@@ -573,7 +574,7 @@ class OIDCProvider {
     // magic-link verify binds whatever address the mint step confirmed,
     // not the hint.
     const sid = request.session && request.session.id;
-    const sess_raw = sid ? kv.get(this.cfg.session_path + "/" + sid) : null;
+    const sess_raw = sid ? this._caps.kv.get(this.cfg.session_path + "/" + sid) : null;
     // NOT `_readRec`: `_oidc/session/{sid}` is the CUSTOMER's record, not
     // this package's. Their login handler writes it — `{sub, auth_time}`
     // at a documented seam — and this package only reads it. Requiring a
@@ -596,7 +597,7 @@ class OIDCProvider {
     // Mint a single-use authorization code bound to everything the
     // token endpoint must re-check.
     const code = _b64urlRandom(32);
-    kv.set(this.cfg.code_path + "/" + code, JSON.stringify(_rec({
+    this._caps.kv.set(this.cfg.code_path + "/" + code, JSON.stringify(_rec({
       client_id,
       redirect_uri,
       code_challenge,
@@ -629,11 +630,11 @@ class OIDCProvider {
     const device_code = _b64urlRandom(32);
     const user_code = _deviceUserCode();
     const now = Date.now();
-    kv.set(this.cfg.device_path + "/" + device_code, JSON.stringify(_rec({
+    this._caps.kv.set(this.cfg.device_path + "/" + device_code, JSON.stringify(_rec({
       client_id, scope, user_code, status: "pending", sub: null,
       exp: now + this.cfg.device_ttl_ms,
     })));
-    kv.set(this.cfg.device_user_path + "/" + user_code, device_code);
+    this._caps.kv.set(this.cfg.device_user_path + "/" + user_code, device_code);
 
     const iss = this._iss();
     const verification_uri = iss + "/device";
@@ -661,7 +662,7 @@ class OIDCProvider {
   // terminal — a pre-filled `?user_code=` link NEVER auto-approves.
   _deviceVerify() {
     const sid = request.session && request.session.id;
-    const sess_raw = sid ? kv.get(this.cfg.session_path + "/" + sid) : null;
+    const sess_raw = sid ? this._caps.kv.get(this.cfg.session_path + "/" + sid) : null;
     const m = request.method;
     const reqQuery = new URLSearchParams(request.query || "");
     // Customer-owned record — see the note in `_authorize`.
@@ -699,8 +700,8 @@ class OIDCProvider {
         "<button>Continue</button></form>");
     }
 
-    const device_code = kv.get(this.cfg.device_user_path + "/" + user_code);
-    const raw = device_code ? kv.get(this.cfg.device_path + "/" + device_code) : null;
+    const device_code = this._caps.kv.get(this.cfg.device_user_path + "/" + user_code);
+    const raw = device_code ? this._caps.kv.get(this.cfg.device_path + "/" + device_code) : null;
     if (raw == null) {
       return this._deviceHtml(400,
         "<h1>Invalid code</h1><p>That code is unknown, used, or expired.</p>");
@@ -714,7 +715,7 @@ class OIDCProvider {
     if (m === "POST") {
       st.status = action === "approve" ? "approved" : "denied";
       if (st.status === "approved") st.sub = sess.sub;
-      kv.set(this.cfg.device_path + "/" + device_code, JSON.stringify(_rec(st)));
+      this._caps.kv.set(this.cfg.device_path + "/" + device_code, JSON.stringify(_rec(st)));
       return this._deviceHtml(200, st.status === "approved"
         ? "<h1>Approved</h1><p>You can return to your terminal.</p>"
         : "<h1>Denied</h1><p>No device was linked.</p>");
@@ -762,11 +763,11 @@ class OIDCProvider {
     // Opaque access + refresh tokens, kv-stored (§4.6: opaque
     // refresh bounds the retired-key window + allows hard revoke).
     const at = _b64urlRandom(32);
-    kv.set(this.cfg.at_path + "/" + at, JSON.stringify(_rec({
+    this._caps.kv.set(this.cfg.at_path + "/" + at, JSON.stringify(_rec({
       sub, client_id, scope, exp: Date.now() + this.cfg.id_token_ttl_ms,
     })));
     const rt = _b64urlRandom(32);
-    kv.set(this.cfg.rt_path + "/" + rt, JSON.stringify(_rec({
+    this._caps.kv.set(this.cfg.rt_path + "/" + rt, JSON.stringify(_rec({
       sub, client_id, scope, nonce: nonce || null, auth_time,
       iat: Date.now(), exp: Date.now() + this.cfg.refresh_ttl_ms,
     })));
@@ -793,9 +794,9 @@ class OIDCProvider {
       if (!code) return this._tokenErr("invalid_request", "missing code");
 
       const key = this.cfg.code_path + "/" + code;
-      const raw = kv.get(key);
+      const raw = this._caps.kv.get(key);
       // Single-use: consume before any check so a replay can't race.
-      kv.delete(key);
+      this._caps.kv.delete(key);
       if (raw == null) return this._tokenErr("invalid_grant", "unknown or used code");
       const st = _readRec(raw);
       if (st == null) return this._tokenErr("invalid_grant", "unknown or used code");
@@ -819,8 +820,8 @@ class OIDCProvider {
       const client_id = f.get("client_id");
       if (!rt) return this._tokenErr("invalid_request", "missing refresh_token");
       const key = this.cfg.rt_path + "/" + rt;
-      const raw = kv.get(key);
-      kv.delete(key); // rotate refresh tokens (single-use)
+      const raw = this._caps.kv.get(key);
+      this._caps.kv.delete(key); // rotate refresh tokens (single-use)
       if (raw == null) return this._tokenErr("invalid_grant", "unknown refresh_token");
       const st = _readRec(raw);
       if (st == null) return this._tokenErr("invalid_grant", "unknown refresh_token");
@@ -845,7 +846,7 @@ class OIDCProvider {
       const client_id = f.get("client_id");
       if (!device_code) return this._tokenErr("invalid_request", "missing device_code");
       const key = this.cfg.device_path + "/" + device_code;
-      const raw = kv.get(key);
+      const raw = this._caps.kv.get(key);
       if (raw == null) return this._tokenErr("expired_token", "unknown or expired device_code");
       const st = _readRec(raw);
       if (st == null) return this._tokenErr("expired_token", "unknown or expired device_code");
@@ -853,21 +854,21 @@ class OIDCProvider {
         return this._tokenErr("invalid_grant", "client_id mismatch");
       }
       if (Date.now() > st.exp) {
-        kv.delete(key);
-        if (st.user_code) kv.delete(this.cfg.device_user_path + "/" + st.user_code);
+        this._caps.kv.delete(key);
+        if (st.user_code) this._caps.kv.delete(this.cfg.device_user_path + "/" + st.user_code);
         return this._tokenErr("expired_token", "device_code expired");
       }
       if (st.status === "pending") {
         return this._tokenErr("authorization_pending", "waiting for user approval");
       }
       if (st.status !== "approved") {
-        kv.delete(key);
-        if (st.user_code) kv.delete(this.cfg.device_user_path + "/" + st.user_code);
+        this._caps.kv.delete(key);
+        if (st.user_code) this._caps.kv.delete(this.cfg.device_user_path + "/" + st.user_code);
         return this._tokenErr("access_denied", "the user denied the request");
       }
       // Approved → issue + consume (single-use: drop the device + index rows).
-      kv.delete(key);
-      if (st.user_code) kv.delete(this.cfg.device_user_path + "/" + st.user_code);
+      this._caps.kv.delete(key);
+      if (st.user_code) this._caps.kv.delete(this.cfg.device_user_path + "/" + st.user_code);
       return this._issueTokens(
         keyset, st.client_id, st.sub, st.scope, null, _OIDC_SECONDS(Date.now()));
     }
@@ -933,7 +934,8 @@ class OIDCRelyingParty {
    * @param {string} name - Config name; namespaces the kv key paths.
    * @throws {TypeError} Missing `issuer`/`client_id`/`redirect_uri`.
    */
-  constructor(config, name) {
+  constructor(caps, config, name) {
+    this._caps = caps;
     if (!config.issuer || !config.client_id || !config.redirect_uri) {
       throw new TypeError(
         "oidc.rp: config needs issuer, client_id, redirect_uri");
@@ -1001,7 +1003,7 @@ class OIDCRelyingParty {
     const verifier = _b64urlRandom(32);
     const challenge = _s256(verifier);
 
-    kv.set(this.cfg.state_path + "/" + state, JSON.stringify(_rec({
+    this._caps.kv.set(this.cfg.state_path + "/" + state, JSON.stringify(_rec({
       verifier, sid, return_to, created_at: Date.now(),
     })));
 
@@ -1065,8 +1067,8 @@ class OIDCRelyingParty {
       return "missing code or state";
     }
     const skey = this.cfg.state_path + "/" + state;
-    const raw = kv.get(skey);
-    kv.delete(skey); // single-use: consume before any check
+    const raw = this._caps.kv.get(skey);
+    this._caps.kv.delete(skey); // single-use: consume before any check
     if (raw == null) {
       response.status = 400;
       return "unknown or used sign-in state";
@@ -1086,7 +1088,7 @@ class OIDCRelyingParty {
     });
     // `context` is a TOP-LEVEL webhook.send field (NOT nested in
     // on_result — matches oauth.js).
-    webhook.send(this.cfg.issuer + "/token", {
+    this._caps.webhook.send(this.cfg.issuer + "/token", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body.toString(),
@@ -1155,7 +1157,7 @@ class OIDCRelyingParty {
     const dec = jwt.decode(id_token);
     if (!dec) { response.status = 200; return "malformed id_token"; }
 
-    const cachedRaw = kv.get(this.cfg.jwks_path);
+    const cachedRaw = this._caps.kv.get(this.cfg.jwks_path);
     if (cachedRaw != null) {
       const cached = _readRec(cachedRaw) || { keys: [] };
       const kid = dec.header && dec.header.kid;
@@ -1165,7 +1167,7 @@ class OIDCRelyingParty {
       }
     }
     // Unknown/absent kid → refetch JWKS, finish in completeJwks.
-    webhook.send(this.cfg.issuer + "/.well-known/jwks.json", {
+    this._caps.webhook.send(this.cfg.issuer + "/.well-known/jwks.json", {
       method: "GET",
       on: this.cfg.jwks_module,
       ctx: { sid: ctx.sid, return_to: ctx.return_to, id_token },
@@ -1194,7 +1196,7 @@ class OIDCRelyingParty {
       response.status = 200;
       return "malformed jwks";
     }
-    kv.set(this.cfg.jwks_path, JSON.stringify(_rec({
+    this._caps.kv.set(this.cfg.jwks_path, JSON.stringify(_rec({
       keys: jwks.keys, fetched_at: Date.now(),
     })));
     return this._finish(ctx.id_token, jwks, ctx.sid, ctx.return_to);
@@ -1224,9 +1226,9 @@ class OIDCRelyingParty {
     // RPs that have no operator concept).
     let is_root = false;
     if (this.cfg.operator_prefix) {
-      is_root = kv.get(this.cfg.operator_prefix + crypto.sha256(sub)) != null;
+      is_root = this._caps.kv.get(this.cfg.operator_prefix + crypto.sha256(sub)) != null;
     }
-    kv.set(this.cfg.sess_path + "/" + sid, JSON.stringify(_rec({
+    this._caps.kv.set(this.cfg.sess_path + "/" + sid, JSON.stringify(_rec({
       sub, is_root,
       exp: Date.now() + this.cfg.session_ttl_ms,
     })));
@@ -1260,7 +1262,7 @@ class OIDCRelyingParty {
     const dec = jwt.decode(id_token);
     if (!dec) { response.status = 400; return { error: "malformed id_token" }; }
 
-    const cachedRaw = kv.get(this.cfg.jwks_path);
+    const cachedRaw = this._caps.kv.get(this.cfg.jwks_path);
     if (cachedRaw != null) {
       const cached = _readRec(cachedRaw) || { keys: [] };
       const kid = dec.header && dec.header.kid;
@@ -1271,7 +1273,7 @@ class OIDCRelyingParty {
       }
     }
     // Unknown/absent kid → refetch JWKS, finish in completeJwks (callback).
-    webhook.send(this.cfg.issuer + "/.well-known/jwks.json", {
+    this._caps.webhook.send(this.cfg.issuer + "/.well-known/jwks.json", {
       method: "GET",
       on: this.cfg.jwks_module,
       ctx: { sid, id_token },
@@ -1295,11 +1297,11 @@ class OIDCRelyingParty {
     const sid = request.session && request.session.id;
     if (!sid) return null;
     const key = this.cfg.sess_path + "/" + sid;
-    const raw = kv.get(key);
+    const raw = this._caps.kv.get(key);
     if (raw == null) return null;
     const s = _readRec(raw);
-    if (!s) { kv.delete(key); return null; }
-    if (Date.now() >= s.exp) { kv.delete(key); return null; }
+    if (!s) { this._caps.kv.delete(key); return null; }
+    if (Date.now() >= s.exp) { this._caps.kv.delete(key); return null; }
     return { sub: s.sub, is_root: !!s.is_root };
   }
 
@@ -1331,7 +1333,7 @@ class OIDCRelyingParty {
    */
   logout() {
     const sid = request.session && request.session.id;
-    if (sid) kv.delete(this.cfg.sess_path + "/" + sid);
+    if (sid) this._caps.kv.delete(this.cfg.sess_path + "/" + sid);
     response.status = 200;
     response.headers = { "content-type": "application/json" };
     return JSON.stringify({ ok: true });
@@ -1353,7 +1355,7 @@ class OIDCRelyingParty {
    */
   logoutRedirect() {
     const sid = request.session && request.session.id;
-    if (sid) kv.delete(this.cfg.sess_path + "/" + sid);
+    if (sid) this._caps.kv.delete(this.cfg.sess_path + "/" + sid);
     const q = new URLSearchParams(request.query || "");
     const back = "https://" + request.host + this._safePath(q.get("return_to"));
     response.status = 302;
@@ -1390,7 +1392,7 @@ const oidc = {
    * @example
    * export default () => oidc.provider().handle();
    */
-  provider(arg) {
+  provider(caps, arg) {
     if (arg == null || typeof arg === "string") {
       const name = arg || "default";
       // Precedence (docs/architecture/auth-and-domains.md): the live admin-managed
@@ -1401,8 +1403,8 @@ const oidc = {
       // `web/auth/_config/oidc/{name}.json`. The fallback IS that
       // documented override/template relationship in code — it makes
       // the prod path work with zero bootstrap glue.
-      let raw = kv.get("_oidc/config/" + name);
-      if (raw == null) raw = config.get("oidc/" + name);
+      let raw = caps.kv.get("_oidc/config/" + name);
+      if (raw == null) raw = caps.config.get("oidc/" + name);
       if (raw == null) {
         throw new Error(
           "oidc.provider: no client registry at _oidc/config/" + name +
@@ -1410,10 +1412,10 @@ const oidc = {
           "X-Rove-Scope: __auth__, or deploy web/auth/_config/oidc/" +
           name + ".json).");
       }
-      return new OIDCProvider(JSON.parse(raw), name);
+      return new OIDCProvider(caps, JSON.parse(raw), name);
     }
     if (typeof arg === "object") {
-      return new OIDCProvider(arg, arg.name || "_inline");
+      return new OIDCProvider(caps, arg, arg.name || "_inline");
     }
     throw new TypeError("oidc.provider: expected string name or config object");
   },
@@ -1432,7 +1434,7 @@ const oidc = {
    * @example
    * const auth = oidc.rp("default").guard();
    */
-  rp(arg) {
+  rp(caps, arg) {
     if (arg == null || typeof arg === "string") {
       const name = arg || "default";
       // `_oidc/rp/{name}` wins (runtime-mutable via admin setKv); fall back to
@@ -1441,18 +1443,18 @@ const oidc = {
       // deploy declaratively — symmetric with oidc.provider's registry fallback
       // (above). Without this an operator must hand-seed _oidc/rp after every
       // wipe or the dashboard 500s.
-      let raw = kv.get("_oidc/rp/" + name);
-      if (raw == null) raw = config.get("oidc/rp/" + name);
+      let raw = caps.kv.get("_oidc/rp/" + name);
+      if (raw == null) raw = caps.config.get("oidc/rp/" + name);
       if (raw == null) {
         throw new Error(
           "oidc.rp: no RP config at _oidc/rp/" + name +
           " or _config/oidc/rp/" + name +
           " (set via admin setKv, or ship _config/oidc/rp/" + name + ".json).");
       }
-      return new OIDCRelyingParty(JSON.parse(raw), name);
+      return new OIDCRelyingParty(caps, JSON.parse(raw), name);
     }
     if (typeof arg === "object") {
-      return new OIDCRelyingParty(arg, arg.name || "_inline");
+      return new OIDCRelyingParty(caps, arg, arg.name || "_inline");
     }
     throw new TypeError("oidc.rp: expected string name or config object");
   },

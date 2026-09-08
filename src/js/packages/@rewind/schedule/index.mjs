@@ -90,7 +90,7 @@
   // the ceiling (the point at which we want to reject). Only invoked for
   // genuinely-new ids (re-arming an existing key is last-write-wins, not
   // a new outstanding entry).
-  function _enforceOutstandingCap() {
+  function _enforceOutstandingCap(kv) {
     let cursor = "";
     let count = 0;
     for (;;) {
@@ -121,7 +121,7 @@
 
   // The arm: validate, cap, write the two `_sched/` rows. Shared by the
   // verb and every internal composer (cron ticks, webhook retry).
-  function _arm(whenNs, target, msg, opts) {
+  function _arm(kv, whenNs, target, msg, opts) {
     if (typeof target !== "string" || target.length === 0) {
       throw new TypeError("schedule: target must be a non-empty module specifier");
     }
@@ -155,7 +155,7 @@
         // Corrupt existing record — overwrite it wholesale below.
       }
     } else {
-      _enforceOutstandingCap();
+      _enforceOutstandingCap(kv);
     }
 
     const record = { v: SCHED_REC_V, when_ns: String(rounded), target: target, msg: payload };
@@ -219,15 +219,15 @@
    * @throws {TypeError} On a malformed `when` or empty `target`.
    * @throws {Error} If `ctx` exceeds 16 KiB or the outstanding cap is hit.
    * @example
-   * const id = schedule({ in: 5000 }, "jobs/poll");
-   * schedule({ in: "1h" }, "jobs/expire", { leaseId: "l-7" });
+   * const id = schedule({ kv }, { in: 5000 }, "jobs/poll");
+   * schedule({ kv }, { in: "1h" }, "jobs/expire", { leaseId: "l-7" });
    */
-const schedule = Object.assign(function schedule(when, target, ctx, opts) {
+const schedule = Object.assign(function schedule({ kv }, when, target, ctx, opts) {
     let whenNs;
     if (when && when.at !== undefined) whenNs = _coerceAt(when.at);
     else if (when && when.in !== undefined) whenNs = _coerceIn(when.in);
     else throw new TypeError("schedule(when, target, ctx?, opts?): when must be { at } or { in }");
-    return _arm(whenNs, target, ctx, opts);
+    return _arm(kv, whenNs, target, ctx, opts);
   }, {
     /**
      * Cancel a scheduled wake by id. Removes both the `_sched/by_id`
@@ -237,10 +237,10 @@ const schedule = Object.assign(function schedule(when, target, ctx, opts) {
      * @param {string} id - The id `schedule(...)` returned.
      * @returns {boolean} `true` iff an entry was removed.
      * @example
-     * const id = schedule({ in: "1h" }, "jobs/expire");
-     * if (!schedule.cancel(id)) throw new Error("cancel missed");
+     * const id = schedule({ kv }, { in: "1h" }, "jobs/expire");
+     * if (!schedule.cancel({ kv }, id)) throw new Error("cancel missed");
      */
-    cancel(id) {
+    cancel({ kv }, id) {
       if (typeof id !== "string" || id.length === 0) return false;
       const raw = kv.get(_byIdKey(id));
       if (raw === null) return false;
@@ -266,11 +266,11 @@ const schedule = Object.assign(function schedule(when, target, ctx, opts) {
      *   key: (string|null)} | null} The schedule, or `null` if unknown /
      *   already fired.
      * @example
-     * const id = schedule({ in: "1h" }, "jobs/expire");
-     * const s = schedule.get(id);
+     * const id = schedule({ kv }, { in: "1h" }, "jobs/expire");
+     * const s = schedule.get({ kv }, id);
      * if (!s || s.target !== "jobs/expire") throw new Error("lookup failed");
      */
-    get(id) {
+    get({ kv }, id) {
       if (typeof id !== "string" || id.length === 0) return null;
       const raw = kv.get(_byIdKey(id));
       if (raw === null) return null;

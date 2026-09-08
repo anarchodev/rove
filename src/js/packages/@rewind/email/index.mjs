@@ -43,17 +43,19 @@ const email = {
    * @throws {TypeError} On missing/invalid `apiKey`/`from`/`subject`/`to`.
    *
    * @example
-   * const apiKey = kv.get("secret/resend") ?? "re_dev_placeholder";
-   * const user = { email: "ada@example.com", name: "Ada" };
-   * email.send({
-   *   apiKey,
-   *   from: "noreply@acme.dev",
-   *   to: user.email,
-   *   subject: "Welcome",
-   *   html: `<h1>Hi ${user.name}</h1>`,
-   * });
+   * export default ({ kv, webhook }) => {
+   *   const apiKey = kv.get("secret/resend") ?? "re_dev_placeholder";
+   *   const user = { email: "ada@example.com", name: "Ada" };
+   *   email.send({ webhook }, {
+   *     apiKey,
+   *     from: "noreply@acme.dev",
+   *     to: user.email,
+   *     subject: "Welcome",
+   *     html: `<h1>Hi ${user.name}</h1>`,
+   *   });
+   * };
    */
-  send(opts) {
+  send({ webhook }, opts) {
     if (!opts || typeof opts !== "object")
       throw new TypeError("email.send requires an options object");
     for (const pair of [["key", "apiKey"], ["reply_to", "replyTo"], ["max_attempts", "maxAttempts"], ["timeout_ms", "timeoutMs"]]) {

@@ -35,10 +35,10 @@ from smoke_lib_v2 import V2Cluster  # noqa: E402
 INDEX_SRC = r"""
 // `schedule` is the `@rewind/schedule` package, not an ambient global.
 import schedule from "@rewind/schedule";
-export default function () {
+export default function ({ kv }) {
     const q = new URLSearchParams(request.query || "");
     const target = q.get("target") || "jobs.mjs.weekly";
-    const id = schedule({ in: 1000 }, target, { tag: q.get("tag") || "m" });
+    const id = schedule({ kv }, { in: 1000 }, target, { tag: q.get("tag") || "m" });
     return { id: id, target: target };
 }
 """

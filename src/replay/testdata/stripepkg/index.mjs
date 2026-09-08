@@ -5,33 +5,33 @@
 // arrive later). Also drives verifyWebhook, which is pure.
 import stripe from "@rewind/stripe";
 
-const sk = () => stripe.client({ apiKey: "sk_test_x", on: "onStripe" });
+const sk = (caps) => stripe.client(caps, { apiKey: "sk_test_x", on: "onStripe" });
 
-export default function ({ next }) {
+export default function ({ next, after, webhook }) {
   if (request.path === "/intent") {
-    sk().setupIntents.create({ customer: "cus_1" }, { on: "onIntent" });
+    sk({ after, webhook }).setupIntents.create({ customer: "cus_1" }, { on: "onIntent" });
     return next();                      // held — the resume answers the browser
   }
   if (request.path === "/subscribe") {
-    return { id: sk().subscriptions.create({
+    return { id: sk({ after, webhook }).subscriptions.create({
       customer: "cus_1",
       items: [{ price: "price_1" }],
       metadata: { tenant: "acme" },
     }, { ctx: { plan: "pro" } }) };
   }
   if (request.path === "/subscribe-keyed") {
-    return { id: sk().subscriptions.create(
+    return { id: sk({ after, webhook }).subscriptions.create(
       { customer: "cus_1", items: [{ price: "price_1" }] },
       { idempotencyKey: "sub-acme-pro-1" }) };
   }
   if (request.path === "/subscribe-incomplete") {
-    sk().subscriptions.createIncomplete(
+    sk({ after, webhook }).subscriptions.createIncomplete(
       { customer: "cus_1", items: [{ price: "price_1" }], metadata: { tier: "pro" } },
       { on: "onIntent", idempotencyKey: "subinc-acme-pro" });
     return next();                      // held — the browser needs the PI secret
   }
   if (request.path === "/cancel") {
-    return { id: sk().subscriptions.cancel("sub_9", { idempotencyKey: "cancel-1" }) };
+    return { id: sk({ after, webhook }).subscriptions.cancel("sub_9", { idempotencyKey: "cancel-1" }) };
   }
   // verifyWebhook — pure, so it runs inline. The body and signature are
   // fixtures computed under the same secret the handler passes.

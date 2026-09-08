@@ -74,8 +74,8 @@ export function schedRow({ kv }, sid) {
 
 // A legitimate wake at the tenant's OWN module — the supported path, which
 // the gate must not touch.
-export function armSchedule(_a) {
-    schedule({ in: 1000 }, "index.mjs.onWake", { tag: "own" }, { key: "own-wake" });
+export function armSchedule({ kv }) {
+    schedule({ kv }, { in: 1000 }, "index.mjs.onWake", { tag: "own" }, { key: "own-wake" });
     return "armed";
 }
 

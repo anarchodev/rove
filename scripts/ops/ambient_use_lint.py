@@ -83,6 +83,10 @@ TREES = (
     # The demo tenants are the handler corpus the smokes deploy from disk
     # (`_src()` in the bound-fetch family) — customer-shaped by definition.
     "examples/loop46-demo-tenants",
+    # The first-party packages: package code receives capabilities like any
+    # other customer-shaped code (`package-isolation.md` — being first-party
+    # buys no ambient reach).
+    "src/js/packages",
 )
 
 SKIP_PARTS = ("_static", "node_modules", ".git")
@@ -113,6 +117,27 @@ def _strip_literals(src: str) -> str:
     """
     out = []
     i, n = 0, len(src)
+
+    def _regex_position() -> bool:
+        # A `/` opens a regex literal (not division) when what precedes it
+        # cannot end an expression. Without this, a quote inside a regex
+        # (`.replace(/'/g, …)`) flips the string tracker and everything
+        # after alternates between blanked code and surviving string
+        # bodies — which zeroed a whole file's count once.
+        j = len(out)
+        text = "".join(out[-4:]) if out else ""
+        t = text.rstrip()
+        if not t:
+            return True
+        last = t[-1]
+        if last in "(,=:[!&|?{};+-*%<>~^":
+            return True
+        # `return /re/` — a keyword boundary
+        for kw in ("return", "typeof", "case", "in", "of", "new", "do", "else"):
+            if t.endswith(kw):
+                return True
+        return False
+
     while i < n:
         ch = src[i]
         if ch == "/" and i + 1 < n and src[i + 1] == "/":
@@ -124,6 +149,25 @@ def _strip_literals(src: str) -> str:
             j = src.find("*/", i + 2)
             j = n if j < 0 else j + 2
             out.append("".join(c if c == "\n" else " " for c in src[i:j]))
+            i = j
+        elif ch == "/" and i + 1 < n and src[i + 1] not in "/*" and _regex_position():
+            # Regex literal: consume to the unescaped closing `/`, honoring
+            # character classes. Blank the body like any other literal.
+            j = i + 1
+            in_class = False
+            while j < n and src[j] != "\n":
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == "[":
+                    in_class = True
+                elif src[j] == "]":
+                    in_class = False
+                elif src[j] == "/" and not in_class:
+                    break
+                j += 1
+            j = min(j + 1, n)
+            out.append("/" + " " * max(0, j - i - 2) + ("/" if j - i >= 2 else ""))
             i = j
         elif ch in "\"'":
             j = i + 1
@@ -264,13 +308,15 @@ def scan() -> tuple[int, dict[str, dict[str, int]]]:
     # each block as its own scope (blocks are independent examples; letting
     # one block's bindings leak into the next would hide a real use).
     acc = {}
-    for path in sorted((REPO / "src" / "js" / "globals").glob("*.js")):
+    doctest_files = sorted((REPO / "src" / "js" / "globals").glob("*.js")) + \
+        sorted((REPO / "src" / "js" / "packages").rglob("*.mjs"))
+    for path in doctest_files:
         for block in _doctest_blocks(path.read_text(encoding="utf-8")):
             for name, n in _count_source(_strip_literals(block)).items():
                 acc[name] = acc.get(name, 0) + n
                 total += n
     if acc:
-        per_tree["doctests(src/js/globals)"] = acc
+        per_tree["doctests(globals+packages)"] = acc
     # The smoke-embedded handlers: JS source carried as Python string
     # literals in scripts/smoke/**/*.py, deployed at run time. Each
     # extracted block counts as its own scope, same as a doctest.

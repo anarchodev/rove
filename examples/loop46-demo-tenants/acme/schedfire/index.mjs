@@ -15,7 +15,7 @@
 // with the deploy (the smoke does that via `firstparty_packages`).
 import schedule from "@rewind/schedule";
 
-export default function () {
+export default function ({ kv }) {
     const q = request.query || "";
     const params = {};
     for (const pair of q.split("&")) {
@@ -27,6 +27,6 @@ export default function () {
     const big = parseInt(params.big || "0", 10);
     const tag = big > 0 ? "x".repeat(big) : (params.tag || "smoke");
     const opts = params.key ? { key: params.key } : undefined;
-    const id = schedule({ in: delay }, "schedtarget", { tag }, opts);
+    const id = schedule({ kv }, { in: delay }, "schedtarget", { tag }, opts);
     return { id };
 }
