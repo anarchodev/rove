@@ -10,22 +10,26 @@
 // `_system.*` is the internal ABI and customer code must never
 // reference it directly.
 //
-// Evaluated as a global script (no module/exports) into every
-// dispatcher context after the native bindings install.
+// A FACTORY (`docs/architecture/package-isolation.md`, the
+// received-not-ambient model): the engine invokes it once per context
+// with its capability slice as the one argument (`_factories_invoke.js`)
+// and installs the returned surface at the public name. The factory has
+// no module-scope bindings for a handler to resolve; its capabilities
+// exist only inside this closure.
 
-(function () {
-  const sys = _system.http;
+/**
+ * Long-lived held outbound subscriptions. The one-shot outbound
+ * primitives are {@link after.fetch} (connection-scoped; cancel via
+ * {@link after.cancel}) and {@link webhook.send} (durable,
+ * connectionless); `http.subscribe` holds an upstream that pushes to
+ * YOU.
+ *
+ * @namespace http
+ */
+__rove_factories.http = function (caps) {
+  const sys = caps.http;
 
-  /**
-   * Long-lived held outbound subscriptions. The one-shot outbound
-   * primitives are {@link after.fetch} (connection-scoped; cancel via
-   * {@link after.cancel}) and {@link webhook.send} (durable,
-   * connectionless); `http.subscribe` holds an upstream that pushes to
-   * YOU.
-   *
-   * @namespace http
-   */
-  globalThis.http = {
+  return {
     /**
      * Open a held outbound subscription — `after.fetch`'s held
      * symmetric twin for long-lived upstreams (atproto firehose, Pub/Sub
@@ -71,12 +75,14 @@
      *   directly. Pass to {@link http.cancelSubscription}.
      *
      * @example
-     * const id = http.subscribe({
-     *   url: "https://bsky.network/xrpc/com.atproto.sync.subscribeRepos",
-     *   on: "ingest_firehose",
-     *   ctx: { cursor: kv.get("firehose/cursor") },
-     * });
-     * kv.set("firehose/subscription_id", id);
+     * export default ({ http, kv }) => {
+     *   const id = http.subscribe({
+     *     url: "https://bsky.network/xrpc/com.atproto.sync.subscribeRepos",
+     *     on: "ingest_firehose",
+     *     ctx: { cursor: kv.get("firehose/cursor") },
+     *   });
+     *   kv.set("firehose/subscription_id", id);
+     * };
      */
     subscribe(opts) {
       opts = opts || {};
@@ -106,4 +112,4 @@
       return sys.cancelSubscription({ id: id });
     },
   };
-})();
+};

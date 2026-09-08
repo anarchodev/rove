@@ -146,7 +146,7 @@
    * @example
    * btoa("hello"); // "aGVsbG8="
    */
-  globalThis.btoa = function (s) {
+  __rove_factories.btoa = () => function (s) {
     if (typeof s !== "string") s = String(s);
     return _encodeBase(_stringToBytes(s), STD_ALPHABET, true);
   };
@@ -162,7 +162,7 @@
    * @example
    * atob("aGVsbG8="); // "hello"
    */
-  globalThis.atob = function (s) {
+  __rove_factories.atob = () => function (s) {
     if (typeof s !== "string") s = String(s);
     return _bytesToString(_decodeBase(s, STD_LOOKUP));
   };
@@ -173,7 +173,7 @@
    *
    * @namespace base64url
    */
-  globalThis.base64url = {
+  __rove_factories.base64url = () => ({
     /**
      * Encode bytes as URL-safe base64, no padding.
      *
@@ -209,7 +209,7 @@
       if (typeof s !== "string") s = String(s);
       return _decodeBase(s, ANY_LOOKUP);
     },
-  };
+  });
 
   /**
    * Hex string ⇄ bytes. Bridges the platform's hex-returning crypto
@@ -219,7 +219,7 @@
    *
    * @namespace hex
    */
-  globalThis.hex = {
+  __rove_factories.hex = () => ({
     /**
      * Encode bytes as a lowercase hex string.
      *
@@ -260,7 +260,7 @@
       }
       return out;
     },
-  };
+  });
 
   function _hexNibble(code) {
     if (code >= 0x30 && code <= 0x39) return code - 0x30;

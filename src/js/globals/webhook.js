@@ -76,7 +76,9 @@
 // installs the returned object. webhook.send composes durability over the
 // internal fetch PRIMITIVE (`caps.http.fetch` — the retired customer
 // `http.fetch` spelling stays retired), the durable scheduler core
-// (`caps.sched`), and ordinary rooted kv markers (`caps.kv`).
+// (`caps.sched`), and marker kv writes through a kv namespace-rooted at
+// `_send/` (`caps.kv` — the shim structurally cannot write outside its
+// namespace).
 //
 // A parameter is scoped by the language — the reason this shape replaces
 // the IIFE + capture convention: an unwrapped shim's top-level `const`s
@@ -175,19 +177,23 @@ __rove_factories.webhook = function (caps) {
      * atomic. An already-fired send cannot be recalled.
      *
      * @example
-     * webhook.send("https://hooks.example.com/x", {
-     *   body: JSON.stringify({ event: "order.paid", id }),
-     *   on: "hooks/onDelivered",
-     *   ctx: { order_id: id },
-     * });
+     * export default ({ webhook }) => {
+     *   webhook.send("https://hooks.example.com/x", {
+     *     body: JSON.stringify({ event: "order.paid", id }),
+     *     on: "hooks/onDelivered",
+     *     ctx: { order_id: id },
+     *   });
      *
+     * };
      * @example
-     * // Scheduled fire — write the marker now, fire in 5 minutes.
-     * webhook.send("https://example.test/reminder", {
-     *   body: "ping",
-     *   key: "reminder/" + userId,        // idempotent
-     *   in: "5m",
-     * });
+     * export default ({ webhook }) => {
+     *   // Scheduled fire — write the marker now, fire in 5 minutes.
+     *   webhook.send("https://example.test/reminder", {
+     *     body: "ping",
+     *     key: "reminder/" + userId,        // idempotent
+     *     in: "5m",
+     *   });
+     * };
      */
     send(url, maybeOpts) {
       // webhook.send(url, opts) — positional url, matching after.fetch.
@@ -312,7 +318,9 @@ __rove_factories.webhook = function (caps) {
         });
       }
 
-      kv.set("_send/owed/" + id, JSON.stringify(marker));
+      // The received kv is namespace-rooted at `_send/` — this spells
+      // the stored `_send/owed/{id}` marker.
+      kv.set("owed/" + id, JSON.stringify(marker));
 
       // The durable next-fire entry (one per send, idempotency key
       // `_send/{id}` — re-sends with the same handle MOVE it, mirroring

@@ -7,25 +7,29 @@
 // `_system.*` is the internal ABI — unstable and undocumented; customer
 // code must never reference it directly.
 //
-// Evaluated as a global script (no module/exports) into every
-// dispatcher context after the native bindings install.
+// A FACTORY (`docs/architecture/package-isolation.md`, the
+// received-not-ambient model): the engine invokes it once per context
+// with its capability slice as the one argument (`_factories_invoke.js`)
+// and installs the returned surface at the public name. The factory has
+// no module-scope bindings for a handler to resolve; its capabilities
+// exist only inside this closure.
 
-(function () {
-  const sys = _system.config;
+/**
+ * Deploy-time configuration, read-only. A config file deployed at
+ * `_config/<name>.json` is readable here as `<name>` — and only
+ * here: config is not part of the kv keyspace a handler can name.
+ *
+ * Values are scoped to the deployment the activation runs under, so
+ * code and its config switch atomically on release — including a
+ * rollback, and a deploy that removes a file (the read then returns
+ * `null`).
+ *
+ * @namespace config
+ */
+__rove_factories.config = function (caps) {
+  const sys = caps.config;
 
-  /**
-   * Deploy-time configuration, read-only. A config file deployed at
-   * `_config/<name>.json` is readable here as `<name>` — and only
-   * here: config is not part of the kv keyspace a handler can name.
-   *
-   * Values are scoped to the deployment the activation runs under, so
-   * code and its config switch atomically on release — including a
-   * rollback, and a deploy that removes a file (the read then returns
-   * `null`).
-   *
-   * @namespace config
-   */
-  globalThis.config = {
+  return {
     /**
      * Read one config value.
      *
@@ -37,12 +41,14 @@
      *   config.
      *
      * @example
-     * const raw = config.get("oauth/google");
-     * if (raw === null) { response.status = 500; return "missing config: oauth/google"; }
-     * const cfg = JSON.parse(raw);
+     * export default ({ config, response }) => {
+     *   const raw = config.get("oauth/google");
+     *   if (raw === null) { response.status = 500; return "missing config: oauth/google"; }
+     *   const cfg = JSON.parse(raw);
+     * };
      */
     get(name) {
       return sys.get(name);
     },
   };
-})();
+};

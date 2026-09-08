@@ -1040,37 +1040,30 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "_factories.js", "globalThis.__rove_factories = {};");
 
     evalSnippet(ctx, "kv.js", KV_JS);
+    // Every shim is factory-shaped: evaluating it only REGISTERS
+    // `__rove_factories.<name>`, so this eval order carries no dependency
+    // constraints — the invoker below sequences construction explicitly.
     evalSnippet(ctx, "config.js", CONFIG_JS);
     evalSnippet(ctx, "console.js", CONSOLE_JS);
     evalSnippet(ctx, "crypto.js", CRYPTO_JS);
     evalSnippet(ctx, "http.js", HTTP_JS);
     evalSnippet(ctx, "textcodec.js", TEXTCODEC_JS);
-    // request.js needs TextDecoder (above): builds the shared
-    // `__rove_request_proto` whose `text`/`json` accessors derive from
-    // `request.bytes` (decisions.md §4.11).
     evalSnippet(ctx, "request.js", REQUEST_JS);
     evalSnippet(ctx, "base64.js", BASE64_JS);
     evalSnippet(ctx, "urlsearchparams.js", URLSEARCHPARAMS_JS);
     evalSnippet(ctx, "time.js", TIME_JS);
-    // The durable one-shot scheduler CORE — installs the private
-    // `_system.sched` (not a customer global; that's the @rewind/schedule
-    // package). webhook.js captures it below, before the `_harden.js`
-    // `_system` delete. After base64/crypto/kv + time (its deps).
+    // The durable one-shot scheduler CORE — registers the private `sched`
+    // factory (not a customer global; the customer verb is the
+    // @rewind/schedule package).
     evalSnippet(ctx, "schedule.js", SCHEDULE_JS);
-    // AFTER schedule.js: `platform.dispatch` captures the private
-    // `_system.sched` for its watchdog, the way webhook.js does. A capture
-    // that ran first would silently bind `undefined`, and the shim would
-    // fail only when someone actually dispatched.
     evalSnippet(ctx, "platform.js", PLATFORM_JS);
-    // The after.* connection wake triggers (canonical) + the on.* alias.
+    // The after.* connection wake triggers.
     evalSnippet(ctx, "after.js", AFTER_JS);
     // Connection output effects (`stream.*`).
     evalSnippet(ctx, "stream.js", STREAM_JS);
     // The public `next` disposition verb.
     evalSnippet(ctx, "next.js", NEXT_JS);
     evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
-    // blob depends on crypto.sha256 + http (both above) +
-    // _system.blob.presign (`docs/architecture/routing-and-ingress.md`, customer blob storage).
     evalSnippet(ctx, "blob.js", BLOB_JS);
 
     // Invoke the registered factories — after every shim has evaluated, so
@@ -1082,30 +1075,91 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // (dual-support: the templates below pick it up by shorthand, and the
     // ambient global goes away at the #753 cutover, not here).
     //
-    // The caps a platform shim receives. Assembled by the engine, passed as
-    // ONE argument — a shim names what it was handed, nothing else. The
-    // per-shim narrowing (a namespace-rooted marker kv instead of the whole
-    // customer kv) arrives with the remaining conversions
-    // (`package-isolation.md` §4.3: narrowing is the normal case).
+    // The caps a platform shim receives, assembled by the engine and passed
+    // as ONE argument — a shim names what it was handed, nothing else, and
+    // each factory gets exactly its slice (`package-isolation.md` §4.3:
+    // narrowing is the normal case). Two kinds of member: an internal
+    // `_system.*` slice (the capability the shim wraps), and a
+    // namespace-rooted marker kv for the durable-effect shims. Names that
+    // STAY ambient at the cutover (`crypto`, `time`, `console`,
+    // `TextDecoder`, …) are read ambiently by factory bodies — handing them
+    // through caps would claim an authority distinction that does not
+    // exist.
+    //
+    // Invocation is explicit and dependency-ordered — the scheduler core
+    // precedes the shims that arm through it — and a registered factory the
+    // list does not consume fails loudly rather than installing with
+    // whatever caps a loop would guess.
     evalSnippet(ctx, "_factories_invoke.js",
         \\(function () {
         \\  const reg = globalThis.__rove_factories;
-        \\  const caps = {
-        \\    http: _system.http,
-        \\    sched: _system.sched,
-        \\    kv: globalThis.kv,
-        \\    formats: __rove.formats,
+        \\  const pending = new Set(Object.keys(reg));
+        \\  const invoke = (name, caps) => {
+        \\    if (!pending.delete(name))
+        \\      throw new Error("factory not registered: " + name);
+        \\    return reg[name](caps);
         \\  };
-        \\  for (const name of Object.keys(reg)) {
-        \\    globalThis[name] = reg[name](caps);
-        \\  }
+        \\  // A namespace-rooted kv view — the per-shim narrowing: every key
+        \\  // the holder spells resolves under `root`, so the holder
+        \\  // structurally cannot touch a row outside its namespace. Keys
+        \\  // come back in the holder's spelling (the root strips on the way
+        \\  // out), so a prefix page's last key round-trips as the next
+        \\  // cursor. Call-time forwarding to `globalThis.kv` keeps one text
+        \\  // across the three engines (the sim's kv is per-run,
+        \\  // epilogue-installed).
+        \\  const rooted = (root) => ({
+        \\    get: (k) => globalThis.kv.get(root + k),
+        \\    set: (k, v) => globalThis.kv.set(root + k, v),
+        \\    delete: (k) => globalThis.kv.delete(root + k),
+        \\    prefix: (p, c, l) =>
+        \\      (globalThis.kv.prefix(root + p, c == null || c === "" ? c : root + c, l) || [])
+        \\        .map((e) => ({ key: e.key.slice(root.length), value: e.value })),
+        \\  });
+        \\  // Thin public shims over one native slice each.
+        \\  globalThis.kv = invoke("kv", { kv: _system.kv });
+        \\  globalThis.config = invoke("config", { config: _system.config });
+        \\  globalThis.console = invoke("console", { console: _system.console });
+        \\  globalThis.crypto = invoke("crypto", { crypto: _system.crypto });
+        \\  globalThis.http = invoke("http", { http: _system.http });
+        \\  globalThis.stream = invoke("stream", { stream: _system.stream });
+        \\  globalThis.next = invoke("next", { next: _system.continuation.next });
+        \\  globalThis.after = invoke("after", { after: _system.after, http: _system.http });
+        \\  // Web-platform + pure names (these stay ambient at the cutover).
+        \\  globalThis.TextEncoder = invoke("TextEncoder", { textcodec: _system.textcodec });
+        \\  globalThis.TextDecoder = invoke("TextDecoder", { textcodec: _system.textcodec });
+        \\  globalThis.__rove_request_proto = invoke("__rove_request_proto", {});
+        \\  globalThis.btoa = invoke("btoa", {});
+        \\  globalThis.atob = invoke("atob", {});
+        \\  globalThis.base64url = invoke("base64url", {});
+        \\  globalThis.hex = invoke("hex", {});
+        \\  globalThis.URLSearchParams = invoke("URLSearchParams", {});
+        \\  globalThis.time = invoke("time", {});
+        \\  // The durable scheduler CORE — private, never a global; the
+        \\  // durable-effect shims receive it as `sched`.
+        \\  const sched = invoke("sched", {
+        \\    kv: rooted("_sched/"), formats: __rove.formats,
+        \\  });
+        \\  globalThis.platform = invoke("platform", {
+        \\    platform: _system.platform, after: _system.after,
+        \\    blobReceive: _system.blob.receive, blobPresign: _system.blob.presign,
+        \\    sched: sched, kv: rooted("_dispatch/"), formats: __rove.formats,
+        \\  });
+        \\  globalThis.webhook = invoke("webhook", {
+        \\    http: _system.http, sched: sched, kv: rooted("_send/"),
+        \\    formats: __rove.formats,
+        \\  });
+        \\  globalThis.blob = invoke("blob", {
+        \\    http: _system.http, blob: _system.blob, kv: rooted("_blob/"),
+        \\    after: globalThis.after, formats: __rove.formats,
+        \\  });
+        \\  if (pending.size > 0)
+        \\    throw new Error("unconsumed factories: " + Array.from(pending).join(", "));
         \\})();
     );
 
     // Reachability hardening (docs/architecture/builtin-libs.md).
-    // Every native shim above captured its slice as
-    // `const sys = _system.X` at eval time, so the `_system.*` objects
-    // stay alive through those closures — the global holder is dead
+    // Every factory above received its `_system.*` slice from the invoker
+    // and holds it in its closure — the global holder is dead
     // weight now. Delete it so customer handler code (loaded per
     // request into the restored snapshot) cannot name the internal
     // ABI even by accident. Baked into the base snapshot: zero
@@ -1843,9 +1897,9 @@ test "harden: _system unreachable post-installStatic, shims still bound (Phase A
         \\      typeof platform.root.get !== "function")
         \\    throw new Error("platform nested shim broke");
         \\  if (typeof webhook !== "object" || typeof webhook.send !== "function")
-        \\    throw new Error("webhook shim broke (lost its captured _system.http / _system.sched)");
+        \\    throw new Error("webhook shim broke (lost its received http / sched caps)");
         \\  if (typeof schedule !== "undefined")
-        \\    throw new Error("schedule leaked to customer scope (should be the private _system.sched)");
+        \\    throw new Error("schedule leaked to customer scope (should be the private sched factory)");
         \\  return true;
         \\})();
     ;
@@ -1974,12 +2028,20 @@ test "factories: a factory's return must not expose a capability it was handed" 
         \\  const reg = globalThis.__rove_factories;
         \\  const names = Object.keys(reg);
         \\  if (names.length === 0)
-        \\    throw new Error("no factories registered — webhook converted away?");
-        \\  const markers = { http: {}, sched: function () {}, kv: {}, formats: {} };
+        \\    throw new Error("no factories registered");
+        \\  // One marker per caps member any factory receives
+        \\  // (`_factories_invoke.js` is the authority on the set).
+        \\  const markers = {
+        \\    http: {}, sched: function () {}, kv: {}, formats: {},
+        \\    platform: {}, after: {}, blob: {},
+        \\    blobReceive: function () {}, blobPresign: function () {},
+        \\    config: {}, console: {}, crypto: {}, stream: {},
+        \\    next: function () {}, textcodec: {},
+        \\  };
         \\  for (const name of names) {
         \\    const out = reg[name](markers);
-        \\    if (out === null || typeof out !== "object")
-        \\      throw new Error(name + " factory did not return an object");
+        \\    if (out === null || (typeof out !== "object" && typeof out !== "function"))
+        \\      throw new Error(name + " factory did not return a surface");
         \\    for (const k of Object.keys(out))
         \\      for (const c of Object.keys(markers))
         \\        if (out[k] === markers[c])
@@ -2031,21 +2093,26 @@ test "the kv write caps match the snapshot stream's frame bounds" {
     try std.testing.expect(reserved.KV_VAL_MAX <= kv_mod.snapshot_stream.STREAM_VAL_MAX);
 }
 
-test "every global shim is IIFE-wrapped, so its top level stays out of handler scope" {
+test "every global shim is factory-shaped and never installs a global itself" {
     // A shim's top-level `const`s land in the BASE context's global lexical
     // scope, and customer handler modules resolve against it — so an
-    // unwrapped shim publishes its internals under names a handler can read
-    // and, for anything mutable, write. Measured before this test existed: a
-    // handler read `STD_LOOKUP.length` and wrote `STD_LOOKUP[0] = 42`
-    // (base64.js), and saw `sysHttp` as an object while `_system` was
-    // correctly undefined (webhook.js) — so `_harden.js`'s delete was hiding
-    // the property while the captures taken pre-harden stayed nameable.
+    // unenclosed shim publishes its internals under names a handler can read
+    // and, for anything mutable, write. Measured before this rule was
+    // enforced: a handler read `STD_LOOKUP.length` and wrote
+    // `STD_LOOKUP[0] = 42` (base64.js), and saw `sysHttp` as an object while
+    // `_system` was correctly undefined — the harden delete was hiding the
+    // property while eval-time captures stayed nameable.
     //
     // The base arena is shared by every request the worker serves, whatever
     // tenant, which makes a writable one a cross-tenant channel (rove#748).
     //
-    // The rule already existed and three shims had drifted off it, which is
-    // the argument for checking it here rather than in review.
+    // The factory shape carries that property by construction: a shim only
+    // REGISTERS `__rove_factories.<name>`, its internals live in the closure
+    // the engine invokes, and its capabilities arrive as the invoke
+    // argument. Two textual halves here; the semantic half — the return
+    // must not expose a capability it was handed — is the factory-return
+    // test above.
+    //
     // GLOBALS_FILES is NOT the eval list: `installStatic` also evaluates
     // request.js, which the table omits (and `_harden.js`, an inline string
     // with no module scope). A lint driven by the table alone silently skips
@@ -2056,26 +2123,12 @@ test "every global shim is IIFE-wrapped, so its top level stays out of handler s
         .{ .name = "request", .src = REQUEST_JS },
     };
     for (SHIMS) |g| {
-        var i: usize = 0;
-        // Skip the licence header and any leading comment/blank lines.
-        while (i < g.src.len) {
-            const nl = std.mem.indexOfScalarPos(u8, g.src, i, '\n') orelse g.src.len;
-            const line = std.mem.trim(u8, g.src[i..nl], " \t\r");
-            if (line.len != 0 and !std.mem.startsWith(u8, line, "//")) break;
-            i = nl + 1;
-        }
-        // Module scope must be `const`, and this is the other half of the
-        // rule rather than style. Enclosing a shim MOVES its top-level
-        // bindings from the global lexical environment — which the engine
-        // shadows per request — into closure cells, which it does not: a
-        // closure variable REASSIGNED after the snapshot freezes keeps its
-        // value into the next request on that worker, and the base context is
-        // shared by every tenant that worker serves.
-        //
-        // So the wrap above and this check are a pair. Wrapping a shim that
-        // held a mutable module-scope binding would trade a reachability leak
-        // for an isolation one. Mutating what a `const` POINTS AT is fine —
-        // the object is shadowed; it is rebinding the variable that escapes.
+        // Module scope must be `const`. A closure variable REASSIGNED after
+        // the snapshot freezes keeps its value into the next request on that
+        // worker, and the base context is shared by every tenant the worker
+        // serves — so a mutable binding trades the reachability leak for an
+        // isolation one. Mutating what a `const` POINTS AT is fine — the
+        // object is shadowed; it is rebinding the variable that escapes.
         {
             var j: usize = 0;
             while (std.mem.indexOfPos(u8, g.src, j, "\n  let ") orelse
@@ -2092,25 +2145,28 @@ test "every global shim is IIFE-wrapped, so its top level stays out of handler s
             j = j;
         }
 
-        const rest = g.src[@min(i, g.src.len)..];
-        // A factory-shaped shim (`__rove_factories.<name> = function (caps)`)
-        // needs no wrap: it has no module-scope bindings for a handler to
-        // resolve — its internals live in the closure the engine invokes —
-        // so the property the IIFE exists to enforce holds by construction.
-        // Its own rule is the factory-return test (the return must not
-        // expose a capability it was handed). Matched anywhere rather than
-        // at the first code line: JSDoc precedes the assignment.
-        const is_factory = std.mem.indexOf(u8, g.src, "__rove_factories.") != null;
-        const wrapped = is_factory or
-            std.mem.startsWith(u8, rest, "(function () {") or
-            std.mem.startsWith(u8, rest, "(() => {");
-        if (!wrapped) {
+        // Half one: the shim registers at least one factory.
+        if (std.mem.indexOf(u8, g.src, "__rove_factories.") == null) {
             std.debug.print(
-                "\nglobals/{s}.js is not IIFE-wrapped: its top-level bindings are " ++
-                    "reachable by name from customer handler code\n",
+                "\nglobals/{s}.js registers no `__rove_factories.<name>` — every " ++
+                    "shim is a factory; the engine's invoker is what installs the " ++
+                    "public names\n",
                 .{g.name},
             );
-            return error.ShimNotEnclosed;
+            return error.ShimNotFactory;
+        }
+        // Half two: installation belongs to `_factories_invoke.js` alone. A
+        // shim naming `globalThis` is either installing behind the invoker's
+        // back or smuggling a late-bound ambient read past the caps
+        // argument.
+        if (std.mem.indexOf(u8, g.src, "globalThis.")) |hit| {
+            std.debug.print(
+                "\nglobals/{s}.js names `globalThis.` at byte {d} — a factory " ++
+                    "receives its capabilities and returns its surface; the " ++
+                    "invoker owns installation\n",
+                .{ g.name, hit },
+            );
+            return error.ShimInstallsGlobal;
         }
     }
 }

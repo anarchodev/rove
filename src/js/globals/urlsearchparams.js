@@ -306,5 +306,5 @@
     return -1;
   }
 
-  globalThis.URLSearchParams = URLSearchParams;
+  __rove_factories.URLSearchParams = () => URLSearchParams;
 })();

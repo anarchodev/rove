@@ -12,9 +12,12 @@
 // ~139 KB decodes exhausted it. Natively each direction is one
 // conversion (QuickJS strings construct from / convert to UTF-8).
 
-(function () {
-  const sysTc = _system.textcodec;
-
+/**
+ * Factory registration — the class below is the documented surface.
+ * @internal
+ */
+__rove_factories.TextEncoder = function (caps) {
+  const sysTc = caps.textcodec;
   /**
    * Encodes a JS string to UTF-8 bytes. WHATWG `TextEncoder` subset
    * (UTF-8 only).
@@ -38,7 +41,15 @@
       return sysTc.encode(String(input ?? ""));
     }
   }
+  return TextEncoder;
+};
 
+/**
+ * Factory registration — the class below is the documented surface.
+ * @internal
+ */
+__rove_factories.TextDecoder = function (caps) {
+  const sysTc = caps.textcodec;
   /**
    * Decodes UTF-8 bytes to a JS string. WHATWG `TextDecoder` subset
    * (UTF-8 only).
@@ -90,7 +101,5 @@
       return sysTc.decode(bytes, this._fatal);
     }
   }
-
-  globalThis.TextEncoder = TextEncoder;
-  globalThis.TextDecoder = TextDecoder;
-})();
+  return TextDecoder;
+};

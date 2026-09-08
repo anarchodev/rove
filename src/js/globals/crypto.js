@@ -8,29 +8,33 @@
 // customer code must never reference it directly. The bundled
 // jwt/oauth/oidc/sessions libraries compose on this shim.
 //
-// Evaluated as a global script (no module/exports) into every
-// dispatcher context after the native bindings install.
+// A FACTORY (`docs/architecture/package-isolation.md`, the
+// received-not-ambient model): the engine invokes it once per context
+// with its capability slice as the one argument (`_factories_invoke.js`)
+// and installs the returned surface at the public name. The factory has
+// no module-scope bindings for a handler to resolve; its capabilities
+// exist only inside this closure.
 
-(function () {
-  const sys = _system.crypto;
+/**
+ * Cryptographic primitives. Random sources (`getRandomValues`,
+ * `randomUUID`, `randomBytes`) are replay-deterministic — captured
+ * to the request tape and re-issued identically on replay. Hash and
+ * signature-verify operations are pure functions of their inputs and
+ * are not taped.
+ *
+ * Two signature families, named by their KEY FORMAT — don't mix
+ * them: `verifyEcdsa` / `verifyRsa` take a JWK (the JOSE world:
+ * JWTs, OIDC id_tokens, JWKS documents); `ecdsaSign` /
+ * `ecdsaVerify` / `ecdsaGenerateKey` take raw key bytes (the
+ * protocol-crypto world: your own signing recipes). `oidcSign`
+ * is the JOSE-side signer (PEM private key → compact JWS).
+ *
+ * @namespace crypto
+ */
+__rove_factories.crypto = function (caps) {
+  const sys = caps.crypto;
 
-  /**
-   * Cryptographic primitives. Random sources (`getRandomValues`,
-   * `randomUUID`, `randomBytes`) are replay-deterministic — captured
-   * to the request tape and re-issued identically on replay. Hash and
-   * signature-verify operations are pure functions of their inputs and
-   * are not taped.
-   *
-   * Two signature families, named by their KEY FORMAT — don't mix
-   * them: `verifyEcdsa` / `verifyRsa` take a JWK (the JOSE world:
-   * JWTs, OIDC id_tokens, JWKS documents); `ecdsaSign` /
-   * `ecdsaVerify` / `ecdsaGenerateKey` take raw key bytes (the
-   * protocol-crypto world: your own signing recipes). `oidcSign`
-   * is the JOSE-side signer (PEM private key → compact JWS).
-   *
-   * @namespace crypto
-   */
-  globalThis.crypto = {
+  return {
     /**
      * Fill a typed array with cryptographically random bytes, in
      * place. Web Crypto compatible.
@@ -224,9 +228,11 @@
      *   JWKS endpoint; `kid` is the key id.
      *
      * @example
-     * const { priv, jwk, kid } = crypto.oidcGenerateKey();
-     * kv.set("oidc/privkey", priv);
-     * kv.set("oidc/jwks", JSON.stringify({ keys: [jwk] }));
+     * export default ({ kv }) => {
+     *   const { priv, jwk, kid } = crypto.oidcGenerateKey();
+     *   kv.set("oidc/privkey", priv);
+     *   kv.set("oidc/jwks", JSON.stringify({ keys: [jwk] }));
+     * };
      */
     oidcGenerateKey() {
       return sys.oidcGenerateKey();
@@ -266,8 +272,10 @@
      *   33-byte compressed SEC1 point (`0x02`/`0x03 ‖ X`).
      *
      * @example
-     * const { privateKey, publicKey } = crypto.ecdsaGenerateKey("secp256k1");
-     * kv.set("repo/signing-key", base64url.encode(privateKey));
+     * export default ({ kv }) => {
+     *   const { privateKey, publicKey } = crypto.ecdsaGenerateKey("secp256k1");
+     *   kv.set("repo/signing-key", base64url.encode(privateKey));
+     * };
      */
     ecdsaGenerateKey(curve) {
       return sys.ecdsaGenerateKey(curve);
@@ -312,4 +320,4 @@
       return sys.ecdsaVerify(curve, publicKey, data, sig);
     },
   };
-})();
+};
