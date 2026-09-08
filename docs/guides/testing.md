@@ -469,10 +469,16 @@ effect log (assert with `toHaveWritten`), exactly as production injects it.
 **kv triggers.** Register a `_triggers/<prefix>/index.mjs` module with
 `scenario({ triggers: [{ prefix: "users/" }] })` (`module` defaults to that path).
 Its `beforePut`/`afterPut`/`beforeDelete`/`afterDelete` exports run on a matching
-`kv.set`/`kv.delete`, receiving `{ key, value, previousValue, op, timing, … }`. A
-`beforePut` that returns a string **mutates** the stored value; a handler that
-**throws** rejects the write as `Error{code:"trigger_rejected"}` — testable with
-the same `err.code` branch the handler ships.
+`kv.set`/`kv.delete`, receiving `({ kv }, event)` — the received caps first (the
+index-maintainer grant: the store, atomic with the firing write, and nothing
+else), then `{ key, value, previousValue, op, timing, … }`. This is the
+secondary-index recipe: a `beforePut` reads the index through its `kv` to
+enforce uniqueness (throw to reject) and returns a string to **mutate** the
+stored value; an `afterPut`/`afterDelete` mirrors the committed row into the
+index in the same writeset — the reader can never observe a row without its
+index entry. A handler that **throws** rejects the write as
+`Error{code:"trigger_rejected"}` — testable with the same `err.code` branch the
+handler ships.
 
 An **outbound `http.subscribe`** (a held upstream that pushes) is separate: it's
 fire-and-forget on the connection (its events fire to the `on` module as an

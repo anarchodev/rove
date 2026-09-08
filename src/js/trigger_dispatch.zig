@@ -53,6 +53,24 @@ fn isPlatformKey(key: []const u8) bool {
 
 pub const TriggerOp = enum { put, delete };
 
+/// The caps object a trigger callback receives as its first argument:
+/// `{ kv }`, the customer kv binding off the persistent `__rove.caps`
+/// template. A lookup failure yields undefined members — the callback
+/// then throws at first use, which surfaces as trigger_rejected rather
+/// than a silent no-op.
+fn buildTriggerCaps(ctx: ?*c.JSContext) c.JSValue {
+    const global = c.JS_GetGlobalObject(ctx);
+    defer c.JS_FreeValue(ctx, global);
+    const rove = c.JS_GetPropertyStr(ctx, global, "__rove");
+    defer c.JS_FreeValue(ctx, rove);
+    const tmpl = c.JS_GetPropertyStr(ctx, rove, "caps");
+    defer c.JS_FreeValue(ctx, tmpl);
+    const kv = c.JS_GetPropertyStr(ctx, tmpl, "kv");
+    const caps = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, caps, "kv", kv); // consumes kv's ref
+    return caps;
+}
+
 /// Load the trigger module's namespace into the qjs context, caching
 /// it on `state.trigger_module_ns` so subsequent fires within the
 /// same request share the same namespace (so module top-level state
@@ -321,8 +339,16 @@ fn fireOneTrigger(
     const event = buildTriggerEvent(state, ctx, key, op, timing, cur_value, prev_value);
     defer c.JS_FreeValue(ctx, event);
 
-    var args = [_]c.JSValue{event};
-    const ret = c.JS_Call(ctx, handler, js_undefined, 1, &args);
+    // The received caps — the index-maintainer grant (tracker #753): a
+    // trigger's job is reads and writes against the tenant store, atomic
+    // with the firing write, so it receives exactly `{ kv }`. Sourced from
+    // the persistent `__rove.caps` template, not the ambient global — the
+    // ambient spelling retires at the cutover, this holder does not.
+    const caps = buildTriggerCaps(ctx);
+    defer c.JS_FreeValue(ctx, caps);
+
+    var args = [_]c.JSValue{ caps, event };
+    const ret = c.JS_Call(ctx, handler, js_undefined, 2, &args);
     if (c.JS_IsException(ret)) return .rejected;
 
     // BEFORE-put trigger return value (if a string) becomes the

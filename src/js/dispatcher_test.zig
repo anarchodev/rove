@@ -5253,7 +5253,7 @@ test "trigger: afterPut fires after a kv.set inside the handler" {
     defer testing.allocator.free(handler_bc);
 
     const trigger_bc = try ctx.compileToBytecode(
-        \\export function afterPut(event) {
+        \\export function afterPut({ kv }, event) {
         \\  const sess = JSON.parse(event.value);
         \\  const sid = event.key.split('/').pop();
         \\  kv.set("users/by-session/" + sid, sess.user_id);
@@ -5315,7 +5315,7 @@ test "trigger: afterDelete fires with previousValue" {
     defer testing.allocator.free(handler_bc);
 
     const trigger_bc = try ctx.compileToBytecode(
-        \\export function afterDelete(event) {
+        \\export function afterDelete({ kv }, event) {
         \\  if (event.previousValue) {
         \\    const order = JSON.parse(event.previousValue);
         \\    kv.set("audit/deleted-totals", String(order.total));
@@ -5379,7 +5379,7 @@ test "trigger: tree-traversal order — outer + inner both fire on AFTER" {
     defer testing.allocator.free(handler_bc);
 
     const inner_bc = try ctx.compileToBytecode(
-        \\export function afterPut(event) {
+        \\export function afterPut({ kv }, event) {
         \\  const cur = kv.get("trace") || "";
         \\  kv.set("trace", cur + "inner;");
         \\}
@@ -5387,7 +5387,7 @@ test "trigger: tree-traversal order — outer + inner both fire on AFTER" {
     defer testing.allocator.free(inner_bc);
 
     const outer_bc = try ctx.compileToBytecode(
-        \\export function afterPut(event) {
+        \\export function afterPut({ kv }, event) {
         \\  const cur = kv.get("trace") || "";
         \\  kv.set("trace", cur + "outer;");
         \\}
@@ -5450,7 +5450,7 @@ test "trigger: cascade depth limit halts runaway recursion" {
     defer testing.allocator.free(handler_bc);
 
     const trigger_bc = try ctx.compileToBytecode(
-        \\export function afterPut(event) {
+        \\export function afterPut({ kv }, event) {
         \\  const n = parseInt(event.key.split('/').pop()) + 1;
         \\  kv.set("loop/" + n, "x");
         \\}
@@ -5509,7 +5509,7 @@ test "trigger: platform-key writes do not fire customer triggers" {
     defer testing.allocator.free(handler_bc);
 
     const trigger_bc = try ctx.compileToBytecode(
-        \\export default function (event) {
+        \\export default function ({ kv }, event) {
         \\  kv.set("seen/" + event.key, "1");
         \\}
     , "_triggers/index.mjs", testing.allocator, .{ .kind = .module });
@@ -5571,7 +5571,7 @@ test "trigger: beforePut throw is catchable in handler with code='trigger_reject
     defer testing.allocator.free(handler_bc);
 
     const trigger_bc = try ctx.compileToBytecode(
-        \\export function beforePut(event) {
+        \\export function beforePut({ kv }, event) {
         \\  const sess = JSON.parse(event.value);
         \\  if (!sess.user_id) throw new Error("session missing user_id");
         \\}
@@ -5633,7 +5633,7 @@ test "trigger: beforePut return-value mutates the written value" {
     defer testing.allocator.free(handler_bc);
 
     const trigger_bc = try ctx.compileToBytecode(
-        \\export function beforePut(event) {
+        \\export function beforePut({ kv }, event) {
         \\  return event.value.toLowerCase();
         \\}
     , "_triggers/users/index.mjs", testing.allocator, .{ .kind = .module });
@@ -5695,7 +5695,7 @@ test "trigger: beforePut throw rolls back trigger-internal writes (the audit got
     defer testing.allocator.free(handler_bc);
 
     const trigger_bc = try ctx.compileToBytecode(
-        \\export function beforePut(event) {
+        \\export function beforePut({ kv }, event) {
         \\  kv.set("audit/last-attempt", event.key);
         \\  throw new Error("nope");
         \\}
@@ -5761,7 +5761,7 @@ test "trigger: afterPut throw is catchable AND rolls back the originating write"
     defer testing.allocator.free(handler_bc);
 
     const trigger_bc = try ctx.compileToBytecode(
-        \\export function afterPut(event) {
+        \\export function afterPut({ kv }, event) {
         \\  throw new Error("after rejected");
         \\}
     , "_triggers/orders/index.mjs", testing.allocator, .{ .kind = .module });
@@ -5820,7 +5820,7 @@ test "trigger: BEFORE chain runs outermost-first (broad validates before narrow)
     defer testing.allocator.free(handler_bc);
 
     const inner_bc = try ctx.compileToBytecode(
-        \\export function beforePut(event) {
+        \\export function beforePut({ kv }, event) {
         \\  const cur = kv.get("trace") || "";
         \\  kv.set("trace", cur + "inner;");
         \\}
@@ -5828,7 +5828,7 @@ test "trigger: BEFORE chain runs outermost-first (broad validates before narrow)
     defer testing.allocator.free(inner_bc);
 
     const outer_bc = try ctx.compileToBytecode(
-        \\export function beforePut(event) {
+        \\export function beforePut({ kv }, event) {
         \\  const cur = kv.get("trace") || "";
         \\  kv.set("trace", cur + "outer;");
         \\}
@@ -5895,7 +5895,7 @@ test "trigger: default export is the catchall when no named export matches" {
     defer testing.allocator.free(handler_bc);
 
     const trigger_bc = try ctx.compileToBytecode(
-        \\export default function (event) {
+        \\export default function ({ kv }, event) {
         \\  const cur = kv.get("trace") || "";
         \\  kv.set("trace", cur + event.timing + ":" + event.op + ";");
         \\}
@@ -5961,7 +5961,7 @@ test "trigger: BEFORE sees previousValue on update" {
     defer testing.allocator.free(handler_bc);
 
     const trigger_bc = try ctx.compileToBytecode(
-        \\export function beforePut(event) {
+        \\export function beforePut({ kv }, event) {
         \\  const cur = kv.get("trace") || "";
         \\  const prev = event.previousValue === null ? "<null>" : event.previousValue;
         \\  kv.set("trace", cur + prev + "->" + event.value + ";");
@@ -6026,7 +6026,7 @@ test "trigger: well-bounded cascade (depth 2, no runaway)" {
     defer testing.allocator.free(handler_bc);
 
     const a_trigger_bc = try ctx.compileToBytecode(
-        \\export function afterPut(event) {
+        \\export function afterPut({ kv }, event) {
         \\  kv.set("trace_a", "depth=" + event.depth);
         \\  kv.set("b/y", "b-from-a");
         \\}
@@ -6034,7 +6034,7 @@ test "trigger: well-bounded cascade (depth 2, no runaway)" {
     defer testing.allocator.free(a_trigger_bc);
 
     const b_trigger_bc = try ctx.compileToBytecode(
-        \\export function afterPut(event) {
+        \\export function afterPut({ kv }, event) {
         \\  kv.set("trace_b", "depth=" + event.depth);
         \\  kv.set("c/z", "c-from-b");  // no matching trigger, chain ends
         \\}
