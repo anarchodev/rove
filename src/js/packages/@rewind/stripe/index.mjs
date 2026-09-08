@@ -122,11 +122,13 @@ const stripe = {
    * @returns {object} The client.
    *
    * @example
-   * const sk = stripe.client({ apiKey: kv.get("stripe_key") });
-   * sk.setupIntents.create({ customer: cid, on: "onIntent" });
-   * return next();                       // held — resumes with the secret
+   * export default ({ after, kv, next, webhook }) => {
+   *   const sk = stripe.client({ after, webhook }, { apiKey: kv.get("stripe_key") });
+   *   sk.setupIntents.create({ customer: cid, on: "onIntent" });
+   *   return next();                       // held — resumes with the secret
+   * };
    */
-  client(cfg) {
+  client({ after, webhook }, cfg) {
     if (!cfg || typeof cfg !== "object")
       throw new TypeError("stripe.client requires an options object");
     rejectRenamed("stripe.client", cfg);
@@ -368,11 +370,13 @@ const stripe = {
    *   matching `v1`, or the timestamp is outside tolerance.
    *
    * @example
-   * const event = stripe.verifyWebhook({
-   *   secret: kv.get("stripe_whsec"),
-   *   header: request.headers["stripe-signature"],
-   *   body: request.bytes,
-   * });
+   * export default ({ kv }) => {
+   *   const event = stripe.verifyWebhook({
+   *     secret: kv.get("stripe_whsec"),
+   *     header: request.headers["stripe-signature"],
+   *     body: request.bytes,
+   *   });
+   * };
    */
   verifyWebhook(opts) {
     if (!opts || typeof opts !== "object")

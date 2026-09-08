@@ -352,7 +352,7 @@ run whether or not anyone is connected. Each names the export it invokes:
   outbound; run the target as a new request when it completes.
 - `schedule({ at } | { in }, "module.method", ctx?)` — run the target
   once, at a time.
-- `cron(spec, "module.method")` — run the target on a recurring schedule.
+- `cron({ kv }, spec, "module.method")` — run the target on a recurring schedule.
 
 For `schedule`/`cron`, the target is a single string. A bare module
 (`"jobs/reminder"`) fires its `default` export; the `module.method` form
@@ -514,7 +514,7 @@ export** a trigger's activation lands in; it does not invent a kind.
 > reconciles; it must tolerate a redundant re-fire and must NOT assume
 > one fire per write. (The manifest
 > `kind=cron` subscription and its `onCron` export RETIRED with
-> durable-wake P5(b): recurrence is the `cron(spec, target, …)` verb —
+> durable-wake P5(b): recurrence is the `cron(caps, spec, target, …)` verb —
 > durable, surviving leader change — or a self-re-arming
 > `schedule({in}, …, {key})` re-arming for sub-minute intervals. The
 > `kind=boot`
@@ -753,9 +753,9 @@ export function onUpstream() {
 ### 5.6 Connectionless work — fire durable, respond now
 
 ```js
-export default function () {
+export default function ({ request, response, kv, webhook }) {
   webhook.send('https://billing.example.com/charge', { body: request.text, on: 'onCharge' });
-  schedule({ in: '24h' }, 'sendReminder', { user: request.user });
+  schedule({ kv }, { in: '24h' }, 'sendReminder', { user: request.user });
   response.status = 202;
   return 'queued';                               // respond immediately; the above outlive this request
 }

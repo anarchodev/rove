@@ -1,9 +1,8 @@
 // P-Lift (rove#123) lib #2: `@rewind/email` — a leaf that composes over the
-// ambient `webhook` primitive (which stays baked). `EMAIL_PKG` is
-// `src/js/globals/email.js` lifted from `globalThis.email = { send }` to an ES
-// module: `export function send` + a default export of the object (so a
-// consumer's `email.send(…)` reads unchanged); the `webhook.send` call is
-// unchanged (packages compose over ambient primitives). The validation error
+// `webhook` capability it RECEIVES (packages get no ambient reach —
+// package-isolation.md). `EMAIL_PKG` mirrors the real package: `export
+// function send({ webhook }, opts)` + a default export of the object; the
+// forwarded capability is what lands the send. The validation error
 // messages' quote style is normalized (backticks → single quotes) purely to
 // keep this inline fixture free of template-literal escaping — the code is
 // otherwise faithful. Verified: the lifted email resolves, and `email.send`
@@ -12,7 +11,7 @@
 import { scenario, expect } from "rewind:test";
 
 const EMAIL_PKG = `
-export function send(opts) {
+export function send({ webhook }, opts) {
   if (!opts || typeof opts !== "object")
     throw new TypeError("email.send requires an options object");
   for (const pair of [["key", "apiKey"], ["reply_to", "replyTo"], ["max_attempts", "maxAttempts"], ["timeout_ms", "timeoutMs"]]) {

@@ -23,7 +23,7 @@ export default function ({ kv, webhook }) {
 
   // Durable one-shot timer. Real shim: writes _sched/by_id/{id} + the
   // _sched/by_time/{when} index row (two more kv writes).
-  schedule({ in: "1h" }, "jobs/followup", { user }, { key: "followup/" + user });
+  schedule({ kv }, { in: "1h" }, "jobs/followup", { user }, { key: "followup/" + user });
 
   kv.set("signup/" + user, "1");
   return { ok: true };

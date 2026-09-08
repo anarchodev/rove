@@ -51,9 +51,9 @@ INDEX_SRC = 'export default function () { return { ok: true }; }'
 # an ambient global.
 EMAIL_SRC = '''import email from "@rewind/email";
 
-export default function () {
+export default function ({ webhook }) {
   try {
-    email.send({
+    email.send({ webhook }, {
       apiKey: "re_test",
       from: "test@example.com",
       to: "user@example.com",

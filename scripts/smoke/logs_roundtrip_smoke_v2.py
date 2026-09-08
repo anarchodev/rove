@@ -36,8 +36,8 @@ READY_SRC = (
     # Arms a durable wake targeting the second module's named export.
     # The fired activation ROOTS ITS OWN saga (the durability boundary);
     # the arming saga rides its record as the reserved `_parent` tag.
-    'export function arm(_a) {\n'
-    '  schedule({ in: 1000 }, "wakes.mjs.fired", { note: "hi" }, { key: "smoke-parent" });\n'
+    'export function arm({ kv }) {\n'
+    '  schedule({ kv }, { in: 1000 }, "wakes.mjs.fired", { note: "hi" }, { key: "smoke-parent" });\n'
     '  return "armed";\n'
     '}\n'
     # kv-touching probe for the seam assertions: ?w= writes a key,

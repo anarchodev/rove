@@ -4,11 +4,11 @@ import email from "@rewind/email";
 // (email.send composes over the metered webhook.send). Offline the bucket is
 // armed by `scenario({ emailBudget })`; each iteration reports "sent" or the
 // caught error surface.
-export default function () {
+export default function ({ webhook }) {
   const results = [];
   for (let i = 0; i < 3; i++) {
     try {
-      email.send({
+      email.send({ webhook }, {
         apiKey: "re_test_123",
         from: "ops@acme.test",
         to: "user@example.test",

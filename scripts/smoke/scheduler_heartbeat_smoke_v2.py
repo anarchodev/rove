@@ -43,7 +43,7 @@ SEED_SRC = r'''// `schedule` is the `@rewind/schedule` package, not an ambient g
 import schedule from "@rewind/schedule";
 
 export default function ({ kv }) {
-    schedule({ in: 1000 }, "heartbeat", { n: 0 }, { key: "heartbeat" });
+    schedule({ kv }, { in: 1000 }, "heartbeat", { n: 0 }, { key: "heartbeat" });
     kv.set("hb-seeded", "1");
     return "seeded";
 }'''
@@ -59,7 +59,7 @@ export default function ({ kv }) {
     kv.set("hb-fire-count", String(count));
     kv.set("hb-last-fired-at-ns", String(BigInt(Date.now()) * 1_000_000n));
     // Re-arm for the next interval — same key keeps it one entry.
-    schedule({ in: 1000 }, "heartbeat", { n: count }, { key: a.key });
+    schedule({ kv }, { in: 1000 }, "heartbeat", { n: count }, { key: a.key });
     return { status: 200 };
 }'''
 

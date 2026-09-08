@@ -214,8 +214,10 @@ export function links(id, opts) {
  * @returns {{start, get, links}} The bound verbs.
  *
  * @example
- * const exp = forScope(platform.scope(instance_id));
- * const id = exp.start();          // later: exp.get(id), exp.links(id)
+ * export default ({ platform }) => {
+ *   const exp = forScope(platform.scope(instance_id));
+ *   const id = exp.start();          // later: exp.get(id), exp.links(id)
+ * };
  */
 export function forScope(scope) {
   return {

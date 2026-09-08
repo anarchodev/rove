@@ -20,7 +20,8 @@ import jwt from "@rewind/jwt";
  * @class OAuthProvider
  */
 class OAuthProvider {
-  constructor(config) {
+  constructor(caps, config) {
+    this._caps = caps;
     for (const k of ["authorization_url", "token_url", "client_id", "redirect_uri", "on_complete_module"]) {
       if (typeof config[k] !== "string" || !config[k]) {
         throw new TypeError("oauth: missing required config key: " + k);
@@ -58,7 +59,7 @@ class OAuthProvider {
       challenge = crypto.sha256b64url(verifier);
     }
 
-    kv.set(this.cfg.state_path + "/" + state, JSON.stringify({
+    this._caps.kv.set(this.cfg.state_path + "/" + state, JSON.stringify({
       verifier,
       return_to: opts.return_to,
       context: opts.context || {},
@@ -102,13 +103,13 @@ class OAuthProvider {
       return "OAuth: missing state or code on callback";
     }
 
-    const stored_raw = kv.get(this.cfg.state_path + "/" + state);
+    const stored_raw = this._caps.kv.get(this.cfg.state_path + "/" + state);
     if (stored_raw == null) {
       response.status = 400;
       return "OAuth: unknown state";
     }
     const stored = JSON.parse(stored_raw);
-    kv.delete(this.cfg.state_path + "/" + state);
+    this._caps.kv.delete(this.cfg.state_path + "/" + state);
 
     if (Date.now() - stored.created_at > this.cfg.state_ttl_ms) {
       response.status = 400;
@@ -124,7 +125,7 @@ class OAuthProvider {
     if (this.cfg.client_secret) body_params.set("client_secret", this.cfg.client_secret);
     if (stored.verifier) body_params.set("code_verifier", stored.verifier);
 
-    webhook.send(this.cfg.token_url, {
+    this._caps.webhook.send(this.cfg.token_url, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body_params.toString(),
@@ -146,7 +147,7 @@ class OAuthProvider {
       client_id: this.cfg.client_id,
     });
     if (this.cfg.client_secret) body_params.set("client_secret", this.cfg.client_secret);
-    return webhook.send(this.cfg.token_url, {
+    return this._caps.webhook.send(this.cfg.token_url, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body_params.toString(),
@@ -160,18 +161,18 @@ class OAuthProvider {
  * Resolve a config and return an {@link OAuthProvider}. `arg` is a provider
  * name (reads `_config/oauth/{name}`; default `"default"`) or an inline config.
  */
-export function fromConfig(arg) {
+export function fromConfig(caps, arg) {
   if (arg == null || typeof arg === "string") {
     const name = arg || "default";
-    const raw = config.get("oauth/" + name);
+    const raw = caps.config.get("oauth/" + name);
     if (raw == null) {
       throw new Error("oauth.fromConfig: config not found at _config/oauth/" + name + ". Did you deploy the file?");
     }
-    return new OAuthProvider(_oauthDefaults(JSON.parse(raw), name));
+    return new OAuthProvider(caps, _oauthDefaults(JSON.parse(raw), name));
   }
   if (typeof arg === "object") {
     const name = arg.name || "_inline";
-    return new OAuthProvider(_oauthDefaults(arg, name));
+    return new OAuthProvider(caps, _oauthDefaults(arg, name));
   }
   throw new TypeError("oauth.fromConfig: expected string name or inline config object");
 }
@@ -181,7 +182,7 @@ export function fromConfig(arg) {
  * Returns `{ok:true, claims}` / `{ok:false, error}` (hard reject) /
  * `{ok:false, need_jwks:true, jwks_uri}` (caller does the async refetch hop).
  */
-export function verifyIdToken(id_token, opts) {
+export function verifyIdToken({ kv }, id_token, opts) {
   if (typeof id_token !== "string" || id_token.length === 0) {
     return { ok: false, error: "missing id_token" };
   }
@@ -206,7 +207,7 @@ export function verifyIdToken(id_token, opts) {
 }
 
 /** Kick the async JWKS fetch; the result lands in the `{on}` module. */
-export function fetchJwks(opts, on, ctx) {
+export function fetchJwks({ webhook }, opts, on, ctx) {
   webhook.send(opts.jwks_uri, {
     method: "GET",
     on: on,
@@ -219,7 +220,7 @@ export function fetchJwks(opts, on, ctx) {
  * ambient result (`request.status` / `request.text`). Returns `true` when a
  * well-formed JWKS was cached.
  */
-export function cacheJwks(cache_path) {
+export function cacheJwks({ kv }, cache_path) {
   const req = globalThis.request;
   if (!req || !(req.status >= 200 && req.status < 300)) return false;
   let jwks = null;

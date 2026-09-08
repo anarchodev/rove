@@ -36,7 +36,7 @@
   // inert on a connectionless activation (no socket) — so calling a
   // sender outside a held `onMessage`/inbound chain simply no-ops,
   // matching the rest of the connection-output surface.
-  function send(frame) {
+  function send(stream, frame) {
     stream.write(JSON.stringify(frame));
   }
 
@@ -73,8 +73,8 @@ const browser = {
      * @param {object} action - e.g. `{id, op:"click", ref:"12"}`.
      * @returns {void}
      */
-    act(action) {
-      send(Object.assign({ t: "act" }, action));
+    act({ stream }, action) {
+      send(stream, Object.assign({ t: "act" }, action));
     },
 
     /**
@@ -82,8 +82,8 @@ const browser = {
      * @param {string} text
      * @returns {void}
      */
-    status(text) {
-      send({ t: "status", text: String(text == null ? "" : text) });
+    status({ stream }, text) {
+      send(stream, { t: "status", text: String(text == null ? "" : text) });
     },
 
     /**
@@ -95,8 +95,8 @@ const browser = {
      * @param {object} req - `{id, prompt, action}`.
      * @returns {void}
      */
-    confirm(req) {
-      send(Object.assign({ t: "confirm" }, req));
+    confirm({ stream }, req) {
+      send(stream, Object.assign({ t: "confirm" }, req));
     },
 
     /**
@@ -107,8 +107,8 @@ const browser = {
      * @param {string} [message]
      * @returns {void}
      */
-    done(message) {
-      send({ t: "done", message: message == null ? undefined : String(message) });
+    done({ stream }, message) {
+      send(stream, { t: "done", message: message == null ? undefined : String(message) });
     },
 
     /**
@@ -213,7 +213,7 @@ const browser = {
      *   cursor; `limit` max records (default 50).
      * @returns {boolean} false if it couldn't issue (no tenant/connection).
      */
-    getReplay(opts) {
+    getReplay({ after }, opts) {
       const request = globalThis.request;
       opts = opts || {};
       const on_key = typeof opts.on === "string" ? opts.on : undefined;

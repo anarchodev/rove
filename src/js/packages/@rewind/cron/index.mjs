@@ -77,7 +77,9 @@ const _cronHelpers = {
    * @returns {bigint} Nanoseconds since epoch.
    * @throws {TypeError} If `s` isn't a duration.
    * @example
-   * webhook.send("https://hooks.example.com/x", { at: cron.fromNow("30m") });
+   * export default ({ webhook }) => {
+   *   webhook.send("https://hooks.example.com/x", { at: cron.fromNow("30m") });
+   * };
    */
   fromNow(s) {
     const dur_ms = time.parseDuration(s);
@@ -145,7 +147,9 @@ const _cronHelpers = {
    *
    * @returns {bigint} Nanoseconds since epoch.
    * @example
-   * webhook.send("https://hooks.example.com/x", { at: cron.hourly() });
+   * export default ({ webhook }) => {
+   *   webhook.send("https://hooks.example.com/x", { at: cron.hourly() });
+   * };
    */
   hourly() {
     const now = new Date();
@@ -173,7 +177,9 @@ const _cronHelpers = {
    * @throws {TypeError} On a malformed expression/field.
    * @throws {Error} If no match within a 4-year window.
    * @example
-   * webhook.send("https://hooks.example.com/x", { at: cron.next("0 3 * * *") });
+   * export default ({ webhook }) => {
+   *   webhook.send("https://hooks.example.com/x", { at: cron.next("0 3 * * *") });
+   * };
    */
   next(expr, now_ms) {
     const fields = String(expr).trim().split(/\s+/);
@@ -294,15 +300,15 @@ function _parseField(field, min, max) {
  *   `schedule.cancel(id)`).
  * @throws {TypeError} On a non-string `spec`/`target` or malformed spec.
  * @example
- * cron("0 3 * * *", "jobs/cleanup");        // nightly cleanup
- * cron("*\/15 * * * *", "jobs/poll", { src }); // every 15 min
+ * cron({ kv }, "0 3 * * *", "jobs/cleanup");        // nightly cleanup
+ * cron({ kv }, "*\/15 * * * *", "jobs/poll", { src }); // every 15 min
  */
-function cron(spec, target, ctx) {
+function cron({ kv }, spec, target, ctx) {
   if (typeof spec !== "string") {
-    throw new TypeError("cron(spec, target, ctx?): spec must be a crontab string");
+    throw new TypeError("cron(caps, spec, target, ctx?): spec must be a crontab string");
   }
   if (typeof target !== "string" || target.length === 0) {
-    throw new TypeError("cron(spec, target, ctx?): target must be a non-empty module specifier");
+    throw new TypeError("cron(caps, spec, target, ctx?): target must be a non-empty module specifier");
   }
   // Validate the spec + compute the first occurrence (throws on a
   // malformed expression — fail at registration, not at fire time).
@@ -313,6 +319,7 @@ function cron(spec, target, ctx) {
   // Return the schedule ID (not the key) — that's what schedule.get /
   // schedule.cancel take and what `_sched/by_id/{id}` is keyed by.
   return schedule(
+    { kv },
     { at: firstNs },
     "__system/cron_tick",
     { spec, target, ctx: ctx === undefined ? null : ctx },

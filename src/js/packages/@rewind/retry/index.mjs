@@ -112,7 +112,7 @@ const retry = {
    * @returns {string} The {@link webhook.send} schedule id.
    * @throws {TypeError} On missing/invalid `url`/`on`/`maxAttempts`.
    */
-  send(opts) {
+  send({ webhook }, opts) {
     if (!opts || typeof opts !== "object") {
       throw new TypeError("retry.send: requires an options object");
     }
@@ -191,7 +191,7 @@ const retry = {
    *
    * @returns {string|null} New marker id, or `null`.
    */
-  again() {
+  again({ webhook }) {
     if (!retry.shouldRetry()) return null;
     const req = globalThis.request;
     const r = req.ctx[RETRY_KEY];

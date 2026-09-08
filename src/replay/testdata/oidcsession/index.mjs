@@ -12,8 +12,8 @@
 // package-UPGRADE boundary rather than the engine skew in rove#820.
 import oidc from "@rewind/oidc";
 
-export default function () {
-  const auth = oidc.rp("default").guard();
+export default function ({ kv, config }) {
+  const auth = oidc.rp({ kv, config }, "default").guard();
   response.status = 200;
   return { authed: !!auth, sub: auth ? auth.sub : null, isRoot: auth ? auth.is_root : null };
 }

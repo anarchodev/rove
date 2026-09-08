@@ -4,9 +4,9 @@ import email from "@rewind/email";
 // marker whose url is the Resend API and whose body is the built Resend request.
 // The `toHaveSent("email", …)` view reads that marker back into a readable
 // {to, from, subject} shape.
-export default function ({ kv }) {
+export default function ({ kv, webhook }) {
   const user = request.json.user;
-  email.send({
+  email.send({ webhook }, {
     apiKey: "re_test_key",
     from: "noreply@acme.dev",
     to: user + "@example.com",

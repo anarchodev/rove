@@ -6,8 +6,8 @@
 // the `toHaveSent("email", …)` matcher reads.
 import email from "@rewind/email";
 
-export default function () {
-  const id = email.send({
+export default function ({ webhook }) {
+  const id = email.send({ webhook }, {
     apiKey: "re_test_key",
     from: "noreply@acme.dev",
     to: "ada@example.com",

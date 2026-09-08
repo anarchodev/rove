@@ -39,14 +39,14 @@ function _recKey(uid) {
   return "users/" + uid;
 }
 
-function _readRec(uid) {
+function _readRec(kv, uid) {
   if (typeof uid !== "string" || uid.length === 0) return null;
   const raw = kv.get(_recKey(uid));
   if (raw == null) return null;
   try { return JSON.parse(raw); } catch (_) { return null; }
 }
 
-function _writeRec(rec) {
+function _writeRec(kv, rec) {
   kv.set(_recKey(rec.uid), JSON.stringify(rec));
   return rec;
 }
@@ -70,9 +70,9 @@ const users = {
    * @throws {TypeError} Missing/invalid email.
    * @throws {Error} `email_exists` — an account already owns it.
    * @example
-   * const u = users.create({ email: "ada@example.com", email_verified: true });
+   * const u = users.create({ kv }, { email: "ada@example.com", email_verified: true });
    */
-  create(input) {
+  create({ kv }, input) {
     input = input || {};
     const email = _normEmail(input.email);
     if (!email || email.indexOf("@") < 1) {
@@ -100,7 +100,7 @@ const users = {
     // Record first, then index: a crash between leaves an orphan
     // record (harmless, GC-able) rather than an index pointing at
     // nothing (a lookup that resurrects a missing user).
-    _writeRec(rec);
+    _writeRec(kv, rec);
     kv.set(_emailKey(email), rec.uid);
     return rec;
   },
@@ -111,8 +111,8 @@ const users = {
    * @param {string} uid
    * @returns {object|null} The record, or `null` if absent.
    */
-  get(uid) {
-    return _readRec(uid);
+  get({ kv }, uid) {
+    return _readRec(kv, uid);
   },
 
   /**
@@ -121,12 +121,12 @@ const users = {
    * @param {string} email
    * @returns {object|null} The record, or `null` if no such user.
    */
-  byEmail(email) {
+  byEmail({ kv }, email) {
     const e = _normEmail(email);
     if (!e) return null;
     const uid = kv.get(_emailKey(e));
     if (uid == null) return null;
-    return _readRec(uid);
+    return _readRec(kv, uid);
   },
 
   /**
@@ -140,8 +140,8 @@ const users = {
    * @returns {object} The updated record.
    * @throws {Error} `not_found`.
    */
-  update(uid, patch) {
-    const rec = _readRec(uid);
+  update({ kv }, uid, patch) {
+    const rec = _readRec(kv, uid);
     if (!rec) throw new Error("not_found");
     patch = patch || {};
     if ("name" in patch) rec.name = patch.name;
@@ -160,7 +160,7 @@ const users = {
       }
     }
     rec.updated_at = Date.now();
-    return _writeRec(rec);
+    return _writeRec(kv, rec);
   },
 
   /**
@@ -171,7 +171,7 @@ const users = {
    * @param {number} [limit] - 1–1000, default 100.
    * @returns {object} `{users:[record,…], next_cursor?}`.
    */
-  list(cursor, limit) {
+  list({ kv }, cursor, limit) {
     const l = Math.max(1, Math.min(parseInt(limit ?? 100, 10) || 100, 1000));
     const rows = kv.prefix("users/", cursor || "", l);
     const out = [];
@@ -197,12 +197,12 @@ const users = {
    * @returns {object} The updated record.
    * @throws {Error} `not_found`.
    */
-  disable(uid) {
-    const rec = _readRec(uid);
+  disable({ kv }, uid) {
+    const rec = _readRec(kv, uid);
     if (!rec) throw new Error("not_found");
     rec.status = "disabled";
     rec.updated_at = Date.now();
-    return _writeRec(rec);
+    return _writeRec(kv, rec);
   },
 
   /**
@@ -212,12 +212,12 @@ const users = {
    * @returns {object} The updated record.
    * @throws {Error} `not_found`.
    */
-  enable(uid) {
-    const rec = _readRec(uid);
+  enable({ kv }, uid) {
+    const rec = _readRec(kv, uid);
     if (!rec) throw new Error("not_found");
     rec.status = "active";
     rec.updated_at = Date.now();
-    return _writeRec(rec);
+    return _writeRec(kv, rec);
   },
 };
 

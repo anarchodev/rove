@@ -156,9 +156,9 @@ export default function ({{ blob }}) {{
 # slices via the recipe helper.
 SEGGET_SRC = """
 import segments from "@rewind/segments";
-export default function ({ next }) {
+export default function ({ next, blob, kv }) {
   const qp = new URLSearchParams(request.query || "");
-  const v = segments.get(qp.get("stream"), Number(qp.get("seq")), { on: "onSeg" });
+  const v = segments.get({ blob, kv }, qp.get("stream"), Number(qp.get("seq")), { on: "onSeg" });
   if (typeof v === "string") return "hot:" + v;
   if (v === null) { response.status = 404; return "missing"; }
   return next();
@@ -203,14 +203,14 @@ export default function ({ blob, kv }) {
     for (let i = 0; i < n; i++) {
       // Each record embeds its own seq so reads are self-checking.
       const nx = Number(kv.get("_seg/" + q.stream + "/n") ?? "0");
-      const seq = segments.append(q.stream, "v-" + nx);
+      const seq = segments.append({ kv }, q.stream, "v-" + nx);
       if (first < 0) first = seq;
       last = seq;
     }
     return JSON.stringify({ first, last });
   }
   if (path === "/seg-seal") {
-    return String(segments.seal(q.stream, { min: 1 }));
+    return String(segments.seal({ blob, kv }, q.stream, { min: 1 }));
   }
   if (path === "/seg-check") {
     const hot = kv.prefix("_seg/" + q.stream + "/h/", null, 4096);

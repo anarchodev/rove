@@ -56,7 +56,8 @@ class Sessions {
    *   (cookie_name/max_age_s/same_site/secure/http_only/path).
    *   `state_path` is required (set by {@link sessions.fromConfig}).
    */
-  constructor(config) {
+  constructor(caps, config) {
+    this._caps = caps;
     this.cfg = Object.assign({}, SESSION_DEFAULTS, config);
     if (!this.cfg.state_path) {
       throw new TypeError("sessions: config.state_path required");
@@ -70,11 +71,11 @@ class Sessions {
    * @param {object} data - Arbitrary session payload.
    * @returns {string} The new session id.
    * @example
-   * sessions.fromConfig().create({ user_sub: payload.sub });
+   * sessions.fromConfig({ kv, config }).create({ user_sub: payload.sub });
    */
   create(data) {
     const id = crypto.randomUUID();
-    kv.set(this.cfg.state_path + "/" + id, JSON.stringify(Object.assign({}, data, {
+    this._caps.kv.set(this.cfg.state_path + "/" + id, JSON.stringify(Object.assign({}, data, {
       created_at: Date.now(),
     })));
     _appendSetCookie(this._cookieHeader(id, this.cfg.max_age_s));
@@ -93,7 +94,7 @@ class Sessions {
   get() {
     const id = this._currentId();
     if (!id) return null;
-    const raw = kv.get(this.cfg.state_path + "/" + id);
+    const raw = this._caps.kv.get(this.cfg.state_path + "/" + id);
     if (raw == null) return null;
     return JSON.parse(raw);
   }
@@ -112,11 +113,11 @@ class Sessions {
   update(patch) {
     const id = this._currentId();
     if (!id) return null;
-    const raw = kv.get(this.cfg.state_path + "/" + id);
+    const raw = this._caps.kv.get(this.cfg.state_path + "/" + id);
     if (raw == null) return null;
     const current = JSON.parse(raw);
     const next = typeof patch === "function" ? patch(current) : Object.assign({}, current, patch);
-    kv.set(this.cfg.state_path + "/" + id, JSON.stringify(next));
+    this._caps.kv.set(this.cfg.state_path + "/" + id, JSON.stringify(next));
     return next;
   }
 
@@ -130,7 +131,7 @@ class Sessions {
    */
   destroy() {
     const id = this._currentId();
-    if (id) kv.delete(this.cfg.state_path + "/" + id);
+    if (id) this._caps.kv.delete(this.cfg.state_path + "/" + id);
     _appendSetCookie(this._cookieHeader("", 0));
   }
 
@@ -147,11 +148,11 @@ class Sessions {
   rotate() {
     const old_id = this._currentId();
     if (!old_id) return null;
-    const raw = kv.get(this.cfg.state_path + "/" + old_id);
+    const raw = this._caps.kv.get(this.cfg.state_path + "/" + old_id);
     if (raw == null) return null;
-    kv.delete(this.cfg.state_path + "/" + old_id);
+    this._caps.kv.delete(this.cfg.state_path + "/" + old_id);
     const new_id = crypto.randomUUID();
-    kv.set(this.cfg.state_path + "/" + new_id, raw);
+    this._caps.kv.set(this.cfg.state_path + "/" + new_id, raw);
     _appendSetCookie(this._cookieHeader(new_id, this.cfg.max_age_s));
     return new_id;
   }
@@ -223,21 +224,21 @@ const sessions = {
    * @throws {Error} Named config not found (file not deployed).
    * @throws {TypeError} `arg` is neither string nor object.
    * @example
-   * const s = sessions.fromConfig();          // "default"
-   * const a = sessions.fromConfig("admin");
+   * const s = sessions.fromConfig({ kv, config });          // "default"
+   * const a = sessions.fromConfig({ kv, config }, "admin");
    */
-  fromConfig(arg) {
+  fromConfig(caps, arg) {
     if (arg == null || typeof arg === "string") {
       const name = arg || "default";
-      const raw = config.get("sessions/" + name);
+      const raw = caps.config.get("sessions/" + name);
       if (raw == null) {
         throw new Error("sessions.fromConfig: config not found at _config/sessions/" + name + ". Did you deploy the file?");
       }
-      return new Sessions(_sessionsDefaults(JSON.parse(raw), name));
+      return new Sessions(caps, _sessionsDefaults(JSON.parse(raw), name));
     }
     if (typeof arg === "object") {
       const name = arg.name || "_inline";
-      return new Sessions(_sessionsDefaults(arg, name));
+      return new Sessions(caps, _sessionsDefaults(arg, name));
     }
     throw new TypeError("sessions.fromConfig: expected string name or inline config object");
   },

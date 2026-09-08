@@ -7,9 +7,9 @@
 // package, not a global.)
 import retry from "@rewind/retry";
 
-export default function () {
+export default function ({ webhook }) {
   if (request.path === "/send") {
-    return { id: retry.send({
+    return { id: retry.send({ webhook }, {
       url: "https://api.stripe.com/v1/charges",
       body: "x",
       on: "stripe_done",
