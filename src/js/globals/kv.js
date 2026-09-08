@@ -3,32 +3,30 @@
 // Public `kv` surface — the documentation source of truth for the
 // tenant key/value store (docs/architecture/builtin-libs.md Phase A).
 //
-// This is a thin shim over the native `_system.kv` binding. The
-// top-level name customers call (`kv.get`, `kv.set`, …) is unchanged;
-// only the implementation moved behind `_system`. `_system.*` is the
-// internal ABI — unstable and undocumented; customer code must never
-// reference it directly.
-//
-// Evaluated as a global script (no module/exports) into every
-// dispatcher context after the native bindings install.
+// A FACTORY (`docs/architecture/package-isolation.md`, the
+// received-not-ambient model): the engine invokes it once per context
+// with the native kv slice as its one capability
+// (`_factories_invoke.js`) and installs the returned object at the
+// top-level name customers call (`kv.get`, `kv.set`, …). The factory
+// has no module-scope bindings for a handler to resolve; its
+// capability exists only inside this closure.
 
-(function () {
-  const sys = _system.kv;
-
-  /**
-   * Tenant-scoped key/value store. Keys and values are strings. Every
-   * key lives in this tenant's `app.db`; reads and writes never cross
-   * tenant boundaries. All operations are replay-deterministic — the
-   * same handler run against the same recorded tape observes identical
-   * results.
-   *
-   * Writes made via `kv.set` / `kv.delete` are buffered in the request
-   * transaction and commit atomically when the handler returns; they
-   * also replicate through Raft to followers.
-   *
-   * @namespace kv
-   */
-  globalThis.kv = {
+/**
+ * Tenant-scoped key/value store. Keys and values are strings. Every
+ * key lives in this tenant's `app.db`; reads and writes never cross
+ * tenant boundaries. All operations are replay-deterministic — the
+ * same handler run against the same recorded tape observes identical
+ * results.
+ *
+ * Writes made via `kv.set` / `kv.delete` are buffered in the request
+ * transaction and commit atomically when the handler returns; they
+ * also replicate through Raft to followers.
+ *
+ * @namespace kv
+ */
+__rove_factories.kv = function (caps) {
+  const sys = caps.kv;
+  return {
     /**
      * Read the value for `key`.
      *
@@ -37,9 +35,11 @@
      *   does not exist.
      *
      * @example
-     * const raw = kv.get(`user/${id}`);
-     * if (raw === null) { response.status = 404; return "not found"; }
-     * const user = JSON.parse(raw);
+     * export default ({ kv, response }) => {
+     *   const raw = kv.get(`user/${id}`);
+     *   if (raw === null) { response.status = 404; return "not found"; }
+     *   const user = JSON.parse(raw);
+     * };
      */
     get(key) {
       return sys.get(key);
@@ -60,7 +60,9 @@
      * @returns {void}
      *
      * @example
-     * kv.set(`user/${user.id}`, JSON.stringify(user));
+     * export default ({ kv }) => {
+     *   kv.set(`user/${user.id}`, JSON.stringify(user));
+     * };
      */
     set(key, value) {
       return sys.set(key, value);
@@ -74,7 +76,9 @@
      * @returns {void}
      *
      * @example
-     * kv.delete(`session/${sid}`);
+     * export default ({ kv }) => {
+     *   kv.delete(`session/${sid}`);
+     * };
      */
     delete(key) {
       return sys.delete(key);
@@ -93,17 +97,19 @@
      *   in ascending key order. An empty array ends the scan.
      *
      * @example
-     * let cursor;
-     * const all = [];
-     * for (;;) {
-     *   const page = kv.prefix("user/", cursor, 1000);
-     *   if (page.length === 0) break;
-     *   all.push(...page);
-     *   cursor = page[page.length - 1].key;
-     * }
+     * export default ({ kv }) => {
+     *   let cursor;
+     *   const all = [];
+     *   for (;;) {
+     *     const page = kv.prefix("user/", cursor, 1000);
+     *     if (page.length === 0) break;
+     *     all.push(...page);
+     *     cursor = page[page.length - 1].key;
+     *   }
+     * };
      */
     prefix(prefix, cursor, limit) {
       return sys.prefix(prefix, cursor, limit);
     },
   };
-})();
+};

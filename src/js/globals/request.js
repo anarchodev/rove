@@ -23,7 +23,12 @@
 // RETIRED — these accessors are the only payload surface; the replay
 // driver alone still synthesizes a `body` so records from
 // pre-retirement deployments replay their pinned code.)
-(function () {
+/**
+ * The shared per-request prototype carrying the derived `text` / `json`
+ * accessors — engine-internal (installed as `__rove_request_proto`, the
+ * name `installRequest` reads), not customer surface.
+ */
+__rove_factories.__rove_request_proto = function () {
   "use strict";
   const proto = {};
   Object.defineProperty(proto, "text", {
@@ -46,5 +51,5 @@
       return v;
     },
   });
-  globalThis.__rove_request_proto = proto;
-})();
+  return proto;
+};

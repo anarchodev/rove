@@ -43,9 +43,11 @@ const SYSTEM_SHIM = @embedFile("js/system_recorders.js");
 // package, so `@embedFile` takes the import NAME, not a path).
 pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     // The factory registry, the same shape the worker's installStatic
-    // creates (`_factories.js`): a factory-shaped shim registers itself
-    // here instead of assigning a global, and the invoker at the end of
-    // this prelude calls it with the caps a platform shim receives.
+    // creates (`_factories.js`): every shim is factory-shaped — evaluating
+    // it only registers `__rove_factories.<name>` (no module-scope
+    // bindings, so each is freeze-safe embedded bare), and the invoker at
+    // the end of this prelude constructs and installs the surfaces in
+    // explicit dependency order. Embed order is therefore free.
     "\n;globalThis.__rove_factories = {};" ++
     "\n;" ++ @embedFile("g_crypto") ++
     "\n;" ++ @embedFile("g_http") ++
@@ -53,59 +55,80 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     "\n;" ++ @embedFile("g_base64") ++
     "\n;" ++ @embedFile("g_urlsearchparams") ++
     // The connection/continuation shims — `after` (wake triggers), `stream`
-    // (output frames), `next` (park disposition). Faithful recorders (they don't
-    // decompose), installed unconditionally; the epilogue does not stub them.
-    // All three are IIFE-wrapped upstream, so freeze-safe as embedded.
+    // (output frames), `next` (park disposition). Faithful recorders (they
+    // don't decompose), installed unconditionally; the epilogue does not
+    // stub them.
     "\n;" ++ @embedFile("g_after") ++
     "\n;" ++ @embedFile("g_stream") ++
     "\n;" ++ @embedFile("g_next") ++
     // The durable-effect shims — the real webhook + the private scheduler
-    // core, so webhook.send decomposes to primitives (`_send/owed` +
+    // core (`sched` — never a customer global; the customer verb is the
+    // @rewind/schedule package, resolved per-request like the other lifted
+    // libs), so webhook.send decomposes to primitives (`_send/owed` +
     // `_sched/*` kv writes + `http.fetch`) in the effect log; the epilogue
-    // does not stub them. Order: `time` (the shared time-coercion library) →
-    // `schedule` (coerces `{at}`/`{in}` through `time`; installs the PRIVATE
-    // `_system.sched`, NOT a customer global — that's the @rewind/schedule
-    // package, resolved per-request like the other lifted libs) → `webhook`
-    // (a factory: it receives `http`/`sched`/`kv`/`formats` from the
-    // invoker below rather than capturing `_system.*` at eval, so eval
-    // order no longer constrains it; the registration itself has no
-    // top-level bindings, so it is freeze-safe embedded bare).
-    // `schedule.js` is self-IIFE'd (freeze-safe as embedded).
+    // does not stub them. `time` is the shared time-coercion library the
+    // sched core reads ambiently.
     "\n;" ++ @embedFile("g_time") ++
     "\n;" ++ @embedFile("g_schedule") ++
-    // AFTER schedule.js, mirroring the worker (globals.zig): platform.js
-    // captures the private `_system.sched` at eval for `platform.dispatch`'s
-    // watchdog arm — evaluated earlier it captures undefined and every
-    // dispatch throws at the arm.
     "\n;" ++ @embedFile("g_platform") ++
     "\n;" ++ @embedFile("g_webhook") ++
-    // `blob` — real shim over the `_system.blob` recorder + `_system.http` (PUT /
-    // compose) + the pure-JS streaming sha256; `blob.get` composes on the base
-    // `after.fetch`, so it lands after `g_after`. Its recipe rows / owed markers
-    // are ordinary kv writes. IIFE-wrapped upstream (`(() => { … })()`), so it
-    // captures `_system` before the delete below and stays freeze-safe.
+    // `blob` — real shim over the `_system.blob` recorder + `_system.http`
+    // (PUT / compose) + the pure-JS streaming sha256; `blob.get` composes
+    // on the public `after.fetch` it receives. Its recipe rows / owed
+    // markers ride the `_blob/`-rooted marker kv.
     "\n;" ++ @embedFile("g_blob") ++
     // Invoke the registered factories — after every shim, before the
-    // `_system` delete, mirroring the worker's `_factories_invoke.js` with
-    // one sim-shaped difference: the kv recorder is EPILOGUE-local (per
-    // run), so `kv` is a call-time forwarder to whatever `globalThis.kv`
-    // the epilogue has installed — exactly the late binding the ambient
+    // `_system` delete, mirroring the worker's `_factories_invoke.js`
+    // (per-shim caps, dependency-ordered, unconsumed-registration check)
+    // over THIS prelude's shim subset. The sim's kv recorder is
+    // EPILOGUE-local (per run), and the rooted marker views forward to
+    // `globalThis.kv` at call time — exactly the late binding the ambient
     // reference used to provide. The other caps are the base recorders.
     "\n;(function () {" ++
     "\n  const reg = globalThis.__rove_factories;" ++
-    "\n  const caps = {" ++
-    "\n    http: _system.http," ++
-    "\n    sched: _system.sched," ++
-    "\n    kv: {" ++
-    "\n      get: (k) => globalThis.kv.get(k)," ++
-    "\n      set: (k, v) => globalThis.kv.set(k, v)," ++
-    "\n      delete: (k) => globalThis.kv.delete(k)," ++
-    "\n      prefix: (p, c, l) => globalThis.kv.prefix(p, c, l)," ++
-    "\n    }," ++
-    "\n    formats: __rove.formats," ++
+    "\n  const pending = new Set(Object.keys(reg));" ++
+    "\n  const invoke = (name, caps) => {" ++
+    "\n    if (!pending.delete(name))" ++
+    "\n      throw new Error(\"factory not registered: \" + name);" ++
+    "\n    return reg[name](caps);" ++
     "\n  };" ++
-    "\n  for (const name of Object.keys(reg)) {" ++
-    "\n    globalThis[name] = reg[name](caps);" ++
-    "\n  }" ++
+    "\n  const rooted = (root) => ({" ++
+    "\n    get: (k) => globalThis.kv.get(root + k)," ++
+    "\n    set: (k, v) => globalThis.kv.set(root + k, v)," ++
+    "\n    delete: (k) => globalThis.kv.delete(root + k)," ++
+    "\n    prefix: (p, c, l) =>" ++
+    "\n      (globalThis.kv.prefix(root + p, c == null || c === \"\" ? c : root + c, l) || [])" ++
+    "\n        .map((e) => ({ key: e.key.slice(root.length), value: e.value }))," ++
+    "\n  });" ++
+    "\n  globalThis.crypto = invoke(\"crypto\", { crypto: _system.crypto });" ++
+    "\n  globalThis.http = invoke(\"http\", { http: _system.http });" ++
+    "\n  globalThis.stream = invoke(\"stream\", { stream: _system.stream });" ++
+    "\n  globalThis.next = invoke(\"next\", { next: _system.continuation.next });" ++
+    "\n  globalThis.after = invoke(\"after\", { after: _system.after, http: _system.http });" ++
+    "\n  globalThis.__rove_request_proto = invoke(\"__rove_request_proto\", {});" ++
+    "\n  globalThis.btoa = invoke(\"btoa\", {});" ++
+    "\n  globalThis.atob = invoke(\"atob\", {});" ++
+    "\n  globalThis.base64url = invoke(\"base64url\", {});" ++
+    "\n  globalThis.hex = invoke(\"hex\", {});" ++
+    "\n  globalThis.URLSearchParams = invoke(\"URLSearchParams\", {});" ++
+    "\n  globalThis.time = invoke(\"time\", {});" ++
+    "\n  const sched = invoke(\"sched\", {" ++
+    "\n    kv: rooted(\"_sched/\"), formats: __rove.formats," ++
+    "\n  });" ++
+    "\n  globalThis.platform = invoke(\"platform\", {" ++
+    "\n    platform: _system.platform, after: _system.after," ++
+    "\n    blobReceive: _system.blob.receive, blobPresign: _system.blob.presign," ++
+    "\n    sched: sched, kv: rooted(\"_dispatch/\"), formats: __rove.formats," ++
+    "\n  });" ++
+    "\n  globalThis.webhook = invoke(\"webhook\", {" ++
+    "\n    http: _system.http, sched: sched, kv: rooted(\"_send/\")," ++
+    "\n    formats: __rove.formats," ++
+    "\n  });" ++
+    "\n  globalThis.blob = invoke(\"blob\", {" ++
+    "\n    http: _system.http, blob: _system.blob, kv: rooted(\"_blob/\")," ++
+    "\n    after: globalThis.after, formats: __rove.formats," ++
+    "\n  });" ++
+    "\n  if (pending.size > 0)" ++
+    "\n    throw new Error(\"unconsumed factories: \" + Array.from(pending).join(\", \"));" ++
     "\n})();" ++
     "\n;delete globalThis._system;\n";

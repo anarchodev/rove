@@ -11,29 +11,43 @@
 // Every method is admin-only: it throws `TypeError` ("platform is
 // only available on the admin handler") when reached from a normal
 // tenant handler — the gate is enforced natively, the shim only
-// forwards. Evaluated as a global script into every dispatcher
-// context after the native bindings install.
+// forwards.
+//
+// A FACTORY (`docs/architecture/package-isolation.md`, the
+// received-not-ambient model): the engine invokes it once per context
+// (`_factories_invoke.js`) with the native platform/after slices, the
+// two blob natives its scope surface lowers to, the durable scheduler
+// core, and a marker kv namespace-rooted at `_dispatch/`.
 
-(function () {
-  const sys = _system.platform;
-  // `after.fetch` native (captured before `_harden.js` deletes `_system`) —
-  // `platform.compile` lowers to a bound fetch to a trusted compile door.
+/**
+ * Admin control plane: cross-tenant kv access, the platform root
+ * store, instance lifecycle, and root-token auth. Only
+ * usable from the `__admin__` handler.
+ *
+ * @namespace platform
+ */
+__rove_factories.platform = function (caps) {
+  const sys = caps.platform;
   // `_dispatch/owed/{id}` record version (`format-versioning.md` §1f).
   // Read by `__system/dispatch_fire`; `__system/dispatch_result` keys on
   // the marker's PRESENCE, not its contents, so it needs no version of
   // its own.
-  const DISPATCH_OWED_V = __rove.formats.dispatchOwed;
+  const DISPATCH_OWED_V = caps.formats.dispatchOwed;
 
-  const sysOn = _system.after;
+  // `after.fetch` native — `platform.compile` lowers to a bound fetch to
+  // a trusted compile door.
+  const sysOn = caps.after;
   // `blob.receive` native — `platform.scope(t).blob.receive` lowers to a
   // cross-tenant streamed upload (extra target + ctx args, admin-gated).
-  const sysBlobReceive = _system.blob.receive;
-  const sysBlobPresign = _system.blob.presign;
-  // The durable scheduler core (globals/schedule.js) installs the private
-  // `_system.sched`; capture it before `_harden.js` deletes `_system`, the
-  // same way webhook.js does, so `platform.dispatch`'s watchdog keeps working
-  // post-harden without exposing an ambient `schedule` to customers.
-  const sysSched = _system.sched;
+  const sysBlobReceive = caps.blobReceive;
+  const sysBlobPresign = caps.blobPresign;
+  // The durable scheduler core (globals/schedule.js) — received, so
+  // `platform.dispatch`'s watchdog arms without an ambient `schedule`
+  // ever existing in customer scope.
+  const sysSched = caps.sched;
+  // Namespace-rooted at `_dispatch/`: the marker writes below spell keys
+  // relative to that root and cannot land outside it.
+  const kv = caps.kv;
 
   // One dispatch attempt's outside bound plus grace. Mirrored in
   // `__system/dispatch_fire.mjs` (its per-attempt re-arm) — keep in sync.
@@ -50,14 +64,7 @@
     }
   }
 
-  /**
-   * Admin control plane: cross-tenant kv access, the platform root
-   * store, instance lifecycle, and root-token auth. Only
-   * usable from the `__admin__` handler.
-   *
-   * @namespace platform
-   */
-  globalThis.platform = {
+  return {
     /**
      * Get accessors scoped to another instance — the explicit
      * cross-tenant grant (replaces the old X-Rove-Scope global-kv rebind).
@@ -83,8 +90,10 @@
      *   Unknown id throws `Error{code:"InstanceNotFound"}`.
      *
      * @example
-     * const { kv: tenantKv } = platform.scope(req.instanceId);
-     * const profile = tenantKv.get("profile");
+     * export default ({ platform }) => {
+     *   const { kv: tenantKv } = platform.scope(req.instanceId);
+     *   const profile = tenantKv.get("profile");
+     * };
      */
     scope(id) {
       const s = sys.scope(id);
@@ -198,8 +207,10 @@
      * @returns {string} The bound fetch id (`ftch_…`).
      *
      * @example
-     * platform.stage([{ path, source }], { scope: tenant, on: "onStaged" });
-     * return next();
+     * export default ({ platform, next }) => {
+     *   platform.stage([{ path, source }], { scope: tenant, on: "onStaged" });
+     *   return next();
+     * };
      */
     stage(files, opts) {
       opts = opts || {};
@@ -241,11 +252,13 @@
      * @returns {string} The bound fetch id (`ftch_…`).
      *
      * @example
-     * platform.compile(handlers, { scope: tenant, on: "onCompiled" });
-     * return next();
-     * // export function onCompiled(request) {
-     * //   const { results } = request.ctx; ...stamp manifest...
-     * // }
+     * export default ({ platform, next }) => {
+     *   platform.compile(handlers, { scope: tenant, on: "onCompiled" });
+     *   return next();
+     *   // export function onCompiled(request) {
+     *   //   const { results } = request.ctx; ...stamp manifest...
+     *   // }
+     * };
      */
     compile(files, opts) {
       opts = opts || {};
@@ -369,9 +382,11 @@
      *   Never the individual operator.
      * @returns {string} The dispatch id — the `_dispatch/owed/{id}` marker.
      * @example
-     * platform.dispatch("acme", "__system/release", {
-     *   ctx: { dep_id: depId }, actor: "tenant_user",
-     * });
+     * export default ({ platform }) => {
+     *   platform.dispatch("acme", "__system/release", {
+     *     ctx: { dep_id: depId }, actor: "tenant_user",
+     *   });
+     * };
      */
     dispatch(tenant, module, opts) {
       opts = opts || {};
@@ -423,7 +438,7 @@
       // before the attempt for the same reason `webhook.send` writes its
       // marker before firing: an attempt that escaped a rolled-back
       // activation would be an effect the cluster never agreed to.
-      kv.set("_dispatch/owed/" + id, JSON.stringify(marker));
+      kv.set("owed/" + id, JSON.stringify(marker));
       // The FIRST fire arms at now — the durable wake IS the fire path, so
       // an initial arm at the watchdog distance would make every dispatch
       // wait out the recovery interval (measured: a caller parked on the
@@ -456,4 +471,4 @@
     //
     //   if (!request.rewind.isRoot) { response.status = 403; return { error: "forbidden" }; }
   };
-})();
+};

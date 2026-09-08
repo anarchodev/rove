@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Loop46, Inc.
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// The durable one-shot scheduler core — installed as the PRIVATE
-// `_system.sched` (deleted from customer scope by `_harden.js`, like
-// every other `_system.*` capability). The customer-facing verb is the
-// `@rewind/schedule` package; this ambient core exists only so the
-// engine's own primitives can compose durable wakes: the `webhook.js`
-// shim captures `_system.sched` at eval time (durable send re-arm), and
-// the baked `__system/*` modules that need it (cron_tick, webhook_fire,
-// webhook_onresult) write the same `_sched/` rows directly over kv (they
-// run post-harden and can't see this closure — see those files).
+// The durable one-shot scheduler core — a FACTORY registered as `sched`,
+// never a customer global. The engine invokes it once per context
+// (`_factories_invoke.js`) and hands the returned core to the shims that
+// compose durable wakes (`webhook.send`'s re-arm, `platform.dispatch`'s
+// watchdog) as their `sched` capability. The customer-facing verb is the
+// `@rewind/schedule` package; the baked `__system/*` modules that need
+// wakes (cron_tick, webhook_fire, webhook_onresult) write the same
+// `_sched/` rows directly over kv (they run post-harden and can't see
+// this closure — see those files).
 // `schedule`/`cron`/`webhook.send` are the three connectionless verbs.
 //
 // `_arm`/`cancel`/`get` and the `{at}`/`{in}` coercions + `opts.key`
@@ -29,12 +29,18 @@
 // tenant):
 //   _sched/by_id/{id}                    -> {when_ns, target, msg, key?}
 //   _sched/by_time/{when_ns_padded}/{id} -> ""   (time-ordered index)
-//
-// Evaluated as a global script after `time.js` (it coerces `{ at }` /
-// `{ in }` through the shared `time` library; `cron.*` fire-time helpers
-// are still handy inputs to `{ at }`).
+// The received kv is namespace-rooted at `_sched/` — the keys this core
+// spells are relative to that root, and the narrowing means the core
+// structurally cannot write outside its namespace. `{at}`/`{in}` coerce
+// through the shared ambient `time` library.
 
-(function () {
+/**
+ * The durable one-shot scheduler core (`sched`) — received by the
+ * durable-effect shims, never installed as a customer global.
+ * @internal
+ */
+__rove_factories.sched = function (caps) {
+  const kv = caps.kv;
 
   // 1 s tick resolution (SCHED_TICK_RESOLUTION). Fire times round UP to
   // the next tick; sub-second scheduling is unsupported (matches the
@@ -60,10 +66,10 @@
   // unparseable record: this is a shim-writable namespace, so a value
   // this reader does not understand is as likely a customer's write as
   // an engine skew, and dropping the entry answers both.
-  const SCHED_REC_V = __rove.formats.sched;
+  const SCHED_REC_V = caps.formats.sched;
 
-  const BY_ID_PREFIX = "_sched/by_id/";
-  const BY_TIME_PREFIX = "_sched/by_time/";
+  const BY_ID_PREFIX = "by_id/";
+  const BY_TIME_PREFIX = "by_time/";
 
   function _byIdKey(id) {
     return BY_ID_PREFIX + id;
@@ -225,7 +231,7 @@
    * const id = schedule({ in: 5000 }, "jobs/poll");
    * schedule({ in: "1h" }, "jobs/expire", { leaseId: "l-7" });
    */
-  _system.sched = Object.assign(function schedule(when, target, ctx, opts) {
+  return Object.assign(function schedule(when, target, ctx, opts) {
     let whenNs;
     if (when && when.at !== undefined) whenNs = _coerceAt(when.at);
     else if (when && when.in !== undefined) whenNs = _coerceIn(when.in);
@@ -294,4 +300,4 @@
       };
     },
   });
-})();
+};

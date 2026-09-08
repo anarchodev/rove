@@ -20,11 +20,20 @@
 //                      delay.) `Date.now()` is replay-deterministic
 //                      (pinned per activation).
 //
-// IIFE-wrapped (like every globals/ shim): a bare top-level declaration
-// left in the script's global lexical scope corrupts the arenajs
-// base-snapshot freeze — scope it.
+// A FACTORY (`docs/architecture/package-isolation.md`, the
+// received-not-ambient model): pure computation, so it takes no
+// capabilities — the factory shape still keeps its helpers out of the
+// base context's global lexical scope (a bare top-level declaration
+// corrupts the arenajs base-snapshot freeze).
 
-(function () {
+/**
+ * Time-coercion helpers shared by `cron` / `schedule` / `webhook.send`:
+ * one place to turn human time inputs into the BigInt nanoseconds-since-
+ * epoch the scheduler verbs use.
+ *
+ * @namespace time
+ */
+__rove_factories.time = function () {
 const NS_PER_MS = 1_000_000n;
 
 function _parseDuration(s) {
@@ -42,14 +51,7 @@ function _parseDuration(s) {
   return null;
 }
 
-/**
- * Time-coercion helpers shared by `cron` / `schedule` / `webhook.send`:
- * one place to turn human time inputs into the BigInt nanoseconds-since-
- * epoch the scheduler verbs use.
- *
- * @namespace time
- */
-globalThis.time = {
+return {
   /**
    * Coerce an ABSOLUTE time input to BigInt nanoseconds-since-epoch.
    *
@@ -123,4 +125,4 @@ globalThis.time = {
     return BigInt(Date.now() + ms) * NS_PER_MS;
   },
 };
-})();
+};

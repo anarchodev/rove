@@ -17,13 +17,36 @@
 // The callback-target option is `{on: "module.method"}` — the universal
 // spelling across every effect.
 //
-// Evaluated as a global script (no module/exports) after the native
-// bindings install. (The pre-rename `on.*` alias existed for one deploy
-// cycle and closed 2026-07-06.)
+// A FACTORY (`docs/architecture/package-isolation.md`, the
+// received-not-ambient model): the engine invokes it once per context
+// with the native after + http slices (`_factories_invoke.js`) and
+// installs the returned surface at the public name.
 
-(function () {
-  const sys = _system.after;
-  const sysHttp = _system.http;
+/**
+ * Connection wake triggers — re-invoke a held handler when something
+ * happens, while it still holds the socket. Register them in the body
+ * before returning `next()` (or while streaming). The runtime arms
+ * every `after.*` wake before firing any connectionless effect of the
+ * same activation, so a wake is never missed even when a callback
+ * writes the key it watches.
+ *
+ * Wakes are one-shot and cannot be cancelled — they're ephemeral
+ * and node-local, so an unwanted wake is simply ignored (or the
+ * handler re-arms a different set). The exception is a fetch:
+ * cancel an in-flight `after.fetch` by its returned id.
+ *
+ * @namespace after
+ * @example
+ * export default ({ stream, after, next }) => {
+ *   // SSE-style: stream rows, then wait for more under a prefix.
+ *   stream.start();
+ *   after.kv(`notif/${user}/`, { on: "onNotify" });
+ *   return next({ user });
+ * };
+ */
+__rove_factories.after = function (caps) {
+  const sys = caps.after;
+  const sysHttp = caps.http;
 
 // Fail-loud on retired option spellings (audit batch 3): silence would
 // mean a silently-ignored option — worse than a break, pre-launch.
@@ -38,27 +61,7 @@ function _rejectRenamed(verb, opts, renames) {
   // The callback-target key is `on` at the native layer too — the bindings
   // read `opts.on` directly, so opts pass through with no respelling.
 
-  /**
-   * Connection wake triggers — re-invoke a held handler when something
-   * happens, while it still holds the socket. Register them in the body
-   * before returning `next()` (or while streaming). The runtime arms
-   * every `after.*` wake before firing any connectionless effect of the
-   * same activation, so a wake is never missed even when a callback
-   * writes the key it watches.
-   *
-   * Wakes are one-shot and cannot be cancelled — they're ephemeral
-   * and node-local, so an unwanted wake is simply ignored (or the
-   * handler re-arms a different set). The exception is a fetch:
-   * cancel an in-flight `after.fetch` by its returned id.
-   *
-   * @namespace after
-   * @example
-   * // SSE-style: stream rows, then wait for more under a prefix.
-   * stream.start();
-   * after.kv(`notif/${user}/`, { on: "onNotify" });
-   * return next({ user });
-   */
-  globalThis.after = {
+  return {
     /**
      * Wake the held connection after `ms` milliseconds. Named for its
      * unit — durations are milliseconds; there is deliberately no
@@ -71,7 +74,9 @@ function _rejectRenamed(verb, opts, renames) {
      *   (`"module.method"` or a bare `"method"`); defaults to `onWake`.
      * @returns {void}
      * @example
-     * after.ms(30_000, { on: "onTimeout" }); // deadline for a join
+     * export default ({ after }) => {
+     *   after.ms(30_000, { on: "onTimeout" }); // deadline for a join
+     * };
      */
     ms(ms, opts) {
       return sys.timer(ms, opts);
@@ -89,8 +94,10 @@ function _rejectRenamed(verb, opts, renames) {
      *   `onWake`.
      * @returns {void}
      * @example
-     * after.kv(`rooms/${roomId}/`);             // default onWake
-     * after.kv(`jobs/${id}/`, { on: "onJob" }); // explicit target
+     * export default ({ after }) => {
+     *   after.kv(`rooms/${roomId}/`);             // default onWake
+     *   after.kv(`jobs/${id}/`, { on: "onJob" }); // explicit target
+     * };
      */
     kv(prefix, opts) {
       return sys.kv(prefix, opts);
@@ -131,9 +138,11 @@ function _rejectRenamed(verb, opts, renames) {
      * @throws {Error} `code:"rate_limited"` when the per-tenant outbound
      *   rate limit is exhausted (shared with `webhook.send`/`email.send`).
      * @example
-     * after.fetch('https://api.example.com/stream',
-     *             { stream: true, on: 'onUpstream' });
-     * return next();
+     * export default ({ after, next }) => {
+     *   after.fetch('https://api.example.com/stream',
+     *               { stream: true, on: 'onUpstream' });
+     *   return next();
+     * };
      */
     fetch(url, opts) {
       opts = opts || {};
@@ -168,11 +177,13 @@ function _rejectRenamed(verb, opts, renames) {
      * @param {string} id - The `ftch_…` id.
      * @returns {void}
      * @example
-     * const id = after.fetch("https://api.example.test/slow", { on: "onSlow" });
-     * after.cancel(id); // changed our mind before it landed
+     * export default ({ after }) => {
+     *   const id = after.fetch("https://api.example.test/slow", { on: "onSlow" });
+     *   after.cancel(id); // changed our mind before it landed
+     * };
      */
     cancel(id) {
       return sysHttp.cancelFetch({ id: id });
     },
   };
-})();
+};

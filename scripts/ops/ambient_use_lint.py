@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Ratchet for the received-not-ambient migration (tracker #753).
 
-Counts places where customer-shaped JS still reaches a **capability** as
+Counts places where customer-shaped JS — the scanned trees plus the shim
+JSDoc's `@example` blocks — still reaches a **capability** as
 an ambient global rather than receiving it from the activation object
 (`docs/architecture/package-isolation.md`). The count is the size of the
 remaining migration, and it may only ever go DOWN — a rising number means
@@ -142,7 +143,12 @@ def _strip_literals(src: str) -> str:
                         elif src[k] == "}":
                             depth -= 1
                         k += 1
-                    buf.append("  " + src[j + 2 : k])  # keep the interpolation
+                    # Keep the interpolation VERBATIM, `${`…`}` included —
+                    # dropping the opener while keeping the closer left an
+                    # unbalanced `}` in the stripped text, which ended every
+                    # enclosing binding-span walk early and mis-counted the
+                    # rest of that function as ambient.
+                    buf.append(src[j:k])
                     j = k
                     continue
                 buf.append("\n" if src[j] == "\n" else " ")
@@ -206,7 +212,11 @@ def _count_file(path: Path) -> dict[str, int]:
         src = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return {}
-    src = _strip_literals(src)
+    return _count_source(_strip_literals(src))
+
+
+def _count_source(src: str) -> dict[str, int]:
+    """Count ambient capability uses in already-literal-stripped source."""
     out: dict[str, int] = {}
     for name in CAPABILITIES:
         bound = _binding_spans(src, name)
@@ -243,7 +253,44 @@ def scan() -> tuple[int, dict[str, dict[str, int]]]:
                 total += n
         if acc:
             per_tree[tree] = acc
+    # The doctests: `@example` blocks in the shim JSDoc are customer-shaped
+    # code too — they are what the reference page teaches — but they live
+    # inside comments, which the file scan rightly skips. Extract and count
+    # each block as its own scope (blocks are independent examples; letting
+    # one block's bindings leak into the next would hide a real use).
+    acc = {}
+    for path in sorted((REPO / "src" / "js" / "globals").glob("*.js")):
+        for block in _doctest_blocks(path.read_text(encoding="utf-8")):
+            for name, n in _count_source(_strip_literals(block)).items():
+                acc[name] = acc.get(name, 0) + n
+                total += n
+    if acc:
+        per_tree["doctests(src/js/globals)"] = acc
     return total, per_tree
+
+
+def _doctest_blocks(src: str) -> list[str]:
+    """`@example` block bodies, JSDoc prefix stripped — the same extraction
+    doc_examples.zig gates on (a tag line, `*/`, or a non-`*` line ends a
+    block)."""
+    blocks: list[str] = []
+    cur: list[str] = []
+    in_example = False
+    for raw in src.split("\n"):
+        line = raw.lstrip()
+        star = line.startswith("*")
+        content = line[1:].lstrip() if star else line
+        is_tag = star and content.startswith("@")
+        if in_example and (is_tag or "*/" in line or not star):
+            blocks.append("\n".join(cur))
+            in_example = False
+        if is_tag and content.startswith("@example"):
+            in_example = True
+            cur = []
+            continue
+        if in_example:
+            cur.append(content)
+    return blocks
 
 
 def main() -> int:

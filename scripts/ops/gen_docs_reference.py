@@ -129,6 +129,9 @@ def split_tags(block):
 
 
 MEMBER_PATTERNS = [
+    # A factory registration is the public name's definition site (the
+    # invoker installs the return value at that name).
+    re.compile(r"__rove_factories\.(\w+)\s*="),
     re.compile(r"globalThis\.(\w+)\s*="),
     re.compile(r"get\s+(\w+)\s*\("),
     re.compile(r"(\w+)\s*:\s*(?:async\s+)?(?:function)?\s*\("),
@@ -168,6 +171,11 @@ def parse_shim(stem: str):
             cur = {"name": ns, "desc": desc, "prefix": ns,
                    "example": examples[0] if examples else None, "members": []}
             sections.append(cur)
+            continue
+        # `@internal` marks a block that is a definition site for lint(b)
+        # but not customer surface — a factory registration whose real doc
+        # lives on the class/return it constructs, or a private core.
+        if "internal" in tagmap:
             continue
         # `@function name` names a bare `function name(…)` declaration
         # the code-line patterns can't see (the callable cron verb).

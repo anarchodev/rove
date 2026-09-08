@@ -13,35 +13,39 @@
 // connectionless activation (a `cron`/`schedule`/`webhook.send`
 // callback) there is no held socket, so these calls are inert.
 //
-// Evaluated as a global script (no module/exports) after the native
-// bindings install. IIFE-wrapped: a bare top-level definition corrupts
-// the arenajs base-snapshot freeze.
+// A FACTORY (`docs/architecture/package-isolation.md`, the
+// received-not-ambient model): the engine invokes it once per context
+// with the native stream slice (`_factories_invoke.js`) and installs the
+// returned surface at the public name. No module-scope bindings escape
+// into the base snapshot.
 
-(function () {
-  const sys = _system.stream;
+/**
+ * Connection output — produce a streamed response over time. Pair
+ * with `after.*` (to wait for more) and `return next()` (to keep the
+ * socket); close by returning a terminal body. The response head is
+ * the ambient `response.*` global, committed to the wire by the first
+ * `stream.start()` / `stream.write()` (or a terminal return).
+ *
+ * This is the OUTBOUND direction only. Taking a large body IN is
+ * `blob.receive`/`blob.write` (an upload session); an append log you
+ * name and query is `segments.*` — neither involves this namespace.
+ *
+ * @namespace stream
+ * @example
+ * export default ({ request, response, stream, after, kv, next }) => {
+ *   // SSE: open, emit rows, then wait for more under a prefix.
+ *   const rows = kv.prefix(`feed/${id}/`, request.ctx?.cursor);
+ *   response.headers = { 'content-type': 'text/event-stream' };
+ *   stream.start();
+ *   for (const r of rows) stream.write(`data: ${r.value}\n\n`);
+ *   after.kv(`feed/${id}/`, { on: 'onNotify' });
+ *   return next({ cursor: rows.at(-1)?.key ?? request.ctx?.cursor });
+ * };
+ */
+__rove_factories.stream = function (caps) {
+  const sys = caps.stream;
 
-  /**
-   * Connection output — produce a streamed response over time. Pair
-   * with `after.*` (to wait for more) and `return next()` (to keep the
-   * socket); close by returning a terminal body. The response head is
-   * the ambient `response.*` global, committed to the wire by the first
-   * `stream.start()` / `stream.write()` (or a terminal return).
-   *
-   * This is the OUTBOUND direction only. Taking a large body IN is
-   * `blob.receive`/`blob.write` (an upload session); an append log you
-   * name and query is `segments.*` — neither involves this namespace.
-   *
-   * @namespace stream
-   * @example
-   * // SSE: open, emit rows, then wait for more under a prefix.
-   * const rows = kv.prefix(`feed/${id}/`, request.ctx?.cursor);
-   * response.headers = { 'content-type': 'text/event-stream' };
-   * stream.start();
-   * for (const r of rows) stream.write(`data: ${r.value}\n\n`);
-   * after.kv(`feed/${id}/`, { on: 'onNotify' });
-   * return next({ cursor: rows.at(-1)?.key ?? request.ctx?.cursor });
-   */
-  globalThis.stream = {
+  return {
     /**
      * Open the streamed response: commit the ambient `response.*` head
      * and begin the stream so the client's `onopen` fires before any
@@ -66,4 +70,4 @@
       return sys.write(chunk);
     },
   };
-})();
+};

@@ -18,16 +18,33 @@
 // GET URL from the activation's taped clock, so replay reproduces
 // it bit-for-bit.
 
-// IIFE-wrapped (like on.js): bare top-level function declarations
-// corrupt the arenajs base-snapshot freeze — green unit tests,
-// segfault on the first live request. Everything below stays in the
-// closure; only `globalThis.blob` escapes.
-(() => {
-
-// Capture the natives at eval time (before `_harden.js` deletes
-// `globalThis._system`) — same closure posture as webhook.js/on.js.
-const sysHttp = _system.http;
-const sysBlob = _system.blob;
+// A FACTORY (`docs/architecture/package-isolation.md`, the
+// received-not-ambient model): the engine invokes it once per context
+// (`_factories_invoke.js`) with the http + blob natives, the public
+// `after` surface (`blob.get` composes on `after.fetch`), and a marker
+// kv namespace-rooted at `_blob/` — the recipe/pending/owed rows below
+// spell keys relative to that root and cannot land outside it. Nothing
+// here has module-scope bindings for a handler to resolve (a bare
+// top-level declaration corrupts the arenajs base-snapshot freeze —
+// green unit tests, segfault on the first live request).
+/**
+ * Content-addressed tenant object storage.
+ *
+ * Two shapes: one-shot (`put`/`get`) for values you hold in hand, and
+ * the upload session (`receive` → `write` → `seal`) for large inbound
+ * bodies that stream in chunk by chunk. "Seal" = freeze the bytes into
+ * an immutable blob and get back its hash (`segments.seal` is the same
+ * metaphor applied to a log tail). `blob.write` appends INTO an upload
+ * session — the opposite direction from `stream.write`, which emits
+ * response bytes OUT over the held connection.
+ *
+ * @namespace blob
+ */
+__rove_factories.blob = function (caps) {
+const sysHttp = caps.http;
+const sysBlob = caps.blob;
+const kv = caps.kv;
+const after = caps.after;
 
 function _rejectRenamedBlob(verb, opts) {
   if (!opts || typeof opts !== "object") return;
@@ -39,7 +56,7 @@ function _rejectRenamedBlob(verb, opts) {
 // `_blob/owed/{hash}` record version (`format-versioning.md` §1f).
 // Read by `__system/blob_onresult`, which ships in the worker binary
 // while this shim ships in the tenant's deployment.
-const BLOB_OWED_V = __rove.formats.blobOwed;
+const BLOB_OWED_V = caps.formats.blobOwed;
 
 const BLOB_ORIGIN = "http://rove-blob.internal/";
 const COMPOSE_ORIGIN = "http://rove-compose.internal/";
@@ -72,10 +89,10 @@ function _recipeSid() {
   return request.sagaId || "local";
 }
 
-function _recipeMetaKey(sid) { return "_blob/recipe/" + sid + "/meta"; }
+function _recipeMetaKey(sid) { return "recipe/" + sid + "/meta"; }
 
 function _recipeRowKey(sid, seq) {
-  return "_blob/recipe/" + sid + "/r/" + String(seq).padStart(4, "0");
+  return "recipe/" + sid + "/r/" + String(seq).padStart(4, "0");
 }
 
 function _recipeMeta(sid) {
@@ -87,24 +104,11 @@ function _recipeMeta(sid) {
 // readiness is announced by the seal's `on` activation, never
 // inferred (the row is deleted by the compose flip).
 function _assertMaterialized(hash, verb) {
-  if (kv.get("_blob/pending/" + hash) != null)
+  if (kv.get("pending/" + hash) != null)
     throw new Error(verb + ": " + hash + " is sealed but not yet materialized — wait for your seal `on` activation");
 }
 
-/**
- * Content-addressed tenant object storage.
- *
- * Two shapes: one-shot (`put`/`get`) for values you hold in hand, and
- * the upload session (`receive` → `write` → `seal`) for large inbound
- * bodies that stream in chunk by chunk. "Seal" = freeze the bytes into
- * an immutable blob and get back its hash (`segments.seal` is the same
- * metaphor applied to a log tail). `blob.write` appends INTO an upload
- * session — the opposite direction from `stream.write`, which emits
- * response bytes OUT over the held connection.
- *
- * @namespace blob
- */
-globalThis.blob = {
+return {
   /**
    * Store bytes content-addressed. Returns the sha256 hash (the
    * object's permanent key) synchronously — index it in kv in the
@@ -138,8 +142,10 @@ globalThis.blob = {
    * @returns {string} The object's sha256 hash (64 hex chars).
    *
    * @example
-   * const hash = blob.put(JSON.stringify(event));
-   * kv.set(`timeline/${room}/${seq}`, JSON.stringify({ hash }));
+   * export default ({ blob, kv }) => {
+   *   const hash = blob.put(JSON.stringify(event));
+   *   kv.set(`timeline/${room}/${seq}`, JSON.stringify({ hash }));
+   * };
    */
   put(bytes, opts) {
     opts = opts || {};
@@ -159,7 +165,7 @@ globalThis.blob = {
       context: context,
       created_at_ns: String(BigInt(Date.now()) * 1_000_000n),
     };
-    kv.set("_blob/owed/" + hash, JSON.stringify(marker));
+    kv.set("owed/" + hash, JSON.stringify(marker));
 
     sysHttp.fetch({
       url: BLOB_ORIGIN + hash,
@@ -194,12 +200,12 @@ globalThis.blob = {
    * @returns {string} The fetch id.
    *
    * @example
-   * export default function () {
+   * export default function ({ request, kv, blob, next }) {
    *   const rec = JSON.parse(kv.get(`media/${id}`) ?? "{}");
    *   if (rec.hash) { blob.get(rec.hash, { on: "onBlob" }); return next(); }
    *   return next();
    * }
-   * export function onBlob() { return request.bytes; } // flattened payload accessors; request.status top-level
+   * export function onBlob({ request }) { return request.bytes; } // flattened payload accessors; request.status top-level
    */
   get(hash, opts) {
     opts = opts || {};
@@ -323,7 +329,7 @@ globalThis.blob = {
    * @returns {number} Total recipe bytes after the append.
    *
    * @example
-   * export function onMirrorChunk() {
+   * export function onMirrorChunk({ request, blob, next }) {
    *   if (!request.done) { blob.write(request.bytes); return next(); }
    *   const hash = blob.seal({ on: "stored", contentType: "image/png" });
    *   return JSON.stringify({ hash });
@@ -400,7 +406,7 @@ globalThis.blob = {
    * @example
    * // doc-only
    * // upload.mjs — respond at seal; readiness arrives at `stored`.
-   * export function onChunk() {
+   * export function onChunk({ request, response, blob, kv, next }) {
    *   blob.write(request.bytes);
    *   if (!request.done) return next();
    *   const hash = blob.seal({ on: "stored", ctx: { id: request.ctx.id } });
@@ -409,7 +415,7 @@ globalThis.blob = {
    *   return JSON.stringify({ hash });
    * }
    * // stored.mjs — the completion activation.
-   * export default function () {
+   * export default function ({ request, kv }) {
    *   const rec = JSON.parse(kv.get(`media/${request.ctx.id}`));
    *   kv.set(`media/${request.ctx.id}`, JSON.stringify({ ...rec, status: "ready" }));
    *   return "";
@@ -445,7 +451,7 @@ globalThis.blob = {
     }));
     // Deleted by the compose flip; blob.url/get check it so an early
     // dereference fails loud instead of racing storage.
-    kv.set("_blob/pending/" + hash, sid);
+    kv.set("pending/" + hash, sid);
 
     // The prompt compose trigger — leader-local, moot-on-loss; the
     // sealed marker above is what guarantees materialization (the
@@ -488,12 +494,12 @@ globalThis.blob = {
    *   when the object is durable (required).
    *
    * @example
-   * export function onHeaders() {
+   * export function onHeaders({ request, response, blob, next }) {
    *   if (!authed(request.headers)) { response.status = 401; return "no"; }
    *   blob.receive({ on: "onStored" });
    *   return next();
    * }
-   * export function onStored() {
+   * export function onStored({ request, response, kv }) {
    *   if (request.status !== 200) { response.status = 502; return "store failed"; }
    *   kv.set(`media/${request.ctx.hash}`, JSON.stringify({ len: request.ctx.len }));
    *   return JSON.stringify({ hash: request.ctx.hash });
@@ -509,4 +515,4 @@ globalThis.blob = {
   },
 };
 
-})();
+};

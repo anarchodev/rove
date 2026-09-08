@@ -7,11 +7,23 @@
 // name (`console.log`) is unchanged; `_system.*` is the internal ABI
 // and customer code must never reference it directly.
 //
-// Evaluated as a global script (no module/exports) into every
-// dispatcher context after the native bindings install.
+// A FACTORY (`docs/architecture/package-isolation.md`, the
+// received-not-ambient model): the engine invokes it once per context
+// with its capability slice as the one argument (`_factories_invoke.js`)
+// and installs the returned surface at the public name. The factory has
+// no module-scope bindings for a handler to resolve; its capabilities
+// exist only inside this closure.
 
-(function () {
-  const sys = _system.console;
+/**
+ * Handler logging. Output is captured into the per-request log
+ * buffer (not stdout) and surfaces in the tenant's request logs and
+ * the replay shell — it is part of the recorded, replay-deterministic
+ * request trace.
+ *
+ * @namespace console
+ */
+__rove_factories.console = function (caps) {
+  const sys = caps.console;
 
   // The ONE argument formatter. Strings pass through; everything else is
   // JSON-stringified so structured values read as structure in the log —
@@ -30,15 +42,7 @@
     }
   };
 
-  /**
-   * Handler logging. Output is captured into the per-request log
-   * buffer (not stdout) and surfaces in the tenant's request logs and
-   * the replay shell — it is part of the recorded, replay-deterministic
-   * request trace.
-   *
-   * @namespace console
-   */
-  globalThis.console = {
+  return {
     /**
      * Write a line to the request log. String arguments pass through;
      * everything else is JSON-stringified (`{a: 1}` logs as `{"a":1}`,
@@ -102,4 +106,4 @@
       return sys.log("[debug]", ...args.map(fmt));
     },
   };
-})();
+};

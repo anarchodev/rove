@@ -3,7 +3,7 @@
 // config — deploy-time configuration, read-only (rove#830: the only door to
 // `_config/`). The surface harness runs with no deployment, so every name
 // reads absent; the door's shape and its null contract are what this pins.
-export default function ({ kv }) {
+export default function ({ kv, config }) {
   check("config.get", () => {
     eq(config.get("oauth/google"), null); // nothing deployed → null, never a throw
     eq(config.get(""), null);             // an empty name is a name nothing has

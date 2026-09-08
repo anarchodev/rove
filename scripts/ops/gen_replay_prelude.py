@@ -70,10 +70,10 @@ PIECES = [
     # bindings. Shared verbatim with the CLI sim (sim_globals.zig embeds
     # the same file), so the two offline runtimes cannot drift.
     (ROVE / "src" / "replay" / "js" / "system_recorders.js", False),
-    # The public shims, in the worker's own eval order (globals.zig
-    # installStatic): each composes on `_system.*` and on the globals the
-    # earlier ones install. `crypto.js` captures `_system.crypto` at eval,
-    # so it must land after the recorders and before the delete below.
+    # The public shims. Every one is factory-shaped — evaluating it only
+    # registers `__rove_factories.<name>` — and the invoker below
+    # constructs and installs the surfaces in explicit dependency order,
+    # so embed order is free.
     (ROVE / "src" / "js" / "globals" / "crypto.js", False),
     (ROVE / "src" / "js" / "globals" / "http.js", False),
     (ROVE / "src" / "js" / "globals" / "base64.js", False),
@@ -83,46 +83,73 @@ PIECES = [
     (ROVE / "src" / "js" / "globals" / "after.js", False),
     (ROVE / "src" / "js" / "globals" / "stream.js", False),
     (ROVE / "src" / "js" / "globals" / "next.js", False),
-    # The durable verbs: `time` (shared coercion) -> `schedule` (installs
-    # the private `_system.sched`) -> `webhook` (a FACTORY: it receives its
-    # capabilities from the invoker below rather than capturing `_system.*`
-    # at eval; the registration has no top-level bindings, so it is
-    # freeze-safe embedded bare).
+    # The durable verbs: `time` (shared coercion, read ambiently by the
+    # sched core), the private `sched` factory (never a customer global),
+    # and the shims that receive it (`platform.dispatch`'s watchdog,
+    # `webhook.send`'s re-arm).
     (ROVE / "src" / "js" / "globals" / "time.js", False),
     (ROVE / "src" / "js" / "globals" / "schedule.js", False),
-    # AFTER schedule.js, mirroring the worker (globals.zig): platform.js
-    # captures the private `_system.sched` at eval for platform.dispatch's
-    # watchdog arm — earlier, it captures undefined and dispatch throws.
     (ROVE / "src" / "js" / "globals" / "platform.js", False),
     (ROVE / "src" / "js" / "globals" / "webhook.js", False),
-    # `blob` composes on the base `after.fetch`, so it lands after it.
+    # `blob` composes on the public `after.fetch` it receives.
     (ROVE / "src" / "js" / "globals" / "blob.js", False),
 ]
 
 # The factory registry precedes the shims, and the invoker follows them —
 # the same pair the worker's installStatic evals (`_factories.js` /
 # `_factories_invoke.js`) and the CLI sim's prelude splices
-# (sim_globals.zig). `kv` is a call-time forwarder: the arena's kv binding
-# is engine-installed per shell, and the forwarder preserves the late
-# binding the ambient reference used to provide.
+# (sim_globals.zig): per-shim caps, dependency-ordered, with an
+# unconsumed-registration check, over THIS prelude's shim subset. The
+# arena's kv binding is engine-installed per shell, and the rooted marker
+# views forward to `globalThis.kv` at call time — the late binding the
+# ambient reference used to provide.
 REGISTRY = "\n;globalThis.__rove_factories = {};\n"
 INVOKER = """
 ;(function () {
   const reg = globalThis.__rove_factories;
-  const caps = {
-    http: _system.http,
-    sched: _system.sched,
-    kv: {
-      get: (k) => globalThis.kv.get(k),
-      set: (k, v) => globalThis.kv.set(k, v),
-      delete: (k) => globalThis.kv.delete(k),
-      prefix: (p, c, l) => globalThis.kv.prefix(p, c, l),
-    },
-    formats: __rove.formats,
+  const pending = new Set(Object.keys(reg));
+  const invoke = (name, caps) => {
+    if (!pending.delete(name))
+      throw new Error("factory not registered: " + name);
+    return reg[name](caps);
   };
-  for (const name of Object.keys(reg)) {
-    globalThis[name] = reg[name](caps);
-  }
+  const rooted = (root) => ({
+    get: (k) => globalThis.kv.get(root + k),
+    set: (k, v) => globalThis.kv.set(root + k, v),
+    delete: (k) => globalThis.kv.delete(root + k),
+    prefix: (p, c, l) =>
+      (globalThis.kv.prefix(root + p, c == null || c === "" ? c : root + c, l) || [])
+        .map((e) => ({ key: e.key.slice(root.length), value: e.value })),
+  });
+  globalThis.crypto = invoke("crypto", { crypto: _system.crypto });
+  globalThis.http = invoke("http", { http: _system.http });
+  globalThis.stream = invoke("stream", { stream: _system.stream });
+  globalThis.next = invoke("next", { next: _system.continuation.next });
+  globalThis.after = invoke("after", { after: _system.after, http: _system.http });
+  globalThis.btoa = invoke("btoa", {});
+  globalThis.atob = invoke("atob", {});
+  globalThis.base64url = invoke("base64url", {});
+  globalThis.hex = invoke("hex", {});
+  globalThis.URLSearchParams = invoke("URLSearchParams", {});
+  globalThis.time = invoke("time", {});
+  const sched = invoke("sched", {
+    kv: rooted("_sched/"), formats: __rove.formats,
+  });
+  globalThis.platform = invoke("platform", {
+    platform: _system.platform, after: _system.after,
+    blobReceive: _system.blob.receive, blobPresign: _system.blob.presign,
+    sched: sched, kv: rooted("_dispatch/"), formats: __rove.formats,
+  });
+  globalThis.webhook = invoke("webhook", {
+    http: _system.http, sched: sched, kv: rooted("_send/"),
+    formats: __rove.formats,
+  });
+  globalThis.blob = invoke("blob", {
+    http: _system.http, blob: _system.blob, kv: rooted("_blob/"),
+    after: globalThis.after, formats: __rove.formats,
+  });
+  if (pending.size > 0)
+    throw new Error("unconsumed factories: " + Array.from(pending).join(", "));
 })();
 """
 
