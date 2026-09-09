@@ -15,7 +15,8 @@
 // failed:true) — the materializer re-fires the compose. The customer
 // is NEVER told ok:false; the completion contract has no failure arm.
 
-export default function () {
+export default function ({ __system, next }) {
+    const rootKv = __system.rootKv;
     const c = request.ctx || {};
     const sid = c.sid;
     const hash = c.hash;
@@ -30,15 +31,15 @@ export default function () {
         return { status: 200 };
     }
 
-    const metaKey = "_blob/recipe/" + sid + "/meta";
-    const raw = kv.get(metaKey);
+    const metaKey = "_user/_blob/recipe/" + sid + "/meta";
+    const raw = rootKv.get(metaKey);
     if (raw == null) return { status: 200 }; // duplicate fire — already flipped
     const meta = JSON.parse(raw);
     for (let i = 0; i < meta.rows; i++) {
-        kv.delete("_blob/recipe/" + sid + "/r/" + String(i).padStart(4, "0"));
+        rootKv.delete("_user/_blob/recipe/" + sid + "/r/" + String(i).padStart(4, "0"));
     }
-    kv.delete(metaKey);
-    kv.delete("_blob/pending/" + hash);
+    rootKv.delete(metaKey);
+    rootKv.delete("_user/_blob/pending/" + hash);
 
     const userCtx = c.ctx !== undefined ? c.ctx : null;
     // Cross-module continuation into the customer's `on` handler — the

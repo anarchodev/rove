@@ -422,29 +422,22 @@ pub fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWak
     // never empty, and even a continuation/stream return still
     // proposes (the cleanup must land).
     //
-    // These keys were NAMED BY JS — the scheduler shim hands up the `_sched/`
-    // rows it wants retired — so they resolve under the user root like any
-    // other key a handler names. Deleting the bare spelling removes nothing,
-    // and the marker that survives re-fires the wake on every sweep.
-    //
-    // The subscription twin above is the opposite case and stays raw: its
-    // `_sub/dirty/` marker is written by the kv write path itself, below the
-    // binding, so it never carried the root. Who NAMED the key decides, not
-    // what the key looks like.
+    // These keys arrive in STORAGE spelling: the producer is the baked
+    // `__system/scheduler_tick`, which per the one-kv rule (#848) holds the
+    // storage-rooted rootKv and spells the user root explicitly — the
+    // `_user/_sched/…` rows it pages are the keys it hands up, verbatim.
+    // Deleting them as given is what retires the fired entry; re-rooting
+    // here would double the root, delete nothing, and re-fire the wake on
+    // every sweep (measured: fire-count 1 → 26 in the unreadable-wake
+    // gate). The subscription twin above is the same spelling for the
+    // opposite reason — its `_sub/dirty/` marker is written below the
+    // binding and never carried a named form.
     for (dw.cleanup_keys) |k| {
-        var kbuf: [reserved.STORAGE_KEY_MAX]u8 = undefined;
-        const sk = std.fmt.bufPrint(&kbuf, "{s}{s}", .{ reserved.USER_KEY_ROOT, k }) catch {
-            std.log.warn(
-                "rove-js durable-wake ({s}/{s}): cleanup key too long to resolve ({d}b)",
-                .{ tenant_id, module_path, k.len },
-            );
-            return;
-        };
-        p.txn.delete(sk) catch |err| {
+        p.txn.delete(k) catch |err| {
             std.log.warn("rove-js durable-wake ({s}/{s}): cleanup txn.delete failed: {s}", .{ tenant_id, dw.id, @errorName(err) });
             return;
         };
-        p.ws.addDelete(sk) catch |err| {
+        p.ws.addDelete(k) catch |err| {
             std.log.warn("rove-js durable-wake ({s}/{s}): cleanup ws.addDelete failed: {s}", .{ tenant_id, dw.id, @errorName(err) });
             return;
         };

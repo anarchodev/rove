@@ -37,7 +37,7 @@ function headersFor(c) {
   };
 }
 
-export default function () {
+export default function ({ after, next }) {
   const c = JSON.parse(request.query || "{}");
   // HEAD: headers only, never a body (RFC 9110 §9.3.2). A plain terminal
   // response (no bound fetch), so committing here is fine.
@@ -72,7 +72,7 @@ export default function () {
 // bytes relay natively — see the `relay` note above). The first chunk
 // commits the response head (with the content-type from request.ctx);
 // the final event closes the held connection.
-export function onChunk() {
+export function onChunk({ next, stream }) {
   const a = request.activation;
   // Honor the upstream read's outcome on the terminal event. A failed
   // (missing blob / S3 error / timeout → status 0 or non-2xx) or

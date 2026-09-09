@@ -37,10 +37,11 @@
 // 1 Hz sweep, which could re-fire a >1 s in-flight first attempt).
 const WATCHDOG_MS = 40_000;
 
-// Durable-scheduler arm, inlined over the ambient `kv`/`crypto`: a baked
-// `__system/*` module runs post-harden and can't reach the private
-// `_system.sched` closure. Writes the exact `_sched/` rows
-// globals/schedule.js + scheduler_tick.mjs use.
+// Durable-scheduler arm, inlined over the received `rootKv` (#848: a
+// baked module holds ONE kv, the storage-rooted rootKv, and spells the
+// user root explicitly — `_user/_sched/…` is the same row the customer
+// shim's rooted view writes as `_sched/…`). `crypto` stays ambient.
+// Writes the exact rows globals/schedule.js + scheduler_tick.mjs use.
 const SCHED_TICK_NS = 1_000_000_000n;
 // `_sched/by_id/{id}` record version (`format-versioning.md` §1f). The
 // record shape is written from every module that arms a wake, so the
@@ -65,20 +66,20 @@ const SCHED_REC_V = __rove.formats.sched;
 const SEND_OWED_V = __rove.formats.sendOwed;
 
 function schedByTimeKey(whenNs, id) {
-    return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
+    return "_user/_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
 }
-function schedArm(whenNs, target, msg, key) {
+function schedArm(rootKv, whenNs, target, msg, key) {
     const rounded = whenNs <= 0n ? 0n
         : ((whenNs + SCHED_TICK_NS - 1n) / SCHED_TICK_NS) * SCHED_TICK_NS;
     const id = key ? crypto.sha256b64url(key) : crypto.randomUUID();
-    const byIdKey = "_sched/by_id/" + id;
-    const prev = kv.get(byIdKey);
+    const byIdKey = "_user/_sched/by_id/" + id;
+    const prev = rootKv.get(byIdKey);
     if (prev !== null) {
         try {
             const old = JSON.parse(prev);
             if (old.v !== SCHED_REC_V) throw new Error("version");
             const oldWhen = BigInt(old.when_ns);
-            if (oldWhen !== rounded) kv.delete(schedByTimeKey(oldWhen, id));
+            if (oldWhen !== rounded) rootKv.delete(schedByTimeKey(oldWhen, id));
         } catch (_e) { /* corrupt or unknown-version prior — overwrite below */ }
     }
     const rec = { v: SCHED_REC_V, when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
@@ -87,12 +88,13 @@ function schedArm(whenNs, target, msg, key) {
     // is the CURRENT fire — the linked-list-through-fires shape.
     if (typeof request !== "undefined" && typeof request.sagaId === "string" && request.sagaId) rec.armed_by = request.sagaId;
     if (key) rec.key = key;
-    kv.set(byIdKey, JSON.stringify(rec));
-    kv.set(schedByTimeKey(rounded, id), "");
+    rootKv.set(byIdKey, JSON.stringify(rec));
+    rootKv.set(schedByTimeKey(rounded, id), "");
     return id;
 }
 
-export default function () {
+export default function ({ __system }) {
+    const rootKv = __system.rootKv;
     const a = request.activation;
     if (a.kind !== "durable_wake") return { status: 200 };
 
@@ -100,8 +102,8 @@ export default function () {
     const id = msg.id;
     if (typeof id !== "string" || id.length === 0) return { status: 200 };
 
-    const markerKey = "_send/owed/" + id;
-    const raw = kv.get(markerKey);
+    const markerKey = "_user/_send/owed/" + id;
+    const raw = rootKv.get(markerKey);
     if (raw == null) return { status: 200 }; // completed/cancelled — stale watchdog
 
     let owed;
@@ -110,7 +112,7 @@ export default function () {
     } catch (_e) {
         // Corrupt marker (customer-writable kv) — unrecoverable by
         // the platform; drop it so the watchdog chain ends.
-        kv.delete(markerKey);
+        rootKv.delete(markerKey);
         return { status: 200 };
     }
     // A version this build does not implement is NOT the same as an
@@ -130,24 +132,24 @@ export default function () {
     // `__system/scheduler_tick`. Non-numeric is corruption, and the
     // unparseable branch above owns that.
     if (owed.v !== undefined && typeof owed.v !== "number") {
-        kv.delete(markerKey);
+        rootKv.delete(markerKey);
         return { status: 200 };
     }
     const owed_v = owed.v ?? UNSTAMPED_V;
     if (owed_v !== SEND_OWED_V) {
         console.warn("webhook_fire: _send/owed/" + id + " is v" + owed_v +
                      ", this build reads v" + SEND_OWED_V + " — deferred, not dropped");
-        schedArm(BigInt(Date.now() + WATCHDOG_MS) * 1_000_000n, "__system/webhook_fire", { id: id }, "_send/" + id);
+        schedArm(rootKv, BigInt(Date.now() + WATCHDOG_MS) * 1_000_000n, "__system/webhook_fire", { id: id }, "_send/" + id);
         return { status: 200 };
     }
     if (typeof owed.url !== "string" || owed.url.length === 0) {
-        kv.delete(markerKey);
+        rootKv.delete(markerKey);
         return { status: 200 };
     }
 
     // (2) watchdog re-arm — covers a crash between this fire and the
     // onresult commit.
-    schedArm(BigInt(Date.now() + WATCHDOG_MS) * 1_000_000n, "__system/webhook_fire", { id: id }, "_send/" + id);
+    schedArm(rootKv, BigInt(Date.now() + WATCHDOG_MS) * 1_000_000n, "__system/webhook_fire", { id: id }, "_send/" + id);
 
     // (3) the attempt. A deferred fire is metered against the tenant's
     // outbound quota exactly like an inline one (`bindings/http.zig`), so
@@ -176,11 +178,11 @@ export default function () {
         if (permanent || attempts + 1 >= max_attempts) {
             // Terminal: drop the marker and cancel the wake, the same
             // shape `webhook_onresult` uses for a give-up.
-            kv.delete(markerKey);
-            schedCancel("_send/" + id);
+            rootKv.delete(markerKey);
+            schedCancel(rootKv, "_send/" + id);
         } else {
             owed.attempts = attempts + 1;
-            kv.set(markerKey, JSON.stringify(owed));
+            rootKv.set(markerKey, JSON.stringify(owed));
         }
     }
     return { status: 200 };
@@ -194,16 +196,16 @@ const DEFAULT_MAX_ATTEMPTS = 5;
 /// Cancel the send's scheduler entry (both `_sched/` rows), so a terminal
 /// refusal ends the watchdog chain instead of re-firing at WATCHDOG_MS
 /// forever. Mirror of `webhook_onresult`'s cancel.
-function schedCancel(key) {
+function schedCancel(rootKv, key) {
     const id = crypto.sha256b64url(key);
-    const byIdKey = "_sched/by_id/" + id;
-    const raw = kv.get(byIdKey);
+    const byIdKey = "_user/_sched/by_id/" + id;
+    const raw = rootKv.get(byIdKey);
     if (raw !== null) {
         try {
-            kv.delete(schedByTimeKey(BigInt(JSON.parse(raw).when_ns), id));
+            rootKv.delete(schedByTimeKey(BigInt(JSON.parse(raw).when_ns), id));
         } catch (_e) { /* corrupt record — the by_id delete below still ends it */ }
     }
-    kv.delete(byIdKey);
+    rootKv.delete(byIdKey);
 }
 
 function fireAttempt(owed, id, attempts) {

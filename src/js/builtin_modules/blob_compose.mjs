@@ -11,15 +11,16 @@
 // sealed meta row is the durable intent the materializer sweeps. So
 // every abnormal exit here just leaves the recipe in place.
 
-export default function () {
+export default function ({ __system, blob }) {
+    const rootKv = __system.rootKv;
     // Fired durable_wake-shaped: the seal Cmd's ctx IS request.ctx
     // (the webhook_fire convention).
     const c = request.ctx || {};
     const sid = c.sid;
     if (!sid) return { status: 400 };
 
-    const metaKey = "_blob/recipe/" + sid + "/meta";
-    const raw = kv.get(metaKey);
+    const metaKey = "_user/_blob/recipe/" + sid + "/meta";
+    const raw = rootKv.get(metaKey);
     if (raw == null) return { status: 200 }; // already composed (dup fire)
     const meta = JSON.parse(raw);
     if (meta.state !== "sealed") return { status: 200 }; // not frozen yet — not ours
@@ -28,7 +29,7 @@ export default function () {
     const parts = [];
     let total = 0;
     for (let i = 0; i < meta.rows; i++) {
-        const rraw = kv.get("_blob/recipe/" + sid + "/r/" + String(i).padStart(4, "0"));
+        const rraw = rootKv.get("_user/_blob/recipe/" + sid + "/r/" + String(i).padStart(4, "0"));
         if (rraw == null) {
             // A sealed recipe can't lose rows — this is corruption.
             // Leave everything; the wedged materializer mark is the

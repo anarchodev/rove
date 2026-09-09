@@ -130,15 +130,15 @@ function cronNext(expr) {
 const SCHED_REC_V = __rove.formats.sched;
 
 function schedByTimeKey(whenNs, id) {
-    return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
+    return "_user/_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
 }
 
-function schedArm(whenNs, target, msg, key) {
+function schedArm(rootKv, whenNs, target, msg, key) {
     const rounded = whenNs <= 0n ? 0n
         : ((whenNs + SCHED_TICK_NS - 1n) / SCHED_TICK_NS) * SCHED_TICK_NS;
     const id = key ? crypto.sha256b64url(key) : crypto.randomUUID();
-    const byIdKey = "_sched/by_id/" + id;
-    const prev = kv.get(byIdKey);
+    const byIdKey = "_user/_sched/by_id/" + id;
+    const prev = rootKv.get(byIdKey);
     if (prev !== null) {
         // Re-arm (same key ⇒ same id, last-write-wins): drop the stale
         // time-index entry if the fire time moved.
@@ -146,7 +146,7 @@ function schedArm(whenNs, target, msg, key) {
             const old = JSON.parse(prev);
             if (old.v !== SCHED_REC_V) throw new Error("version");
             const oldWhen = BigInt(old.when_ns);
-            if (oldWhen !== rounded) kv.delete(schedByTimeKey(oldWhen, id));
+            if (oldWhen !== rounded) rootKv.delete(schedByTimeKey(oldWhen, id));
         } catch (_e) { /* corrupt or unknown-version prior — overwrite below */ }
     }
     const rec = { v: SCHED_REC_V, when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
@@ -155,12 +155,13 @@ function schedArm(whenNs, target, msg, key) {
     // is the CURRENT fire — the linked-list-through-fires shape.
     if (typeof request !== "undefined" && typeof request.sagaId === "string" && request.sagaId) rec.armed_by = request.sagaId;
     if (key) rec.key = key;
-    kv.set(byIdKey, JSON.stringify(rec));
-    kv.set(schedByTimeKey(rounded, id), "");
+    rootKv.set(byIdKey, JSON.stringify(rec));
+    rootKv.set(schedByTimeKey(rounded, id), "");
     return id;
 }
 
-export default function () {
+export default function ({ __system }) {
+    const rootKv = __system.rootKv;
     const a = request.activation;
     if (a.kind !== "durable_wake") return { status: 200 };
 
@@ -175,7 +176,7 @@ export default function () {
     // last-write-wins, so a cron stays exactly one durable entry.
     try {
         const nextNs = cronNext(spec);
-        schedArm(nextNs, "__system/cron_tick", { spec, target, ctx }, a.key);
+        schedArm(rootKv, nextNs, "__system/cron_tick", { spec, target, ctx }, a.key);
     } catch (_e) {
         // A spec that no longer parses (shouldn't happen — `cron()`
         // validated it) just stops recurring rather than crashing.
@@ -186,7 +187,7 @@ export default function () {
     // can't chain via the disposition return (those are inert on a
     // wake origin); routing through the scheduler keeps the target a
     // clean independent activation.
-    schedArm(BigInt(Date.now()) * NS_PER_MS, target, ctx === undefined ? null : ctx, null);
+    schedArm(rootKv, BigInt(Date.now()) * NS_PER_MS, target, ctx === undefined ? null : ctx, null);
 
     return { status: 200 };
 }

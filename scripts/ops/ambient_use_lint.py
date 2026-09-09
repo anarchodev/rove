@@ -87,6 +87,10 @@ TREES = (
     # other customer-shaped code (`package-isolation.md` — being first-party
     # buys no ambient reach).
     "src/js/packages",
+    # The baked `__system/*` modules run in the same contexts and receive
+    # capsSystem — one kv, the storage-rooted rootKv, user root spelled
+    # explicitly (#848).
+    "src/js/builtin_modules",
 )
 
 SKIP_PARTS = ("_static", "node_modules", ".git")

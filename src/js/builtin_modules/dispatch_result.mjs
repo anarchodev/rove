@@ -33,21 +33,22 @@ const DISPATCH_RESULT_V = __rove.formats.dispatchResult;
 // `__system/*` module runs post-harden and cannot reach the private
 // `_system.sched` closure. Mirrors `webhook_onresult.mjs` — keep in step.
 function schedByTimeKey(whenNs, id) {
-    return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
+    return "_user/_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
 }
-function schedCancel(id) {
-    const raw = kv.get("_sched/by_id/" + id);
+function schedCancel(rootKv, id) {
+    const raw = rootKv.get("_user/_sched/by_id/" + id);
     if (raw === null) return false;
     try {
         const rec = JSON.parse(raw);
         if (rec.v !== SCHED_REC_V) throw new Error("version");
-        kv.delete(schedByTimeKey(BigInt(rec.when_ns), id));
+        rootKv.delete(schedByTimeKey(BigInt(rec.when_ns), id));
     } catch (_e) { /* corrupt or unknown-version record — still drop by_id below */ }
-    kv.delete("_sched/by_id/" + id);
+    rootKv.delete("_user/_sched/by_id/" + id);
     return true;
 }
 
-export default function () {
+export default function ({ __system }) {
+    const rootKv = __system.rootKv;
     const msg = request.ctx || {};
     const id = msg.id;
     if (typeof id !== "string" || id.length === 0) return { status: 200 };
@@ -57,7 +58,7 @@ export default function () {
     // Resolve-once also covers the result row below: only the FIRST result
     // writes it, so a late duplicate cannot clobber a value the origin's
     // wake may already have consumed and deleted.
-    const rawMarker = kv.get("_dispatch/owed/" + id);
+    const rawMarker = rootKv.get("_user/_dispatch/owed/" + id);
     if (rawMarker === null) return { status: 200 };
     let noResult = false;
     try { noResult = JSON.parse(rawMarker).no_result === true; } catch (_e) { /* keep the row */ }
@@ -70,7 +71,7 @@ export default function () {
     // truncated them. The origin's wake consumes and deletes the row; a
     // chain that dies parked leaks one bounded row; nothing re-fires it.
     if (typeof msg.status === "number" && !noResult) {
-        kv.set("_dispatch/result/" + id, JSON.stringify({
+        rootKv.set("_user/_dispatch/result/" + id, JSON.stringify({
             v: DISPATCH_RESULT_V,
             status: msg.status,
             overflow: msg.overflow === true,
@@ -78,10 +79,10 @@ export default function () {
         }));
     }
 
-    kv.delete("_dispatch/owed/" + id);
+    rootKv.delete("_user/_dispatch/owed/" + id);
     // Same writeset as the delete: the watchdog exists only to re-fire an
     // unresolved dispatch, so it must not outlive the marker it guards.
-    schedCancel(crypto.sha256b64url("_dispatch/" + id));
+    schedCancel(rootKv, crypto.sha256b64url("_user/_dispatch/" + id));
 
     return { status: 200 };
 }

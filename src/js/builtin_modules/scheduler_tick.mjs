@@ -26,7 +26,7 @@
 // `is_system_module = true`, so the gated `__rove.wake.set` /
 // `__rove.wake.fire` ops (which throw for customer code) are reachable.
 
-const BY_TIME_PREFIX = "_sched/by_time/";
+const BY_TIME_PREFIX = "_user/_sched/by_time/";
 // `_sched/by_id/{id}` record version (`format-versioning.md` §1f). A
 // record this tick cannot read is dropped WITH its index entry — firing
 // a target named by fields we may be misreading is worse than not
@@ -40,7 +40,7 @@ const UNSTAMPED_V = __rove.formats.unstamped;
 
 const SCHED_REC_V = __rove.formats.sched;
 
-const BY_ID_PREFIX = "_sched/by_id/";
+const BY_ID_PREFIX = "_user/_sched/by_id/";
 
 // Thundering-herd bound: at most this many wakes fire per tick when
 // many share a due-time; the remainder carries to the next tick.
@@ -55,13 +55,14 @@ const MAX_FIRES_PER_TICK = 256;
 // prefix scan yields entries in fire-time order.
 const PAD_WIDTH = 20;
 
-export default function () {
+export default function ({ __system }) {
+    const rootKv = __system.rootKv;
     // Date.now() is replay-deterministic (pinned per activation). ms→ns.
     const nowNs = BigInt(Date.now()) * 1_000_000n;
 
     // +1 over the cap so we can tell "more due entries remain" from
     // "scan reached the end."
-    const page = kv.prefix(BY_TIME_PREFIX, "", MAX_FIRES_PER_TICK + 1) || [];
+    const page = rootKv.prefix(BY_TIME_PREFIX, "", MAX_FIRES_PER_TICK + 1) || [];
 
     let fired = 0;
     let nextWatermark = 0n; // 0n ⇒ "no wake pending"
@@ -73,7 +74,7 @@ export default function () {
         const slash = rest.indexOf("/");
         if (slash < 0) {
             // Malformed index key — drop it (its own writeset; not a fire).
-            kv.delete(key);
+            rootKv.delete(key);
             continue;
         }
         const whenNs = BigInt(rest.slice(0, slash));
@@ -92,20 +93,20 @@ export default function () {
         }
 
         const byIdKey = BY_ID_PREFIX + id;
-        const recRaw = kv.get(byIdKey);
+        const recRaw = rootKv.get(byIdKey);
         if (recRaw == null) {
             // Orphaned index entry (by_id cancelled/lost but by_time
             // left behind). Clean the stale index in THIS module's
             // own writeset; nothing to fire.
-            kv.delete(key);
+            rootKv.delete(key);
             continue;
         }
         let rec;
         try {
             rec = JSON.parse(recRaw);
         } catch (_e) {
-            kv.delete(byIdKey);
-            kv.delete(key);
+            rootKv.delete(byIdKey);
+            rootKv.delete(key);
             continue;
         }
         // An ABSENT `v` reads as v1 — the pre-stamp shape — because
@@ -127,8 +128,8 @@ export default function () {
         // it is not one, which is corruption, and the unparseable branch
         // above already owns that answer.
         if (rec.v !== undefined && typeof rec.v !== "number") {
-            kv.delete(byIdKey);
-            kv.delete(key);
+            rootKv.delete(byIdKey);
+            rootKv.delete(key);
             continue;
         }
         const rec_v = rec.v ?? UNSTAMPED_V;
@@ -172,8 +173,8 @@ export default function () {
             armedBy,
         );
         if (!ok) {
-            kv.delete(byIdKey);
-            kv.delete(key);
+            rootKv.delete(byIdKey);
+            rootKv.delete(key);
             continue;
         }
         fired++;

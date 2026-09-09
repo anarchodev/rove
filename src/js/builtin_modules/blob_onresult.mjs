@@ -21,7 +21,8 @@
 // `_blob/owed/{hash}` marker version (`format-versioning.md` §1f).
 const BLOB_OWED_V = __rove.formats.blobOwed;
 
-export default function () {
+export default function ({ __system, next }) {
+    const rootKv = __system.rootKv;
     const a = request.activation;
     if (a.kind !== "fetch_chunk" && a.kind !== "send_callback") {
         return { status: 200 };
@@ -33,8 +34,8 @@ export default function () {
     const on_result = ctx.on_result || null;
     const context = ctx.context !== undefined ? ctx.context : null;
 
-    const key = "_blob/owed/" + hash;
-    const owed_raw = kv.get(key);
+    const key = "_user/_blob/owed/" + hash;
+    const owed_raw = rootKv.get(key);
     if (owed_raw == null) {
         // Duplicate fire (marker already settled) — no-op.
         return { status: 200 };
@@ -56,12 +57,12 @@ export default function () {
     const ok = status >= 200 && status < 300;
 
     if (ok) {
-        kv.delete(key);
+        rootKv.delete(key);
     } else {
         owed.failed = true;
         owed.last_status = status;
         owed.failed_at_ns = String(BigInt(Date.now()) * 1_000_000n);
-        kv.set(key, JSON.stringify(owed));
+        rootKv.set(key, JSON.stringify(owed));
     }
 
     if (on_result) {

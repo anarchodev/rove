@@ -59,20 +59,20 @@ const SCHED_REC_V = __rove.formats.sched;
 const SEND_OWED_V = __rove.formats.sendOwed;
 
 function schedByTimeKey(whenNs, id) {
-    return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
+    return "_user/_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
 }
-function schedArm(whenNs, target, msg, key) {
+function schedArm(rootKv, whenNs, target, msg, key) {
     const rounded = whenNs <= 0n ? 0n
         : ((whenNs + SCHED_TICK_NS - 1n) / SCHED_TICK_NS) * SCHED_TICK_NS;
     const id = key ? crypto.sha256b64url(key) : crypto.randomUUID();
-    const byIdKey = "_sched/by_id/" + id;
-    const prev = kv.get(byIdKey);
+    const byIdKey = "_user/_sched/by_id/" + id;
+    const prev = rootKv.get(byIdKey);
     if (prev !== null) {
         try {
             const old = JSON.parse(prev);
             if (old.v !== SCHED_REC_V) throw new Error("version");
             const oldWhen = BigInt(old.when_ns);
-            if (oldWhen !== rounded) kv.delete(schedByTimeKey(oldWhen, id));
+            if (oldWhen !== rounded) rootKv.delete(schedByTimeKey(oldWhen, id));
         } catch (_e) { /* corrupt or unknown-version prior — overwrite below */ }
     }
     const rec = { v: SCHED_REC_V, when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
@@ -82,23 +82,24 @@ function schedArm(whenNs, target, msg, key) {
     // the hours-later retry keeps its thread.
     if (typeof request !== "undefined" && typeof request.sagaId === "string" && request.sagaId) rec.armed_by = request.sagaId;
     if (key) rec.key = key;
-    kv.set(byIdKey, JSON.stringify(rec));
-    kv.set(schedByTimeKey(rounded, id), "");
+    rootKv.set(byIdKey, JSON.stringify(rec));
+    rootKv.set(schedByTimeKey(rounded, id), "");
     return id;
 }
-function schedCancel(id) {
-    const raw = kv.get("_sched/by_id/" + id);
+function schedCancel(rootKv, id) {
+    const raw = rootKv.get("_user/_sched/by_id/" + id);
     if (raw === null) return false;
     try {
         const rec = JSON.parse(raw);
         if (rec.v !== SCHED_REC_V) throw new Error("version");
-        kv.delete(schedByTimeKey(BigInt(rec.when_ns), id));
+        rootKv.delete(schedByTimeKey(BigInt(rec.when_ns), id));
     } catch (_e) { /* corrupt or unknown-version record — still drop by_id below */ }
-    kv.delete("_sched/by_id/" + id);
+    rootKv.delete("_user/_sched/by_id/" + id);
     return true;
 }
 
-export default function () {
+export default function ({ __system, next }) {
+    const rootKv = __system.rootKv;
     const a = request.activation;
     if (a.kind !== "send_callback" && a.kind !== "fetch_chunk") {
         // Belt-and-braces — every dispatch via http.fetch hits us
@@ -129,7 +130,7 @@ export default function () {
     // >=400 status is warn-logged by the fire path, making the case
     // attributable from the node log either way (a true duplicate
     // fire is rare enough that the line is signal, not noise).
-    const owed_raw = kv.get("_send/owed/" + id);
+    const owed_raw = rootKv.get("_user/_send/owed/" + id);
     if (owed_raw == null) return { status: 404 };
     const owed = JSON.parse(owed_raw);
     // Loud, matching the parse above: this module ROUND-TRIPS the
@@ -190,9 +191,9 @@ export default function () {
         // wake fires `__system/webhook_fire`, which re-fetches.
         owed.attempts += 1;
         delete owed.next_at_ns; // legacy timing field — scheduler owns timing now
-        kv.set("_send/owed/" + id, JSON.stringify(owed));
-        schedArm(computeNextAtNs(owed.attempts), "__system/webhook_fire",
-                 { id: id }, "_send/" + id);
+        rootKv.set("_user/_send/owed/" + id, JSON.stringify(owed));
+        schedArm(rootKv, computeNextAtNs(owed.attempts), "__system/webhook_fire",
+                 { id: id }, "_user/_send/" + id);
         return { status: 200 };
     }
 
@@ -200,8 +201,8 @@ export default function () {
     // crash-recovery watchdog / pending retry). The schedule id is
     // deterministic from the key — same recipe as schedule's opts.key
     // opts.key handling (base64url-no-pad(sha256(key))).
-    kv.delete("_send/owed/" + id);
-    schedCancel(crypto.sha256b64url("_send/" + id));
+    rootKv.delete("_user/_send/owed/" + id);
+    schedCancel(rootKv, crypto.sha256b64url("_user/_send/" + id));
 
     // Mark as a give-up vs success in the result the customer sees.
     if (transport_failed || upstream_5xx) {
