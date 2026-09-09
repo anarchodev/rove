@@ -87,20 +87,20 @@ const SCHED_REC_V = __rove.formats.sched;
 const EXPORT_REC_V = __rove.formats.exportRec;
 
 function schedByTimeKey(whenNs, id) {
-    return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
+    return "_user/_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
 }
-function schedArm(whenNs, target, msg, key) {
+function schedArm(rootKv, whenNs, target, msg, key) {
     const rounded = whenNs <= 0n ? 0n
         : ((whenNs + SCHED_TICK_NS - 1n) / SCHED_TICK_NS) * SCHED_TICK_NS;
     const id = key ? crypto.sha256b64url(key) : crypto.randomUUID();
-    const byIdKey = "_sched/by_id/" + id;
-    const prev = kv.get(byIdKey);
+    const byIdKey = "_user/_sched/by_id/" + id;
+    const prev = rootKv.get(byIdKey);
     if (prev !== null) {
         try {
             const old = JSON.parse(prev);
             if (old.v !== SCHED_REC_V) throw new Error("version");
             const oldWhen = BigInt(old.when_ns);
-            if (oldWhen !== rounded) kv.delete(schedByTimeKey(oldWhen, id));
+            if (oldWhen !== rounded) rootKv.delete(schedByTimeKey(oldWhen, id));
         } catch (_e) { /* corrupt or unknown-version prior — overwrite below */ }
     }
     const rec = { v: SCHED_REC_V, when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
@@ -109,23 +109,24 @@ function schedArm(whenNs, target, msg, key) {
     // is the CURRENT fire — the linked-list-through-fires shape.
     if (typeof request !== "undefined" && typeof request.sagaId === "string" && request.sagaId) rec.armed_by = request.sagaId;
     if (key) rec.key = key;
-    kv.set(byIdKey, JSON.stringify(rec));
-    kv.set(schedByTimeKey(rounded, id), "");
+    rootKv.set(byIdKey, JSON.stringify(rec));
+    rootKv.set(schedByTimeKey(rounded, id), "");
     return id;
 }
-function schedCancel(id) {
-    const raw = kv.get("_sched/by_id/" + id);
+function schedCancel(rootKv, id) {
+    const raw = rootKv.get("_user/_sched/by_id/" + id);
     if (raw === null) return false;
     try {
         const rec = JSON.parse(raw);
         if (rec.v !== SCHED_REC_V) throw new Error("version");
-        kv.delete(schedByTimeKey(BigInt(rec.when_ns), id));
+        rootKv.delete(schedByTimeKey(BigInt(rec.when_ns), id));
     } catch (_e) { /* corrupt or unknown-version record — still drop by_id below */ }
-    kv.delete("_sched/by_id/" + id);
+    rootKv.delete("_user/_sched/by_id/" + id);
     return true;
 }
 
 export default function ({ __system }) {
+    const rootKv = __system.rootKv;
     const a = request.activation;
     if (a.kind !== "durable_wake" && a.kind !== "fetch_chunk") return { status: 200 };
     // A streaming intermediate is not an outcome — only the terminal event
@@ -148,8 +149,8 @@ export default function ({ __system }) {
     // Absent ⇒ nothing was ever started under this id (or it was reaped): a
     // stale watchdog, or an arm by a handler that guessed an id. Either way,
     // no-op — the same defence every baked module makes.
-    const key = "_export/" + id;
-    const raw = kv.get(key);
+    const key = "_user/_export/" + id;
+    const raw = rootKv.get(key);
     if (raw === null) return { status: 200 };
 
     let st;
@@ -158,8 +159,8 @@ export default function ({ __system }) {
     } catch (_e) {
         // Unparseable state cannot be advanced or trusted; end the chain
         // rather than re-firing a watchdog against it forever.
-        kv.delete(key);
-        schedCancel(crypto.sha256b64url(key));
+        rootKv.delete(key);
+        schedCancel(rootKv, crypto.sha256b64url(key));
         return { status: 200 };
     }
     // A version this build does not implement is NOT the unparseable
@@ -170,8 +171,8 @@ export default function ({ __system }) {
     // advance nothing.
     // Absent reads as the pre-stamp shape — see `__system/scheduler_tick`.
     if (st.v !== undefined && typeof st.v !== "number") {
-        kv.delete(key);
-        schedCancel(crypto.sha256b64url(key));
+        rootKv.delete(key);
+        schedCancel(rootKv, crypto.sha256b64url(key));
         return { status: 200 };
     }
     const st_v = st.v ?? UNSTAMPED_V;
@@ -183,7 +184,7 @@ export default function ({ __system }) {
     if (st.state !== "running") {
         // Terminal already. Cancel any watchdog still pointing here so a
         // finished export stops costing wakes.
-        schedCancel(crypto.sha256b64url(key));
+        schedCancel(rootKv, crypto.sha256b64url(key));
         return { status: 200 };
     }
 
@@ -204,8 +205,8 @@ export default function ({ __system }) {
                 st.error = "part upload failed with status " + a.status +
                     " after " + st.attempts + " attempts";
                 st.finished_at = Date.now();
-                kv.set(key, JSON.stringify(st));
-                schedCancel(crypto.sha256b64url(key));
+                rootKv.set(key, JSON.stringify(st));
+                schedCancel(rootKv, crypto.sha256b64url(key));
                 return { status: 200 };
             }
         }
@@ -231,8 +232,8 @@ export default function ({ __system }) {
                 st.bundle = { manifest_hash: part.hash, dep_id: part.dep_id || "" };
                 st.state = "done";
                 st.finished_at = Date.now();
-                kv.set(key, JSON.stringify(st));
-                schedCancel(crypto.sha256b64url(key));
+                rootKv.set(key, JSON.stringify(st));
+                schedCancel(rootKv, crypto.sha256b64url(key));
                 return { status: 200 };
             }
             st.cursor = part.next_cursor || "";
@@ -255,8 +256,8 @@ export default function ({ __system }) {
                     st.state = "done";
                     st.bundle = null;
                     st.finished_at = Date.now();
-                    kv.set(key, JSON.stringify(st));
-                    schedCancel(crypto.sha256b64url(key));
+                    rootKv.set(key, JSON.stringify(st));
+                    schedCancel(rootKv, crypto.sha256b64url(key));
                     return { status: 200 };
                 }
             }
@@ -268,12 +269,12 @@ export default function ({ __system }) {
 
     // ── issue the next part ────────────────────────────────────────────
     st.updated_at = Date.now();
-    kv.set(key, JSON.stringify(st));
+    rootKv.set(key, JSON.stringify(st));
 
     // Re-arm BEFORE issuing: this activation's writeset deletes the fired
     // entry's `_sched/` keys, so a crash between here and the part's
     // terminal event would otherwise strand the job.
-    schedArm(BigInt(Date.now() + WATCHDOG_MS) * 1_000_000n, "__system/export_run", { id: id }, key);
+    schedArm(rootKv, BigInt(Date.now() + WATCHDOG_MS) * 1_000_000n, "__system/export_run", { id: id }, key);
 
     __rove.fetch({
         url: "http://rove-kvexport.internal/",

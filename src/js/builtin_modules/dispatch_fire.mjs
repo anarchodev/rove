@@ -65,31 +65,32 @@ const SCHED_REC_V = __rove.formats.sched;
 const DISPATCH_OWED_V = __rove.formats.dispatchOwed;
 
 function schedByTimeKey(whenNs, id) {
-    return "_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
+    return "_user/_sched/by_time/" + String(whenNs).padStart(20, "0") + "/" + id;
 }
-function schedArm(whenNs, target, msg, key) {
+function schedArm(rootKv, whenNs, target, msg, key) {
     const rounded = whenNs <= 0n ? 0n
         : ((whenNs + SCHED_TICK_NS - 1n) / SCHED_TICK_NS) * SCHED_TICK_NS;
     const id = key ? crypto.sha256b64url(key) : crypto.randomUUID();
-    const byIdKey = "_sched/by_id/" + id;
-    const prev = kv.get(byIdKey);
+    const byIdKey = "_user/_sched/by_id/" + id;
+    const prev = rootKv.get(byIdKey);
     if (prev !== null) {
         try {
             const old = JSON.parse(prev);
             if (old.v !== SCHED_REC_V) throw new Error("version");
             const oldWhen = BigInt(old.when_ns);
-            if (oldWhen !== rounded) kv.delete(schedByTimeKey(oldWhen, id));
+            if (oldWhen !== rounded) rootKv.delete(schedByTimeKey(oldWhen, id));
         } catch (_e) { /* corrupt or unknown-version prior — overwrite below */ }
     }
     const rec = { v: SCHED_REC_V, when_ns: String(rounded), target: target, msg: msg === undefined ? null : msg };
     if (typeof request !== "undefined" && typeof request.sagaId === "string" && request.sagaId) rec.armed_by = request.sagaId;
     if (key) rec.key = key;
-    kv.set(byIdKey, JSON.stringify(rec));
-    kv.set(schedByTimeKey(rounded, id), "");
+    rootKv.set(byIdKey, JSON.stringify(rec));
+    rootKv.set(schedByTimeKey(rounded, id), "");
     return id;
 }
 
-export default function () {
+export default function ({ __system }) {
+    const rootKv = __system.rootKv;
     const a = request.activation;
     if (a.kind !== "durable_wake") return { status: 200 };
 
@@ -97,8 +98,8 @@ export default function () {
     const id = msg.id;
     if (typeof id !== "string" || id.length === 0) return { status: 200 };
 
-    const markerKey = "_dispatch/owed/" + id;
-    const raw = kv.get(markerKey);
+    const markerKey = "_user/_dispatch/owed/" + id;
+    const raw = rootKv.get(markerKey);
     // Resolved already. A stale watchdog firing once after the resolve is
     // expected, not an error.
     if (raw === null) return { status: 200 };
@@ -109,7 +110,7 @@ export default function () {
     } catch (_e) {
         // Unparseable marker: drop the chain rather than re-fire forever.
         // Same defensive posture `__system/export_run` takes on its record.
-        kv.delete(markerKey);
+        rootKv.delete(markerKey);
         return { status: 200 };
     }
     // A version this build does not implement is NOT the same as an
@@ -120,29 +121,29 @@ export default function () {
     // a turn, dispatch nothing. (Mirrors webhook_fire.mjs.)
     // Absent reads as the pre-stamp shape — see `__system/scheduler_tick`.
     if (marker.v !== undefined && typeof marker.v !== "number") {
-        kv.delete(markerKey);
+        rootKv.delete(markerKey);
         return { status: 200 };
     }
     const marker_v = marker.v ?? UNSTAMPED_V;
     if (marker_v !== DISPATCH_OWED_V) {
         console.warn("dispatch_fire: _dispatch/owed/" + id + " is v" + marker_v +
                      ", this build reads v" + DISPATCH_OWED_V + " — deferred, not dropped");
-        schedArm(
+        schedArm(rootKv, 
             BigInt(Date.now() + WATCHDOG_MS) * 1_000_000n,
             "__system/dispatch_fire",
             { id: id },
-            "_dispatch/" + id,
+            "_user/_dispatch/" + id,
         );
         return { status: 200 };
     }
 
     // Re-arm BEFORE dispatching — see the header. Same key ⇒ same entry, so
     // this moves the existing wake rather than adding one.
-    schedArm(
+    schedArm(rootKv, 
         BigInt(Date.now() + WATCHDOG_MS) * 1_000_000n,
         "__system/dispatch_fire",
         { id: id },
-        "_dispatch/" + id,
+        "_user/_dispatch/" + id,
     );
 
     __rove.dispatch(

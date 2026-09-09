@@ -30,7 +30,8 @@ function pad(seq) {
     return PAD.slice(d.length) + d;
 }
 
-export default function () {
+export default function ({ __system }) {
+    const rootKv = __system.rootKv;
     // Unified effect-result surface (handler-shape §7, Endpoint A): a
     // blob.put on_result arrives flattened — `request.status` top-level
     // (the single success signal; 2xx = ok, no `request.ok`),
@@ -51,7 +52,7 @@ export default function () {
         throw new Error("segments_onsealed: malformed seal ctx: " + JSON.stringify(c));
     }
 
-    kv.set("_seg/" + log + "/s/" + pad(first), JSON.stringify({
+    rootKv.set("_user/_seg/" + log + "/s/" + pad(first), JSON.stringify({
         // `_seg/{log}/s/` index-row version
         // (`format-versioning.md` §1f). The permanent pointer to a
         // sealed segment blob: it outlives the hot rows it replaced
@@ -63,7 +64,7 @@ export default function () {
         count: c.count,
     }));
     for (let seq = first; seq <= last; seq++) {
-        kv.delete("_seg/" + log + "/h/" + pad(seq));
+        rootKv.delete("_user/_seg/" + log + "/h/" + pad(seq));
     }
     return { status: 200 };
 }
