@@ -296,9 +296,12 @@ Pair `stream.*` with `next()` to keep producing across activations;
 close with a terminal return:
 
 ```js
-stream.start();
-after.kv(`notif/${user}/`, { on: 'onNotify' });
-return next({ since });
+export default ({ after, next, stream }) => {
+  stream.start();
+  after.kv(`notif/${user}/`, { on: 'onNotify' });
+  return next({ since });
+};
+
 ```
 
 `stream` is **only** a namespace — `stream.start()` / `stream.write()`,
@@ -332,9 +335,12 @@ same spelling every effect takes. Without `on`, an `after.kv`/
 `onFetchResult`/`onFetchChunk`/`onFetchDone` by event shape (§3).
 
 ```js
-const rooms = request.ctx?.rooms ?? [];
-for (const room of rooms) after.kv(`rooms/${room}/`);  // dynamic sets are natural
-return next({ rooms });
+export default ({ after, next }) => {
+  const rooms = request.ctx?.rooms ?? [];
+  for (const room of rooms) after.kv(`rooms/${room}/`);  // dynamic sets are natural
+  return next({ rooms });
+};
+
 ```
 
 The runtime arms `after.*` wakes **before** firing any connectionless
@@ -412,13 +418,13 @@ More work than one activation's budget is not an error to design around; it is
 the signal to **continue in another activation**:
 
 ```js
-export default function () {
-  return writeChunk(0);
+export default function ({ after, kv, next }) {
+  return writeChunk({ after, kv, next }, 0);
 }
-export function onMore() {
-  return writeChunk(request.ctx.from);
+export function onMore({ after, kv, next }) {
+  return writeChunk({ after, kv, next }, request.ctx.from);
 }
-function writeChunk(from) {
+function writeChunk({ after, kv, next }, from) {
   const rows = load(from, 200);           // a bounded slice
   for (const r of rows) kv.set(`row/${r.id}`, JSON.stringify(r));
   if (rows.length < 200) return "done";
@@ -443,9 +449,12 @@ that removes a file. The reads are recorded like kv reads, so replay and
 sim cover them; a sim world seeds them as ordinary `_config/<name>` rows.
 
 ```js
-const raw = config.get("oauth/google");   // _config/oauth/google.json
-if (raw === null) { response.status = 500; return "missing config: oauth/google"; }
-const cfg = JSON.parse(raw);
+export default ({ config }) => {
+  const raw = config.get("oauth/google");   // _config/oauth/google.json
+  if (raw === null) { response.status = 500; return "missing config: oauth/google"; }
+  const cfg = JSON.parse(raw);
+};
+
 ```
 
 ### 2.6 The rule, and why there are no scope flags
@@ -563,7 +572,7 @@ every other read:
 
 ```js
 function rpc(fns) {
-  return function () {
+  return function (a) {
     let fn = null, args = [];
     // `request.query` is the raw query STRING. `URLSearchParams` is installed
     // (see the ambient names above) and knows the encoding rules — `+` for a
@@ -580,15 +589,20 @@ function rpc(fns) {
         if (b && typeof b.fn === "string") { fn = b.fn; args = Array.isArray(b.args) ? b.args : []; }
       } catch (_) {}
     }
-    const f = fn ? fns[fn] : null;
+    const f = fn && Object.hasOwn(fns, fn) ? fns[fn] : null;
     if (!f) { response.status = 404; return "no such fn: " + fn; }
-    return f(...args);
+    // The activation object rides as every fn's LEADING argument, so an
+    // rpc function receives its capabilities first and its wire args
+    // after — the received idiom applied to the recipe. A function that
+    // needs no capabilities still takes the slot.
+    return f(a, ...args);
   };
 }
 
-function whoami() { return "it me"; }
-function add(a, b) { return a + b; }
-export default rpc({ whoami, add });
+function whoami(_a) { return "it me"; }
+function add(_a, a, b) { return a + b; }
+function greet({ kv }, name) { kv.set("last_greeted", name); return "hi " + name; }
+export default rpc({ whoami, add, greet });
 ```
 
 The wire shapes are unchanged — `GET /?fn=whoami` and
@@ -703,14 +717,14 @@ export default function () {
 ### 5.3 Streaming inbound — per-chunk upload to storage
 
 ```js
-export function onChunk() {
+export function onChunk({ after, next }) {
   after.fetch(`${STORAGE_URL}/${request.headers['x-key']}?seq=${request.chunkSeq}`,
            { method: 'PUT', body: request.bytes, on: 'onPut' });
   if (request.done) { response.status = 201; return 'uploaded'; }
   return next();                                 // await the next inbound chunk
 }
 
-export function onPut() {                        // each PUT result resumes here (held)
+export function onPut({ after, next }) {                        // each PUT result resumes here (held)
   if (request.status >= 400) { response.status = 502; return 'storage failed'; }
   return next();
 }
@@ -719,13 +733,13 @@ export function onPut() {                        // each PUT result resumes here
 ### 5.4 Gateway — hold the client, forward upstream, return its status
 
 ```js
-export default function () {
+export default function ({ after, next }) {
   after.fetch('https://upstream.example.com',
            { method: 'POST', body: request.bytes, on: 'onUpstream' });
   return next();                                 // held, uncommitted — status still open
 }
 
-export function onUpstream() {
+export function onUpstream({ after, next }) {
   response.status = request.status;              // forward upstream's status verbatim
   return request.bytes;                          // raw response bytes, forwarded verbatim
 }
@@ -738,12 +752,12 @@ abandoning it is correct.
 ### 5.5 LLM proxy — streamed connection fetch + held client
 
 ```js
-export default function () {
+export default function ({ after, next, stream }) {
   after.fetch(LLM_URL, { method: 'POST', body: request.bytes, on: 'onUpstream' });
   return next();                                 // hold the client; wait for the first chunk
 }
 
-export function onUpstream() {
+export function onUpstream({ after, next, stream }) {
   if (request.done) return "";                   // close the held response
   stream.write(transform(request.bytes));        // emit a chunk (commits the head on first write)
   return next();
@@ -760,7 +774,7 @@ export default function ({ request, response, kv, webhook }) {
   return 'queued';                               // respond immediately; the above outlive this request
 }
 
-export function onCharge() {                      // connectionless {on} callback — no socket; does work, returns nothing
+export function onCharge({ kv }) {                      // connectionless {on} callback — no socket; does work, returns nothing
   if (request.status < 200 || request.status >= 300) return;  // delivery failed (request.activation.error says why; status 0 = never reached)
   const charge = request.json;                    // the response payload, parsed (§7)
   kv.set(`charges/${charge.id}`, JSON.stringify(charge));
@@ -778,7 +792,7 @@ after the cursor key.
 const PAD = (n) => String(n).padStart(20, '0');
 
 // Connect (or reconnect via Last-Event-ID = the last seq delivered).
-export default function () {
+export default function ({ after, kv, next, stream }) {
   response.headers = { 'content-type': 'text/event-stream' };       // ambient head
   const last = request.headers['last-event-id'];
   const cursor = last ? `notif/${user}/${PAD(Number(last))}` : null;
@@ -788,7 +802,7 @@ export default function () {
 }
 
 // Connection-held resume: drain everything past the cursor key.
-export function onNotify() {
+export function onNotify({ after, kv, next, stream }) {
   const rows = kv.prefix(`notif/${user}/`, request.ctx.cursor);
   after.kv(`notif/${user}/`, { on: 'onNotify' });                    // re-arm
   for (const r of rows) {
@@ -800,7 +814,7 @@ export function onNotify() {
 
 // Connectionless cleanup — cron('0 3 * * *', 'gcNotifs'); each value
 // carries its write time, so retention is a scan-and-delete.
-export function gcNotifs() {
+export function gcNotifs({ after, kv, next, stream }) {
   const horizon = Date.now() - 7 * 24 * 3600 * 1000;
   let cursor = null;
   for (;;) {
@@ -823,14 +837,14 @@ retention bounds the reconnect-replay window.)
 ### 5.8 Fan-in / join — wait for all, then combine
 
 ```js
-export default function () {
+export default function ({ after, next }) {
   const a = after.fetch(API_A, { on: 'onResult' });   // returns the fetch id (`ftch_…`)
   const b = after.fetch(API_B, { on: 'onResult' });
   after.ms(30_000, { on: 'onTimeout' });                  // deadline
   return next({ a, b, got: {} });                         // uncommitted: response unknown until both land
 }
 
-export function onResult() {
+export function onResult({ after, next }) {
   // request.fetchId is the SAME `ftch_…` string after.fetch returned.
   const got = { ...request.ctx.got,
                 [request.fetchId]: { status: request.status, body: request.text } };
@@ -839,7 +853,7 @@ export function onResult() {
   return next({ ...request.ctx, got });                   // still waiting on the other
 }
 
-export function onTimeout() { response.status = 504; return 'upstream timeout'; }
+export function onTimeout({ after, next }) { response.status = 504; return 'upstream timeout'; }
 ```
 
 `next({ctx})` makes `ctx` the continuation's accumulator. Each fetch
@@ -865,7 +879,7 @@ run there, so there's no new trust boundary (see `decisions.md` §4.8).
 
 ```js
 // Held WS chain: each page snapshot → call the LLM → send one action.
-export function onMessage() {
+export function onMessage({ after, kv, next }) {
   const frame = browser.message(request);                 // decode the ws_message
   const ctx = request.ctx || {};
   if (!frame) return next(ctx);
@@ -880,7 +894,7 @@ export function onMessage() {
   return next(ctx);                                        // read-only turn — a writing frame can't bind after.fetch
 }
 
-export function onLLM() {                                  // flattened result surface (§7): request.json/.status/.done
+export function onLLM({ after, kv, next }) {                                  // flattened result surface (§7): request.json/.status/.done
   if (!request.done || request.status >= 400) { browser.status("LLM error"); return next(request.ctx); }
   const reply = request.json;
   const action = pickAction(reply);                        // adapt the model's tool call → {op, ref, ...}

@@ -95,17 +95,17 @@ function _param(name) {
     }
     return "";
 }
-export function begin(_a) {
-    return start();
+export function begin({ kv }) {
+    return start({ kv });
 }
-export function status(_a) {
-    const st = get(_param("id"));
+export function status({ blob, kv }) {
+    const st = get({ kv }, _param("id"));
     if (!st) return "none";
     // `links()`, not `blob.url`: parts live in the tenant's unmetered
     // `exports/` pool (rove#429), so signing them against `app-blobs/`
     // would mint URLs that 404.
     if (st.state === "done") {
-        st.links = links(_param("id"));
+        st.links = links({ blob, kv }, _param("id"));
     }
     return JSON.stringify(st);
 }

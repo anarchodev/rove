@@ -7,7 +7,7 @@
 // The current request is available on the `request` global
 // (request.method, request.path, request.text, request.query).
 // Return a string (or an object — we'll JSON.stringify it).
-export default function () {
+export default function ({ kv }) {
   const count = parseInt(kv.get("starter_hits") ?? "0", 10) + 1;
   kv.set("starter_hits", String(count));
   return {

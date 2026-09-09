@@ -17,7 +17,7 @@ const std = @import("std");
 const root = @import("root.zig");
 
 const HANDLER =
-    \\export default function () {
+    \\export default function ({ kv }) {
     \\  const u = kv.get('user');
     \\  kv.set('seen', u);
     \\  console.log('hello ' + u);
@@ -212,7 +212,7 @@ fn runPoison(a: std.mem.Allocator) !void {
 /// the capture allowed (no refusal entry) — must succeed, because the tape
 /// is faithful to the rules that were live when it was cut.
 const REFUSAL_HANDLER =
-    \\export default function () {
+    \\export default function ({ kv }) {
     \\  const cap = (fn) => { try { fn(); return "ok"; } catch (e) { return (e.code || "?") + "|" + e.message; } };
     \\  const taped = cap(() => kv.set("orders/fine", "v"));
     \\  const evolved = cap(() => kv.set("_secret/allowed-at-capture", "v"));
@@ -254,7 +254,7 @@ fn runRefusals(a: std.mem.Allocator) !void {
 /// the live handler read real data, and exactly the shape (#214) that makes a
 /// replay lie. Both spellings are probed: a `get` and a `prefix` page.
 const ELIDED_HANDLER =
-    \\export default function () {
+    \\export default function ({ kv }) {
     \\  const v = kv.get("big/blob");
     \\  const page = kv.prefix("feed/", null, 100);
     \\  return { got: v === null ? "absent" : "value", rows: page.length };
@@ -290,7 +290,7 @@ fn runElided(a: std.mem.Allocator) !void {
 }
 
 const SEALED_HANDLER =
-    \\export default function () {
+    \\export default function ({ kv }) {
     \\  const v = kv.get("card");
     \\  return { got: v === null ? "absent" : v };
     \\}
@@ -598,7 +598,9 @@ fn runLeafPkgs(a: std.mem.Allocator) !void {
 /// still work. Real embedded lifted source.
 fn runCronPkg(a: std.mem.Allocator) !void {
     const CRON_HASH = "3" ** 64;
+    const SCHED_HASH = "4" ** 64;
     const CRON_SRC = @embedFile("pkg_cron");
+    const SCHED_SRC = @embedFile("pkg_schedule");
     const CRON_HANDLER =
         \\import cron from '@rewind/cron';
         \\export default function () {
@@ -623,8 +625,11 @@ fn runCronPkg(a: std.mem.Allocator) !void {
     try w.writeAll("}],");
     try w.print("\"app_imports\":{{\"@rewind/cron\":\"{s}\"}},", .{CRON_HASH});
     try w.writeAll("\"packages\":[");
-    try w.print("{{\"spec\":\"@rewind/cron\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{CRON_HASH});
+    try w.print("{{\"spec\":\"@rewind/cron\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"imports\":{{\"@rewind/schedule\":\"{s}\"}},\"files\":{{\"index.mjs\":", .{ CRON_HASH, SCHED_HASH });
     try std.json.Stringify.value(CRON_SRC, .{}, w);
+    try w.writeAll("}},");
+    try w.print("{{\"spec\":\"@rewind/schedule\",\"version\":\"1.0.0\",\"pkg_hash\":\"{s}\",\"files\":{{\"index.mjs\":", .{SCHED_HASH});
+    try std.json.Stringify.value(SCHED_SRC, .{}, w);
     try w.writeAll("}}]}");
     world = aw.toArrayList();
 
@@ -656,9 +661,9 @@ fn runOauthJwt(a: std.mem.Allocator) !void {
     const OAUTH_SRC = @embedFile("pkg_oauth");
     const OAUTH_HANDLER =
         \\import oauth from '@rewind/oauth';
-        \\export default function () {
+        \\export default function ({ kv }) {
         \\  kv.set('cache/oauth/test/jwks', JSON.stringify({ keys: [{ kty: 'RSA', kid: 'k1' }] }));
-        \\  const r = oauth.verifyIdToken('not-a-jwt', {
+        \\  const r = oauth.verifyIdToken({ kv }, 'not-a-jwt', {
         \\    issuer: 'https://issuer.test', client_id: 'client-x',
         \\    jwks_uri: 'https://jwks.test', cache_path: 'cache/oauth/test',
         \\  });

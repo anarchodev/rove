@@ -103,7 +103,9 @@ PIECES = [
 # textcodec/request — the arena's kv is engine-installed per shell and the
 # shell's epilogue owns request) skips entries with no registration.
 REGISTRY = "\n;globalThis.__rove_factories = {};\n"
-INVOKER = "\n;" + (ROVE / "src" / "js" / "globals" / "_invoke.js").read_text() + "\n"
+# The invoker is a function expression — call it with the recorder
+# `_system` the prelude assembled, mirroring the sim splice.
+INVOKER = "\n;(" + (ROVE / "src" / "js" / "globals" / "_invoke.js").read_text() + ")(globalThis._system);\n"
 
 # Evaled last: `_system` is the shims' private construction material, not
 # customer surface. Every shim above captured what it needs in a closure —

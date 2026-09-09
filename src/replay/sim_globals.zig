@@ -77,11 +77,14 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     // on the public `after.fetch` it receives. Its recipe rows / owed
     // markers ride the `_blob/`-rooted marker kv.
     "\n;" ++ @embedFile("g_blob") ++
-    // Invoke the registered factories — after every shim, before the
-    // `_system` delete. THE invoker is `globals/_invoke.js`, shared
-    // verbatim with the worker and the browser arena generator; it is
-    // subset-tolerant, so this prelude's smaller shim set (no
-    // kv/config/console/textcodec — the sim's kv is per-run,
-    // epilogue-installed) skips the entries with no registration.
-    "\n;" ++ @embedFile("g__invoke") ++
+    // Invoke the registered factories. THE invoker is
+    // `globals/_invoke.js` — a function expression shared verbatim with
+    // the worker and the browser arena generator — CALLED with the
+    // recorder `_system` this prelude assembled on the global, which is
+    // then deleted before the base freezes; the worker's `_system` is
+    // never a global at all (#861). Subset-tolerant: this prelude's
+    // smaller shim set (no kv/config/console/textcodec — the sim's kv is
+    // per-run; its epilogue assigns `__rove.caps.kv` itself) skips the
+    // entries with no registration.
+    "\n;(" ++ @embedFile("g__invoke") ++ ")(globalThis._system);" ++
     "\n;delete globalThis._system;\n";

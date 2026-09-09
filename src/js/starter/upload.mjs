@@ -16,7 +16,7 @@ const WS = "_workspace/";
 
 // Ownership (mirrors web/admin/index.mjs — duplicated rather than imported so
 // this stays a standalone onHeaders module, incl. in the baked genesis bundle).
-function ownsTenant(sub, tenant) {
+function ownsTenant(kv, sub, tenant) {
   const hash = crypto.sha256(sub);
   const pre = "account/" + hash + "/instances/";
   return kv.prefix(pre, "", 1000).some((e) => e.key.slice(pre.length) === tenant);
@@ -25,7 +25,7 @@ function ownsTenant(sub, tenant) {
 // Returns the authorized actor ({ is_root } / { sub }) for `tenant`, or null
 // after stamping the error response. Root token → operator; else an OIDC
 // session that owns `tenant`.
-function authFor(tenant) {
+function authFor(kv, tenant) {
   // Engine-computed operator-root verdict; the bearer itself is stripped from
   // `request.headers` on this handler so it can't reach the tape
   // (docs/architecture/privileged-surface.md).
@@ -48,19 +48,19 @@ function authFor(tenant) {
     }
   }
   if (sess && sess.sub) {
-    if (sess.is_root || ownsTenant(sess.sub, tenant)) return sess;
+    if (sess.is_root || ownsTenant(kv, sess.sub, tenant)) return sess;
     response.status = 403; return null;
   }
   response.status = 401; return null;
 }
 
-export function onHeaders() {
+export function onHeaders({ kv, next, platform }) {
   const q = new URLSearchParams(request.query || "");
   const tenant = q.get("tenant");
   const path = q.get("path");
   const ct = q.get("content_type") || "";
   if (!tenant || !path) { response.status = 400; return "tenant + path required\n"; }
-  if (!authFor(tenant)) return ""; // status already stamped (401/403)
+  if (!authFor(kv, tenant)) return ""; // status already stamped (401/403)
   // Stream the body → target's file-blobs; onStored records the entry.
   platform.scope(tenant).blob.receive({
     on: "onStored",
@@ -69,7 +69,7 @@ export function onHeaders() {
   return next();
 }
 
-export function onStored() {
+export function onStored({ platform }) {
   const ctx = request.ctx || {};
   const app = ctx.app || {};
   // blob.receive completion: 2xx = stored, status 0 = failed (status is

@@ -201,7 +201,7 @@ function __rpc(fns) {
         if (b && typeof b.fn === "string") { fn = b.fn; args = Array.isArray(b.args) ? b.args : []; }
       } catch (_) {}
     }
-    const f = fn ? fns[fn] : null;
+    const f = fn && Object.hasOwn(fns, fn) ? fns[fn] : null;
     if (!f) { response.status = 404; return "no such fn: " + fn; }
     return f(a, ...args);
   };

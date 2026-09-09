@@ -74,7 +74,7 @@ expect(sunk.disposition).toBe("held"); // sink re-armed + re-held
 // immediate defined 500 naming the mistake (never a silent 25 s 504) — the
 // hop's writes roll back with it. ──
 const orphans = scenario({
-  sources: { "index.mjs": "export default function () { kv.set(\"orphan/wrote\", \"1\"); return next({ n: 1 }); }" },
+  sources: { "index.mjs": "export default function ({ kv, next }) { kv.set(\"orphan/wrote\", \"1\"); return next({ n: 1 }); }" },
 });
 const orphan = orphans.inbound({ path: "/" });
 expect(orphan.disposition).toBe("terminal");

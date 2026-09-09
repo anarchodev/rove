@@ -169,7 +169,7 @@ function _links(kvh, blobh, id, opts) {
  *   const urls = links(id);
  * }
  */
-export function start(opts) {
+export function start({ kv }, opts) {
   return _start(kv, opts);
 }
 
@@ -183,7 +183,7 @@ export function start(opts) {
  *   `parts` is `[{hash, bytes, entries, kind?}]` in store order — the
  *   manifest. {@link links} turns those hashes into download URLs.
  */
-export function get(id) {
+export function get({ kv }, id) {
   return _get(kv, id);
 }
 
@@ -199,7 +199,7 @@ export function get(id) {
  * @returns {string[]} Empty when the export does not exist or has produced
  *   no parts yet, so a caller can render progress without special-casing.
  */
-export function links(id, opts) {
+export function links({ blob, kv }, id, opts) {
   return _links(kv, blob, id, opts);
 }
 

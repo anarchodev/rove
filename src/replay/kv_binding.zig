@@ -718,7 +718,28 @@ fn jsParkOutput(
 /// Called from the reactor base-setup hook, after
 /// `arena_install_replay_bindings` (which still owns the module loader and
 /// the crypto surface).
+
+/// The target for engine-installed capabilities post-#861: the
+/// persistent template `__rove.caps` — never `globalThis`. A capability
+/// name as a free variable is a ReferenceError in every engine; the
+/// activation builders hand the template's members to each activation.
+fn capsTarget(ctx: ?*c.JSContext, g: c.JSValue) c.JSValue {
+    var rove = c.JS_GetPropertyStr(ctx, g, "__rove");
+    if (c.JS_IsUndefined(rove)) {
+        rove = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, g, "__rove", c.JS_DupValue(ctx, rove));
+    }
+    defer c.JS_FreeValue(ctx, rove);
+    var caps = c.JS_GetPropertyStr(ctx, rove, "caps");
+    if (c.JS_IsUndefined(caps)) {
+        caps = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, rove, "caps", c.JS_DupValue(ctx, caps));
+    }
+    return caps;
+}
+
 pub fn installKv(ctx: ?*c.JSContext) c_int {
+    // capability installs land on `__rove.caps` (#861), see capsTarget.
     const g = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, g);
     const obj = c.JS_NewObject(ctx);
@@ -726,7 +747,9 @@ pub fn installKv(ctx: ?*c.JSContext) c_int {
     _ = c.JS_SetPropertyStr(ctx, obj, "set", c.JS_NewCFunction2(ctx, B.jsKvSet, "set", 2, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, obj, "delete", c.JS_NewCFunction2(ctx, B.jsKvDelete, "delete", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, obj, "prefix", c.JS_NewCFunction2(ctx, B.jsKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
-    if (c.JS_SetPropertyStr(ctx, g, "kv", obj) < 0) return -1;
+    const caps_t = capsTarget(ctx, g);
+    defer c.JS_FreeValue(ctx, caps_t);
+    if (c.JS_SetPropertyStr(ctx, caps_t, "kv", obj) < 0) return -1;
     // The config door (rove#830) — native here like `kv`, so the generated
     // prelude excludes config.js the same way it excludes kv.js. Offline
     // configScope 0 resolves a name to its visible spelling, which is how an
@@ -734,7 +757,7 @@ pub fn installKv(ctx: ?*c.JSContext) c_int {
     // deployment-scoped stored key.
     const cfg = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, cfg, "get", c.JS_NewCFunction2(ctx, B.jsConfigGet, "get", 1, c.JS_CFUNC_generic, 0));
-    if (c.JS_SetPropertyStr(ctx, g, "config", cfg) < 0) return -1;
+    if (c.JS_SetPropertyStr(ctx, caps_t, "config", cfg) < 0) return -1;
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_poison", c.JS_NewCFunction2(ctx, jsPoison, "__rove_poison", 1, c.JS_CFUNC_generic, 0));
     // The common tag binding — the epilogue assigns it onto the
     // per-request `request` object (`tag = __rove_request_tag`).
