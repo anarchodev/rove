@@ -45,7 +45,7 @@ function jerr(status, msg) {
 
 // Clear the workspace so a `deploy <bundle>` means EXACTLY that bundle (no
 // carry-forward of files a prior deploy left behind).
-function wsReset(b) {
+function wsReset(platform, b) {
   if (!b.tenant) return jerr(400, "tenant required");
   const sk = platform.scope(b.tenant).kv;
   const rows = sk.prefix(WS, "", 1000);
@@ -62,7 +62,7 @@ function wsReset(b) {
 // is merely incomplete, not wrong (rove#344). STATICS do not come through
 // here — they stream straight to S3 via PUT /v1/upload (scope(t).blob.receive),
 // which records their workspace entry directly.
-function wsFile(b) {
+function wsFile(next, platform, b) {
   if (!b.tenant || !b.path) return jerr(400, "tenant + path required");
   if (b.kind !== "handler")
     return jerr(400, "kind must be 'handler' (statics stream via PUT /v1/upload)");
@@ -76,7 +76,7 @@ function wsFile(b) {
 // Stage one PACKAGE file: compiled under /pkg/<pkg_hash>/<path> (its
 // module identity), recorded under _workspace_pkg/{pkg_hash}/{path} so
 // `cut` can assemble the manifest's packages[].files.
-function wsPkgFile(b) {
+function wsPkgFile(next, platform, b) {
   if (!b.tenant || !b.pkg_hash || !b.path)
     return jerr(400, "tenant + pkg_hash + path required");
   // TRY to compile now (no resolution — the file alone): a self-contained
@@ -92,7 +92,7 @@ function wsPkgFile(b) {
   return next();
 }
 
-export function onPkgTryCompiled() {
+export function onPkgTryCompiled({ platform }) {
   const ctx = request.ctx;
   const app = (ctx && ctx.app) || {};
   if (ctx && ctx.ok) {
@@ -127,7 +127,7 @@ export function onPkgTryCompiled() {
   });
 }
 
-export function onFileStaged() {
+export function onFileStaged({ platform }) {
   const ctx = request.ctx;
   if (!ctx || !ctx.ok) {
     response.status = 500;
@@ -152,7 +152,7 @@ export function onFileStaged() {
 // sibling: only now is the whole bundle present, and compilation resolves
 // every import eagerly (rove#344). It is also where a bad import fails — the
 // compile error names the file.
-function wsCut(b) {
+function wsCut(next, platform, b) {
   if (!b.tenant) return jerr(400, "tenant required");
   const sk = platform.scope(b.tenant).kv;
   const rows = sk.prefix(WS, "", 1000);
@@ -163,8 +163,8 @@ function wsCut(b) {
   // batch compiled before it. Then the handlers (phase 2).
   const q = pkgCompileQueue(sk, b);
   if (q && q.error) return jerr(400, q.error);
-  if (q && q.length > 0) return compileNextPkg(b, q, 0, {});
-  return cutCompileHandlers(b, {});
+  if (q && q.length > 0) return compileNextPkg(next, platform, b, q, 0, {});
+  return cutCompileHandlers(next, platform, b, {});
 }
 
 // Phase 2 of cut: batch-compile the workspace's handlers against the
@@ -173,7 +173,7 @@ function wsCut(b) {
 // written to kv mid-chain: a resume hop that writes and then fires a
 // platform call gets the call dropped (bind-from-writing-resume is not
 // wired), which would silently stall the held cut.
-function cutCompileHandlers(b, done) {
+function cutCompileHandlers(next, platform, b, done) {
   const sk = platform.scope(b.tenant).kv;
   const rows = sk.prefix(WS, "", 1000);
   const handlers = [];
@@ -182,7 +182,7 @@ function cutCompileHandlers(b, done) {
     if (e.kind === "handler")
       handlers.push({ path: rows[i].key.slice(WS.length), source_hash: e.source_hex });
   }
-  if (handlers.length === 0) return cutStamp(b, {}, done);  // statics-only bundle
+  if (handlers.length === 0) return cutStamp(next, platform, b, {}, done);  // statics-only bundle
   // Compile against the SERVER-authoritative resolution (the join below), not
   // the client's lockfile: the engine needs each package file's staged
   // bytecode hash to load it, and validating against anything other than what
@@ -254,7 +254,7 @@ function pkgCompileQueue(sk, b) {
 // file's bytecode eagerly, so an incomplete package lists empty files.
 // Dependency order makes the complete set exactly what this package may
 // import from.
-function compileNextPkg(b, q, idx, done) {
+function compileNextPkg(next, platform, b, q, idx, done) {
   const sk = platform.scope(b.tenant).kv;
   const pkg_hash = q[idx];
   const staged = sk.prefix(WSPKG + pkg_hash + "/", "", 1000);
@@ -277,7 +277,7 @@ function compileNextPkg(b, q, idx, done) {
   return next();
 }
 
-export function onPkgBatchCompiled() {
+export function onPkgBatchCompiled({ next, platform }) {
   const ctx = request.ctx;
   if (!ctx || !ctx.ok) {
     response.status = (ctx && ctx.status) || 500;
@@ -300,8 +300,8 @@ export function onPkgBatchCompiled() {
     resolution: app.resolution === null ? undefined : app.resolution,
   };
   const nextIdx = app.idx + 1;
-  if (nextIdx < app.queue.length) return compileNextPkg(b, app.queue, nextIdx, done);
-  return cutCompileHandlers(b, done);
+  if (nextIdx < app.queue.length) return compileNextPkg(next, platform, b, app.queue, nextIdx, done);
+  return cutCompileHandlers(next, platform, b, done);
 }
 
 // This deploy's resolution with files listed ONLY for bytecode-complete
@@ -345,7 +345,7 @@ function compiledResolution(sk, b, done) {
 
 // The bundle compiled: fold each handler's bytecode hash into its workspace
 // row, then stamp.
-export function onBundleCompiled() {
+export function onBundleCompiled({ next, platform }) {
   const ctx = request.ctx;
   if (!ctx || !ctx.ok) {
     // A compile failure here is the author's — a syntax error or an import
@@ -357,7 +357,7 @@ export function onBundleCompiled() {
   const app = ctx.app || {};
   const bc = {};
   for (let i = 0; i < ctx.results.length; i++) bc[ctx.results[i].path] = ctx.results[i].bytecode_hex;
-  return cutStamp(
+  return cutStamp(next, platform, 
     { tenant: app.target, resolution: app.resolution === null ? undefined : app.resolution },
     bc,
     app.done || {},
@@ -367,7 +367,7 @@ export function onBundleCompiled() {
 // Assemble the manifest from the workspace + the just-compiled bytecode
 // hashes (`bc`, path → bytecode_hex; `done`, the chain's package results)
 // and stamp it.
-function cutStamp(b, bc, done) {
+function cutStamp(next, platform, b, bc, done) {
   const sk = platform.scope(b.tenant).kv;
   const rows = sk.prefix(WS, "", 1000);
   const entries = rows.map(function (row) {
@@ -452,7 +452,7 @@ export function onCut() {
 //
 // Shape mirrors `v2-kv`'s so callers read the same: 200 + the raw value, or
 // 404 `no such key`.
-function kvStoreFor(id) {
+function kvStoreFor(platform, id) {
   try {
     return platform.scope(id).kv;
   } catch (e) {
@@ -471,10 +471,10 @@ function isKvRoute(p) {
   return slash > 0 && rest.slice(slash) === "/kv";
 }
 
-function instanceKvRoute(p, method, body) {
+function instanceKvRoute(platform, p, method, body) {
   const rest = p.slice("/v1/instances/".length);
   const id = rest.slice(0, rest.indexOf("/"));
-  const store = kvStoreFor(id);
+  const store = kvStoreFor(platform, id);
   if (store === null) return jerr(404, "unknown instance");
 
   if (method === "GET") {
@@ -510,7 +510,7 @@ function instanceKvRoute(p, method, body) {
   return jerr(405, "GET to read, PUT to write");
 }
 
-export default function () {
+export default function ({ after, next, platform }) {
   // The kv route serves GET, so it is decided BEFORE the POST-only gate below.
   // Everything else keeps the original order — an unauthenticated GET of any
   // other path still answers 405, which is what the readiness probe asserts.
@@ -527,7 +527,7 @@ export default function () {
       try { kb = request.json; }
       catch (e) { return jerr(400, "expected JSON body"); }
     }
-    return instanceKvRoute(request.path, request.method, kb);
+    return instanceKvRoute(platform, request.path, request.method, kb);
   }
   if (request.method !== "POST") {
     response.status = 405;
@@ -544,10 +544,10 @@ export default function () {
   try { b = request.json; }
   catch (e) { return jerr(400, "expected JSON body"); }
   const p = request.path;
-  if (p === "/v1/deploy/reset") return wsReset(b);
-  if (p === "/v1/deploy/file") return wsFile(b);
-  if (p === "/v1/deploy/pkgfile") return wsPkgFile(b);
-  if (p === "/v1/deploy/cut") return wsCut(b);
+  if (p === "/v1/deploy/reset") return wsReset(platform, b);
+  if (p === "/v1/deploy/file") return wsFile(next, platform, b);
+  if (p === "/v1/deploy/pkgfile") return wsPkgFile(next, platform, b);
+  if (p === "/v1/deploy/cut") return wsCut(next, platform, b);
   // Control-plane relay (rove#414). The operator CLI drives provision / move /
   // delete / host / plan through this chokepoint rather than by holding the
   // move-secret on a shell, and doing so makes the action an ordinary

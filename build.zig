@@ -1796,6 +1796,7 @@ pub fn build(b: *std.Build) void {
     driver_smoke_mod.addAnonymousImport("pkg_jwt", .{ .root_source_file = b.path("src/js/packages/@rewind/jwt/index.mjs") });
     driver_smoke_mod.addAnonymousImport("pkg_oauth", .{ .root_source_file = b.path("src/js/packages/@rewind/oauth/index.mjs") });
     driver_smoke_mod.addAnonymousImport("pkg_cron", .{ .root_source_file = b.path("src/js/packages/@rewind/cron/index.mjs") });
+    driver_smoke_mod.addAnonymousImport("pkg_schedule", .{ .root_source_file = b.path("src/js/packages/@rewind/schedule/index.mjs") });
     driver_smoke_mod.addAnonymousImport("pkg_sessions", .{ .root_source_file = b.path("src/js/packages/@rewind/sessions/index.mjs") });
     driver_smoke_mod.addAnonymousImport("pkg_retry", .{ .root_source_file = b.path("src/js/packages/@rewind/retry/index.mjs") });
     driver_smoke_mod.addAnonymousImport("pkg_activitypub", .{ .root_source_file = b.path("src/js/packages/@rewind/activitypub/index.mjs") });

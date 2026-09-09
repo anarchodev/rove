@@ -995,12 +995,24 @@ pub fn installStatic(ctx: *c.JSContext) void {
     const global = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, global);
 
-    // Build the fresh-namespace tree (kv, console, crypto, webhook,
-    // platform/...). For nested paths the parent must already exist
-    // as a JSObject, so STATIC_NAMESPACES is ordered parent-before-
-    // child — the empty `platform` entry creates the holder before
-    // platform.root and platform.instances populate it.
-    for (STATIC_NAMESPACES) |ns| installNamespace(ctx, global, ns);
+    // Build the fresh-namespace tree. For nested paths the parent must
+    // already exist as a JSObject, so STATIC_NAMESPACES is ordered
+    // parent-before-child — an empty entry creates the holder before its
+    // children populate it.
+    //
+    // `_system` — the internal native ABI — is built DETACHED: it is
+    // never a property of globalThis, so handler code cannot name it in
+    // any phase and there is nothing to harden away (#861 — not
+    // installing is the denial). The invoker below receives it as an
+    // argument; the natives stay alive through the factory closures.
+    const sys_root = c.JS_NewObject(ctx);
+    defer c.JS_FreeValue(ctx, sys_root);
+    for (STATIC_NAMESPACES) |ns| {
+        if (std.mem.eql(u8, ns.path[0], "_system")) {
+            if (ns.path.len == 1) continue; // the detached root IS the holder
+            installNamespaceAt(ctx, sys_root, ns.path[1..], ns);
+        } else installNamespace(ctx, global, ns);
+    }
 
     // Extend existing intrinsics. Skipped if the intrinsic isn't
     // installed in this runtime (Dispatcher.snapshotInitFn keeps
@@ -1082,7 +1094,15 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // subset-tolerant (each engine embeds only the shims it serves); the
     // capability-template test below is what catches a worker shim that
     // silently failed to register.
-    evalSnippet(ctx, "_invoke.js", INVOKE_JS);
+    {
+        const fn_val = c.JS_Eval(ctx, INVOKE_JS.ptr, INVOKE_JS.len, "_invoke.js", c.JS_EVAL_TYPE_GLOBAL);
+        defer c.JS_FreeValue(ctx, fn_val);
+        if (c.JS_IsException(fn_val)) evalSnippetFatal(ctx, "_invoke.js");
+        var argv = [_]c.JSValue{sys_root};
+        const ret = c.JS_Call(ctx, fn_val, global, 1, &argv);
+        defer c.JS_FreeValue(ctx, ret);
+        if (c.JS_IsException(ret)) evalSnippetFatal(ctx, "_invoke.js(call)");
+    }
 
     // Reachability hardening (docs/architecture/builtin-libs.md).
     // Every factory above received its `_system.*` slice from the invoker
@@ -1114,8 +1134,10 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // `referencesPrivilegedSurface`). While the ambient globals still
     // exist this duplicates them; removing them is what makes this the
     // only path (tracker #753).
-    evalSnippet(ctx, "_caps.js", comptime "globalThis.__rove.caps = { " ++
-        reserved.capabilityLiteralBody() ++ "};");
+    // The customer capability template is built by the invoker itself,
+    // from its constructed surfaces — object shorthand over ambient
+    // bindings retired with the ambients (#861). The identity test below
+    // asserts the template's members against CAPABILITY_NAMES.
 
     // The SECOND capability template: what a baked `__system/` activation is
     // handed instead of `caps` — selected by code origin when the activation
@@ -1136,7 +1158,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // the cutover, when nothing needs the name
     // (`package-isolation.md`: not installing is the denial).
     evalSnippet(ctx, "_caps_system.js", comptime "globalThis.__rove.capsSystem = { " ++
-        reserved.systemCapabilityLiteralBody() ++ "};");
+        systemCapabilityFromTemplateBody() ++ "};");
 
     // The system set's one member the shorthand cannot express: the
     // storage-rooted kv, nested as `__system.rootKv` — what a baked
@@ -1159,7 +1181,9 @@ pub fn installStatic(ctx: *c.JSContext) void {
         \\};
     );
 
-    evalSnippet(ctx, "_harden.js", "delete globalThis._system;");
+    // No `_harden.js`: `_system` was never a global (#861), so there is
+    // nothing to delete and no pre/post-harden distinction to reason
+    // about.
 }
 
 const NativeFn = *const fn (
@@ -1549,6 +1573,37 @@ pub const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "blob", .src = BLOB_JS },
 };
 
+/// `capsSystem`'s literal body, each member read off the customer
+/// template the invoker built (`__rove.caps`) — never off an ambient
+/// binding, which no longer exists for capability names (#861).
+fn systemCapabilityFromTemplateBody() []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (reserved.SYSTEM_CAPABILITY_NAMES) |n| {
+            out = out ++ n ++ ": __rove.caps." ++ n ++ ", ";
+        }
+        return out;
+    }
+}
+
+/// installNamespace with an explicit base + path slice — the `_system`
+/// subtree builds on a DETACHED base (#861).
+fn installNamespaceAt(ctx: *c.JSContext, base: c.JSValue, path: []const [:0]const u8, ns: NamespaceBindings) void {
+    const leaf = c.JS_NewObject(ctx);
+    for (ns.fns) |fb| attachFn(ctx, leaf, fb);
+    for (ns.consts) |cb| {
+        _ = c.JS_SetPropertyStr(ctx, leaf, cb.name.ptr, c.JS_NewInt32(ctx, cb.value));
+    }
+    var parent = c.JS_DupValue(ctx, base);
+    defer c.JS_FreeValue(ctx, parent);
+    for (path[0 .. path.len - 1]) |seg| {
+        const next = c.JS_GetPropertyStr(ctx, parent, seg.ptr);
+        c.JS_FreeValue(ctx, parent);
+        parent = next;
+    }
+    _ = c.JS_SetPropertyStr(ctx, parent, path[path.len - 1].ptr, leaf);
+}
+
 fn installNamespace(ctx: *c.JSContext, global: c.JSValue, ns: NamespaceBindings) void {
     const leaf = c.JS_NewObject(ctx);
     for (ns.fns) |fb| attachFn(ctx, leaf, fb);
@@ -1592,6 +1647,21 @@ fn attachFn(ctx: *c.JSContext, target: c.JSValue, fb: FnBinding) void {
         target,
         fb.name.ptr,
         c.JS_NewCFunction2(ctx, fb.cfunc, fb.name.ptr, fb.argc, c.JS_CFUNC_generic, 0),
+    );
+}
+
+/// The shared install-failure panic: an exception is pending on `ctx`.
+/// Same infallibility posture as `evalSnippet`'s tail — a base-install
+/// failure must be loud at install, never a missing surface later.
+fn evalSnippetFatal(ctx: *c.JSContext, name: []const u8) noreturn {
+    const exc = c.JS_GetException(ctx);
+    defer c.JS_FreeValue(ctx, exc);
+    const msg = c.JS_ToCString(ctx, exc);
+    defer if (msg != null) c.JS_FreeCString(ctx, msg);
+    const detail: []const u8 = if (msg != null) std.mem.span(msg) else "<no message>";
+    std.debug.panic(
+        "rove-js: global shim {s} failed to evaluate: {s}",
+        .{ name, detail },
     );
 }
 
@@ -1799,13 +1869,14 @@ test "lint(b): every globals/*.js export carries a JSDoc block (Phase A)" {
     }
 }
 
-test "harden: _system unreachable post-installStatic, shims still bound (Phase A)" {
-    // Builds the base snapshot the way a worker does (installStatic),
-    // then asserts customer scope can't see `_system` while the shims
-    // — which captured their `_system.X` slice in a closure before
-    // the delete — are still wired. A regression here means either
-    // the delete moved before the shim evals or a shim started
-    // reading `_system` lazily instead of via its captured `sys`.
+test "cutover: effect names are absent from the global; the template holds them (#861)" {
+    // Builds the base the way a worker does (installStatic), then asserts
+    // the #861 done-criterion: a capability name is NOT a global — naming
+    // one as a free variable is a ReferenceError — while the SAME surface
+    // is present and wired on the template the activation object is built
+    // from. `_system` never existed on the global, so its absence is the
+    // never-installed model, not a delete. Ambient-STAYING names
+    // (crypto, the codecs, console, time) still resolve.
     var rt = try qjs.Runtime.init();
     defer rt.deinit();
     var ctx = try rt.newContext();
@@ -1816,18 +1887,23 @@ test "harden: _system unreachable post-installStatic, shims still bound (Phase A
     const assertion =
         \\(function () {
         \\  if (typeof globalThis._system !== "undefined")
-        \\    throw new Error("_system still reachable from customer scope");
-        \\  if (typeof kv !== "object" || typeof kv.get !== "function")
-        \\    throw new Error("kv shim broke (closure lost its _system slice)");
+        \\    throw new Error("_system reachable — the detached build regressed");
+        \\  for (const n of ["kv", "config", "http", "after", "stream", "next",
+        \\                   "platform", "webhook", "blob", "schedule"]) {
+        \\    if (n in globalThis)
+        \\      throw new Error(n + " is still an ambient global (#861)");
+        \\  }
+        \\  const t = globalThis.__rove.caps;
+        \\  if (typeof t.kv !== "object" || typeof t.kv.get !== "function")
+        \\    throw new Error("template kv missing/unwired");
+        \\  if (typeof t.platform !== "object" || typeof t.platform.root.get !== "function")
+        \\    throw new Error("template platform missing/unwired");
+        \\  if (typeof t.webhook !== "object" || typeof t.webhook.send !== "function")
+        \\    throw new Error("template webhook missing/unwired");
         \\  if (typeof crypto !== "object" || typeof crypto.sha256 !== "function")
-        \\    throw new Error("crypto shim broke");
-        \\  if (typeof platform !== "object" ||
-        \\      typeof platform.root.get !== "function")
-        \\    throw new Error("platform nested shim broke");
-        \\  if (typeof webhook !== "object" || typeof webhook.send !== "function")
-        \\    throw new Error("webhook shim broke (lost its received http / sched caps)");
-        \\  if (typeof schedule !== "undefined")
-        \\    throw new Error("schedule leaked to customer scope (should be the private sched factory)");
+        \\    throw new Error("crypto must STAY ambient and wired");
+        \\  if (typeof time !== "object" || typeof TextDecoder !== "function")
+        \\    throw new Error("the ambient-staying set must stay installed");
         \\  return true;
         \\})();
     ;
@@ -1850,8 +1926,9 @@ test "caps: the activation template holds every reaching name and nothing pure" 
     // (tracker #753) — silently un-passable, and un-deniable. Adding a
     // pure name here would make handlers thread it for no reason.
     //
-    // Identity, not shape: the template must hold THE ambient object, so
-    // the two cannot drift into separate implementations while both work.
+    // Post-cutover (#861) the template IS the only home: the set check
+    // still pins the classification rule, and the identity half inverts —
+    // no member may ALSO be ambient.
     var rt = try qjs.Runtime.init();
     defer rt.deinit();
     var ctx = try rt.newContext();
@@ -1867,10 +1944,11 @@ test "caps: the activation template holds every reaching name and nothing pure" 
         \\  const want = "after,blob,config,http,kv,next,platform,stream,webhook";
         \\  if (got !== want)
         \\    throw new Error("capability set drifted: got [" + got + "] want [" + want + "]");
-        \\  // Same object, not a copy.
+        \\  // The template is the ONLY home — a member that is also a
+        \\  // global means the removal regressed.
         \\  for (const k of Object.keys(caps))
-        \\    if (caps[k] !== globalThis[k])
-        \\      throw new Error("caps." + k + " is not the ambient " + k);
+        \\    if (k in globalThis)
+        \\      throw new Error("caps." + k + " leaked back to globalThis (#861)");
         \\  // Pure / web-platform names stay ambient and out of the template.
         \\  // The request-sourced effects are NOT capability-template members:
         \\  // they are per-activation own properties (installRequest), so a
@@ -1887,7 +1965,7 @@ test "caps: the activation template holds every reaching name and nothing pure" 
         \\  // The mechanism installRequest uses: capabilities resolve through
         \\  // the prototype chain, so a per-activation object costs one alloc.
         \\  const act = Object.create(caps);
-        \\  if (act.kv !== globalThis.kv) throw new Error("prototype chain broke");
+        \\  if (act.kv !== caps.kv) throw new Error("prototype chain broke");
         \\  // The SYSTEM set: what a baked `__system/` activation receives
         \\  // instead. Shared members by the same identity rule; the
         \\  // customer-only capabilities are absent, so the two sets are
@@ -1901,9 +1979,11 @@ test "caps: the activation template holds every reaching name and nothing pure" 
         \\  const swant = "__system,after,blob,config,http,next,platform,stream,webhook";
         \\  if (sgot !== swant)
         \\    throw new Error("system capability set drifted: got [" + sgot + "] want [" + swant + "]");
+        \\  // capsSystem's members are the CUSTOMER template's, by identity —
+        \\  // one construction, two grants (#861: neither is ambient).
         \\  for (const k of Object.keys(sys))
-        \\    if (k !== "__system" && sys[k] !== globalThis[k])
-        \\      throw new Error("capsSystem." + k + " is not the ambient " + k);
+        \\    if (k !== "__system" && sys[k] !== caps[k])
+        \\      throw new Error("capsSystem." + k + " is not the template's " + k);
         \\  if ("kv" in sys) throw new Error("kv must not be in the system template");
         \\  if (Object.create(sys).kv !== undefined)
         \\    throw new Error("a system activation would inherit a kv");
@@ -1979,8 +2059,8 @@ test "factories: a factory's return must not expose a capability it was handed" 
         \\  // and the registry knows the name.
         \\  if (typeof reg.webhook !== "function")
         \\    throw new Error("webhook is not factory-registered");
-        \\  if (typeof globalThis.webhook.send !== "function")
-        \\    throw new Error("webhook.send missing from the installed object");
+        \\  if (typeof globalThis.__rove.caps.webhook.send !== "function")
+        \\    throw new Error("webhook.send missing from the template surface");
         \\  return true;
         \\})();
     ;

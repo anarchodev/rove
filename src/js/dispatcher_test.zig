@@ -201,7 +201,10 @@ fn runOneOutcome(
     body: []const u8,
     request_in: Request,
 ) !RunOutcome {
-    const wrapped = try std.fmt.allocPrint(testing.allocator, "export function go() {{ {s} }}\n", .{body});
+    // The wrapper destructures every capability, so a statement-level
+    // snippet keeps the ambient-era spelling while receiving its effects
+    // from the activation object (#861 — the names are no longer globals).
+    const wrapped = try std.fmt.allocPrint(testing.allocator, "export function go({{ after, blob, config, http, kv, next, platform, stream, webhook }}) {{ {s} }}\n", .{body});
     defer testing.allocator.free(wrapped);
 
     var rt = try qjs.Runtime.init();
@@ -1224,7 +1227,7 @@ test "kv subscriptions: watched-prefix writes inject ONE durable dirty marker (c
     var ctx = try rt.newContext();
     defer ctx.deinit();
     const bc = try ctx.compileToBytecode(
-        \\export function go() {
+        \\export function go({ kv }) {
         \\  kv.set("orders/1", "a");
         \\  kv.set("orders/2", "b");   // same sub - marker deduped
         \\  kv.set("other/1", "c");    // unwatched - no marker
@@ -1393,7 +1396,7 @@ test "static onChunk: a failed upstream read fails loud (502), never a silent 20
     // reporting failure MUST 502 on the first (head-not-yet-committed)
     // chunk, not serve a well-formed 200 for a broken/missing blob.
     const bc = try ctx.compileToBytecode(
-        \\export function onChunk() {
+        \\export function onChunk({ next, stream }) {
         \\  const a = request.activation;
         \\  if (a.final && (a.status < 200 || a.status >= 300 || a.bodyTruncated)) {
         \\    if (a.seq === 0) { response.status = 502; return "static asset read failed (status " + a.status + ")"; }
@@ -2139,7 +2142,7 @@ test "dispatch: kv tape captures foreign gets only (§8 minimal read set)" {
     var ctx = try rt.newContext();
     defer ctx.deinit();
     const bytecode = try ctx.compileToBytecode(
-        \\export function go() {
+        \\export function go({ kv }) {
         \\    const v = kv.get("seeded");
         \\    const missing = kv.get("missing");
         \\    kv.set("new", v + "!");
@@ -2220,7 +2223,7 @@ test "dispatch: kv tape skips own-reads (§8 minimal read set)" {
     // reproducible by replay re-running the handler against its
     // overlay — so no tape entry needed.
     const bytecode = try ctx.compileToBytecode(
-        \\export function go() {
+        \\export function go({ kv }) {
         \\    kv.set("own", "hello");
         \\    const v = kv.get("own");
         \\    return v;
@@ -2267,11 +2270,11 @@ test "dispatch: a batch-mate's write is a FOREIGN read for the next activation (
     var ctx = try rt.newContext();
     defer ctx.deinit();
     const bytecode = try ctx.compileToBytecode(
-        \\export function first() {
+        \\export function first({ kv }) {
         \\    kv.set("count", "1");
         \\    return "a";
         \\}
-        \\export function second() {
+        \\export function second({ kv }) {
         \\    const v = kv.get("count");
         \\    kv.set("count", "2");
         \\    return String(v);
@@ -5245,7 +5248,7 @@ test "trigger: afterPut fires after a kv.set inside the handler" {
     defer ctx.deinit();
 
     const handler_bc = try ctx.compileToBytecode(
-        \\export default function () {
+        \\export default function ({ kv }) {
         \\  kv.set("users/sessions/abc", JSON.stringify({ user_id: "u42" }));
         \\  return "ok";
         \\}
@@ -5306,7 +5309,7 @@ test "trigger: afterDelete fires with previousValue" {
     defer ctx.deinit();
 
     const handler_bc = try ctx.compileToBytecode(
-        \\export default function () {
+        \\export default function ({ kv }) {
         \\  kv.set("orders/o1", JSON.stringify({ total: 100 }));
         \\  kv.delete("orders/o1");
         \\  return "ok";
@@ -5371,7 +5374,7 @@ test "trigger: tree-traversal order — outer + inner both fire on AFTER" {
     // Each appends its name to a marker key so we can verify both fired
     // and in the right order (innermost-first for AFTER).
     const handler_bc = try ctx.compileToBytecode(
-        \\export default function () {
+        \\export default function ({ kv }) {
         \\  kv.set("users/sessions/abc", "v");
         \\  return "ok";
         \\}
@@ -5442,7 +5445,7 @@ test "trigger: cascade depth limit halts runaway recursion" {
     // Trigger that writes another key that matches itself → infinite
     // cascade. The depth cap must throw and abort the handler.
     const handler_bc = try ctx.compileToBytecode(
-        \\export default function () {
+        \\export default function ({ kv }) {
         \\  kv.set("loop/0", "x");
         \\  return "ok";
         \\}
@@ -5501,7 +5504,7 @@ test "trigger: platform-key writes do not fire customer triggers" {
     // `_callback/...` is a platform key — the fire-time guard skips
     // dispatch so the customer's afterPut never sees system writes.
     const handler_bc = try ctx.compileToBytecode(
-        \\export default function () {
+        \\export default function ({ kv }) {
         \\  kv.set("_callback/sys-write", "x");
         \\  return "ok";
         \\}
@@ -5559,7 +5562,7 @@ test "trigger: beforePut throw is catchable in handler with code='trigger_reject
     // Handler tries to write a session with no user_id; trigger rejects.
     // Handler catches and reports the error code.
     const handler_bc = try ctx.compileToBytecode(
-        \\export default function () {
+        \\export default function ({ kv }) {
         \\  try {
         \\    kv.set("users/sessions/abc", JSON.stringify({}));
         \\    return "should not reach";
@@ -5625,7 +5628,7 @@ test "trigger: beforePut return-value mutates the written value" {
 
     // Trigger lowercases the value before storage.
     const handler_bc = try ctx.compileToBytecode(
-        \\export default function () {
+        \\export default function ({ kv }) {
         \\  kv.set("users/abc", "ALICE");
         \\  return "ok";
         \\}
@@ -5687,7 +5690,7 @@ test "trigger: beforePut throw rolls back trigger-internal writes (the audit got
     // every accepted write" and the handler itself for "log every
     // rejected attempt." See PLAN §2.5 implementation notes.
     const handler_bc = try ctx.compileToBytecode(
-        \\export default function () {
+        \\export default function ({ kv }) {
         \\  try { kv.set("orders/o1", "{}"); } catch (e) {}
         \\  return "ok";
         \\}
@@ -5749,7 +5752,7 @@ test "trigger: afterPut throw is catchable AND rolls back the originating write"
     // the handler caught the exception (inner savepoint covers
     // BEFORE+write+AFTER).
     const handler_bc = try ctx.compileToBytecode(
-        \\export default function () {
+        \\export default function ({ kv }) {
         \\  try {
         \\    kv.set("orders/o1", "{}");
         \\    return "no throw";
@@ -5812,7 +5815,7 @@ test "trigger: BEFORE chain runs outermost-first (broad validates before narrow)
     // Two BEFORE triggers: outer + inner. Each appends to a marker.
     // BEFORE chain should fire outermost-first (opposite of AFTER).
     const handler_bc = try ctx.compileToBytecode(
-        \\export default function () {
+        \\export default function ({ kv }) {
         \\  kv.set("users/sessions/abc", "v");
         \\  return "ok";
         \\}
@@ -5886,7 +5889,7 @@ test "trigger: default export is the catchall when no named export matches" {
     // Test: put + delete + verify default ran twice with the right
     // event.op + event.timing values.
     const handler_bc = try ctx.compileToBytecode(
-        \\export default function () {
+        \\export default function ({ kv }) {
         \\  kv.set("orders/o1", "{}");
         \\  kv.delete("orders/o1");
         \\  return "ok";
@@ -5952,7 +5955,7 @@ test "trigger: BEFORE sees previousValue on update" {
     // each put so we can verify the second one saw the first's bytes
     // as previousValue.
     const handler_bc = try ctx.compileToBytecode(
-        \\export default function () {
+        \\export default function ({ kv }) {
         \\  kv.set("docs/d1", "v1");
         \\  kv.set("docs/d1", "v2");
         \\  return "ok";
@@ -6018,7 +6021,7 @@ test "trigger: well-bounded cascade (depth 2, no runaway)" {
     // different trigger); B's afterPut writes C (no matching trigger,
     // chain ends). Verify event.depth reflects the cascade level.
     const handler_bc = try ctx.compileToBytecode(
-        \\export default function () {
+        \\export default function ({ kv }) {
         \\  kv.set("a/x", "a-value");
         \\  return "ok";
         \\}

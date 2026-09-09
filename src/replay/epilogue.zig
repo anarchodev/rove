@@ -639,7 +639,7 @@ const EPILOGUE_BODY_HEAD =
     \\  // Pre-rename `on.*` — the captured driver only, so records from
     \\  // pre-rename deployments still replay their pinned code. Aliases the
     \\  // base `after`. Authored worlds never see it (retired live).
-    \\  if (D.captured) globalThis.on = { fetch: globalThis.after.fetch, kv: globalThis.after.kv, timer: globalThis.after.ms };
+    \\  if (D.captured) { const __t0 = (globalThis.__rove && __rove.caps) || {}; globalThis.on = { fetch: __t0.after.fetch, kv: __t0.after.kv, timer: __t0.after.ms }; }
     \\  // kv is the NATIVE common binding (rove-binding, installed at reactor
     \\  // base setup) for the whole run — no per-request JS wrapper. The
     \\  // binding owns coercion + guards + shaping (one implementation with
@@ -713,7 +713,11 @@ const EPILOGUE_BODY_TAIL =
     \\  // installs a subset of the worker's shims, and an own property
     \\  // holding `undefined` reads differently from an absent one.
     \\  const __act = {};
-    \\  for (const __k of __CAPS) if (__k in globalThis) __act[__k] = globalThis[__k];
+    \\  // Capabilities come from the persistent template — the ambient
+    \\  // spellings are gone (#861); the engine assigned the per-run kv
+    \\  // onto `__rove.caps` itself.
+    \\  const __tmpl = globalThis.__rove && __rove.caps || {};
+    \\  for (const __k of __CAPS) if (__k in __tmpl) __act[__k] = __tmpl[__k];
     \\  __act.request = request;
     \\  __act.response = globalThis.response;
     \\  // The three effects that HID on `request` (package-isolation.md §3.4)

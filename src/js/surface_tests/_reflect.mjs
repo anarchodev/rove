@@ -20,7 +20,7 @@
 // so a new shim cannot ship without declaring how it reflects.
 // `_`-prefixed props are non-public by convention and skipped.
 
-export default function () {
+export default function ({ after, blob, config, http, kv, next, platform, stream, webhook }) {
   const out = [];
   const errors = [];
   const skip = (k) => k.startsWith("_") || k === "constructor";

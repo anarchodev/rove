@@ -91,6 +91,10 @@ TREES = (
     # capsSystem — one kv, the storage-rooted rootKv, user root spelled
     # explicitly (#848).
     "src/js/builtin_modules",
+    # The baked genesis/starter apps (the bootstrap deploy app `/_system/reset`
+    # deploys, the starter tenant content) — customer-context handlers shipped
+    # in the binary.
+    "src/js/starter",
 )
 
 SKIP_PARTS = ("_static", "node_modules", ".git")

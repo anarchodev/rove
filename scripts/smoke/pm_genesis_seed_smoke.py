@@ -46,6 +46,12 @@ def _find_registry_dir() -> Path:
     cands = []
     if override:
         cands.append(Path(override) / "registry")
+    # The rove checkout's own `web/` submodule FIRST — it is the apps
+    # commit this rove commit pins, so it can never be stale relative to
+    # the engine under test. A sibling standalone clone is the fallback
+    # for layouts without the submodule, and it drifts (a pre-migration
+    # sibling served ambient-idiom handlers into a post-#861 engine).
+    cands.append(Path(__file__).resolve().parents[2] / "web" / "registry")
     # walk up from here; at each level try a sibling rewind-apps/registry.
     for p in Path(__file__).resolve().parents:
         cands.append(p.parent / "rewind-apps" / "registry")

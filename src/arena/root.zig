@@ -513,6 +513,24 @@ fn jsSetConfigScope(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.J
     return undef();
 }
 
+
+/// The target for engine-installed capabilities post-#861: the
+/// persistent template `__rove.caps` — never `globalThis`.
+fn capsTarget(ctx: ?*c.JSContext, g: c.JSValue) c.JSValue {
+    var rove = c.JS_GetPropertyStr(ctx, g, "__rove");
+    if (c.JS_IsUndefined(rove)) {
+        rove = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, g, "__rove", c.JS_DupValue(ctx, rove));
+    }
+    defer c.JS_FreeValue(ctx, rove);
+    var caps = c.JS_GetPropertyStr(ctx, rove, "caps");
+    if (c.JS_IsUndefined(caps)) {
+        caps = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, rove, "caps", c.JS_DupValue(ctx, caps));
+    }
+    return caps;
+}
+
 export fn rove_arena_install(ctx: ?*c.JSContext) c_int {
     const g = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, g);
@@ -521,12 +539,14 @@ export fn rove_arena_install(ctx: ?*c.JSContext) c_int {
     _ = c.JS_SetPropertyStr(ctx, obj, "set", c.JS_NewCFunction2(ctx, B.jsKvSet, "set", 2, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, obj, "delete", c.JS_NewCFunction2(ctx, B.jsKvDelete, "delete", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, obj, "prefix", c.JS_NewCFunction2(ctx, B.jsKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
-    if (c.JS_SetPropertyStr(ctx, g, "kv", obj) < 0) return -1;
+    const caps_t = capsTarget(ctx, g);
+    defer c.JS_FreeValue(ctx, caps_t);
+    if (c.JS_SetPropertyStr(ctx, caps_t, "kv", obj) < 0) return -1;
     // The config door (rove#830) — native like `kv`; the prelude excludes
     // config.js for the same reason it excludes kv.js.
     const cfg = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, cfg, "get", c.JS_NewCFunction2(ctx, B.jsConfigGet, "get", 1, c.JS_CFUNC_generic, 0));
-    if (c.JS_SetPropertyStr(ctx, g, "config", cfg) < 0) return -1;
+    if (c.JS_SetPropertyStr(ctx, caps_t, "config", cfg) < 0) return -1;
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_request_tag", c.JS_NewCFunction2(ctx, T.jsRequestTag, "__rove_request_tag", 2, c.JS_CFUNC_generic, 0));
     const SK = binding.ShredKey(c, ArenaTag);
     _ = c.JS_SetPropertyStr(ctx, g, "__rove_request_shred_key", c.JS_NewCFunction2(ctx, SK.jsRequestShredKey, "__rove_request_shred_key", 1, c.JS_CFUNC_generic, 0));
