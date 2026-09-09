@@ -462,7 +462,8 @@ pub const Request = struct {
     session_id: ?[64]u8 = null,
     /// True when the dispatched module belongs to the
     /// `__system/` namespace. Built-in modules are platform-trusted — they
-    /// bypass the `isCustomerWriteReserved` check and skip middleware.
+    /// hold the storage-rooted kv (`rootKv`, gated on this flag) and skip
+    /// middleware.
     is_system_module: bool = false,
 
     /// The streaming substrate (`docs/architecture/routing-and-ingress.md`): the entity owning the chain

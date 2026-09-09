@@ -660,19 +660,18 @@ const EPILOGUE_BODY_TAIL =
     \\  // before-put that returns a STRING mutates the written value (the
     \\  // final value is this function's return); a handler that THROWS
     \\  // rejects the write as Error{code:"trigger_rejected"}
-    \\  // ("<module>: <message>"). Platform-owned key prefixes never fire
-    \\  // (matches prod isPlatformKey); a depth cap guards
+    \\  // ("<module>: <message>"). Every handler-named key can fire — the
+    \\  // platform-prefix exemption is retired with its prod half (#862),
+    \\  // since a handler's keys are its own; a depth cap guards
     \\  // trigger-writes-that-re-fire recursion. Subscription markers
     \\  // (`_sub/dirty/{name}`) are the delegate's too — injected below the
     \\  // binding like the worker's markSubscriptionsDirty, from the
     \\  // scenario's `__rove_store/subscriptions` registration.
-    \\  const __TRIG_PLATFORM = ["_audit/", "_deploy/", "_callback/", "_magic/", "_triggers/", "_sessions/"];
     \\  const __triggerHandler = (ns, op, timing) => { const nm = op === "put" ? (timing === "before" ? "beforePut" : "afterPut") : (timing === "before" ? "beforeDelete" : "afterDelete"); if (typeof ns[nm] === "function") return ns[nm]; if (typeof ns.default === "function") return ns.default; return null; };
     \\  let __triggerDepth = 0;
     \\  const __runTriggers = (op, timing, key, value, prev) => {
     \\    const trigs = globalThis.__rove_triggers;
     \\    if (!trigs || trigs.length === 0 || __triggerDepth >= 16) return value;
-    \\    for (const p of __TRIG_PLATFORM) if (key.startsWith(p)) return value;
     \\    const matched = trigs.filter((t) => key.startsWith(t.prefix));
     \\    if (matched.length === 0) return value;
     \\    // BEFORE: broad→narrow (shortest prefix first); AFTER: narrow→broad.

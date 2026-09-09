@@ -480,7 +480,7 @@ test "kv binding: a handler cannot address the engine keyspace" {
 
     // ── a catch-all scan sees the handler's rows and no engine row, with no
     //    filtering and no refill: they were never in the scanned range. This is
-    //    what retires `scanSpansEngineOnly` and `kvPrefixFiltered` — a run of
+    //    what retired `scanSpansEngineOnly` and `kvPrefixFiltered` (#862) — a run of
     //    engine rows can no longer truncate a customer's page, because there is
     //    no run of them to skip.
     try expectEval(ctx, a, "__t(() => kv.set('users/1', 'alice'))", "ok:null");

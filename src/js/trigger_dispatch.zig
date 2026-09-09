@@ -29,28 +29,6 @@ const MAX_TRIGGER_DEPTH = globals.MAX_TRIGGER_DEPTH;
 const js_undefined = globals.js_undefined;
 const js_null = globals.js_null;
 
-/// Platform-owned prefixes whose writes never fire customer triggers,
-/// even when a catch-all trigger is registered. Keeps customer code
-/// from observing (or stalling) internal infrastructure writes.
-///
-/// If a kv key under a customer's catch-all trigger happens to
-/// start with one of these, we silently skip trigger dispatch.
-const PLATFORM_KV_PREFIXES_FIRE = [_][]const u8{
-    "_audit/",
-    "_deploy/",
-    "_callback/",
-    "_magic/",
-    "_triggers/",
-    "_sessions/",
-};
-
-fn isPlatformKey(key: []const u8) bool {
-    for (PLATFORM_KV_PREFIXES_FIRE) |p| {
-        if (std.mem.startsWith(u8, key, p)) return true;
-    }
-    return false;
-}
-
 pub const TriggerOp = enum { put, delete };
 
 /// The caps object a trigger callback receives as its first argument:
@@ -212,13 +190,17 @@ fn lookupTriggerHandler(
 
 /// Cheap probe used by `kv.set` / `kv.delete` to decide whether
 /// to pay the previousValue lookup cost. Walks the registry, returns
-/// true on the first prefix match. No qjs interaction. Returns false
-/// for platform keys (matches the fire-time guard's behavior so we
-/// don't pay the lookup for traffic that won't fire triggers anyway).
+/// true on the first prefix match. No qjs interaction.
+///
+/// There is no platform-prefix exemption: the key here is one the HANDLER
+/// named, and a handler's keys resolve under the user root, so a `_audit/`
+/// it writes is its own row and a trigger it registered on that prefix is
+/// its own to fire. The engine's namespaces are written below this binding
+/// and never reach trigger dispatch at all. The old exemption suppressed
+/// the customer's trigger on the customer's data (#862).
 pub fn anyTriggerMatches(state: *DispatchState, key: []const u8) bool {
     const triggers = state.triggers orelse return false;
     if (triggers.len == 0) return false;
-    if (isPlatformKey(key)) return false;
     for (triggers) |entry| {
         if (std.mem.startsWith(u8, key, entry.prefix)) return true;
     }

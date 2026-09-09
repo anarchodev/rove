@@ -298,9 +298,9 @@ log to the effect bundle or return values — contradicting the
 
 1. **Recipe rows live under `_blob/recipe/{sid}/`** — `meta` (state,
    hash-or-midstate, contentType, totals, updated_at) plus
-   `r/{seq, zero-padded}` rows. `_blob/` is already in
-   `SHIM_WRITABLE_PREFIXES` (reserved.zig), so the shim writes them as
-   ordinary tenant kv — no reserved changes. **sid = the chain's
+   `r/{seq, zero-padded}` rows. `_blob/` is an ordinary key family in the
+   tenant's own rooted keyspace, so the shim writes them as ordinary tenant
+   kv. **sid = the chain's
    correlation id** (recorded → replay-pure), with `req{request_id}`
    as the chain-less fallback (test paths). **One open recipe per
    chain**, matching today's session-per-saga semantics; a second

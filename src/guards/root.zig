@@ -194,37 +194,6 @@ pub fn checkKvWrite(
     return null;
 }
 
-/// The read half of the reserved-keyspace rule: `true` when a handler read of
-/// `key` must behave as though the key is absent.
-///
-/// A read is HIDDEN, not refused, where a write is refused, not ignored. The
-/// asymmetry is deliberate. A write that silently did nothing is a bug the
-/// handler cannot see, so it must throw; a read of a namespace that is not the
-/// tenant's is honestly empty, and answering "absent" is the only answer that
-/// does not itself disclose the namespace. `is_system_module` exempts the
-/// platform's baked modules, which read these by design.
-pub fn kvReadHidden(key: []const u8, is_system_module: bool) bool {
-    return !is_system_module and reserved.isEngineOnly(key);
-}
-
-/// A scan at `prefix` is entirely inside an engine-only namespace, so it has
-/// nothing visible to return and must not touch storage at all.
-pub fn kvScanAllHidden(prefix: []const u8, is_system_module: bool) bool {
-    return !is_system_module and reserved.isEngineOnly(prefix);
-}
-
-/// A scan at `prefix` can reach engine-only keys, so it must filter them out
-/// and keep refilling its page. See `reserved.scanSpansEngineOnly` for why
-/// filtering alone is not enough.
-pub fn kvScanFilters(prefix: []const u8, is_system_module: bool) bool {
-    return !is_system_module and reserved.scanSpansEngineOnly(prefix);
-}
-
-/// One row of a filtered scan: skip it, or hand it to the handler.
-pub fn kvRowHidden(key: []const u8) bool {
-    return reserved.isEngineOnly(key);
-}
-
 /// The reserved-key message names the offending key, so it is formatted by
 /// the caller rather than carried on the verdict. Kept here so the wording
 /// has one home.
@@ -485,16 +454,18 @@ test "kv: the write budget refuses on ops and on bytes, and a fresh activation i
     );
 }
 
-test "kv: no namespace is refused — the allowlist has nothing left to allow" {
-    // `SHIM_WRITABLE_PREFIXES` existed as the exception to a blanket
-    // leading-`_` denial: the durability shims had to write `_send/`, `_sched/`
-    // and friends from ordinary handler context, so the denial needed holes.
-    // With the denial gone the holes are gone too — every one of these is now
-    // an ordinary key in whatever keyspace the writer's capability is rooted
-    // in, which is what makes the list retirable rather than merely shorter.
-    for (reserved.SHIM_WRITABLE_PREFIXES) |p| {
-        var buf: [64]u8 = undefined;
-        const k = try std.fmt.bufPrint(&buf, "{s}x", .{p});
+test "kv: no namespace is refused — there is no namespace rule left" {
+    // The allowlist (`SHIM_WRITABLE_PREFIXES`) existed as the exception to a
+    // blanket leading-`_` denial: the durability shims had to write `_send/`,
+    // `_sched/` and friends from ordinary handler context, so the denial
+    // needed holes. Both are retired (#862) — every key below is an ordinary
+    // one in whatever keyspace the writer's capability is rooted in, and the
+    // spellings are written out here rather than looped over a list, since
+    // the list no longer exists to loop over.
+    for ([_][]const u8{
+        "_send/x", "_sched/x", "_blob/x", "_dispatch/x", "_seg/x",
+        "_export/x", "_sub/x",
+    }) |k| {
         try testing.expect(checkKvWrite(k, "v", .{}) == null);
     }
     try testing.expect(checkKvWrite("_secret/x", "v", .{}) == null);

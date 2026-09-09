@@ -55,10 +55,10 @@ const MODULES = [_]struct {
     src: []const u8,
     /// May a durable wake fire this module? (rove#495)
     ///
-    /// A `_sched/` record names its own dispatch target, and `_sched/` is
-    /// customer-writable by design (`reserved.zig`'s
-    /// `SHIM_WRITABLE_PREFIXES`) so the `schedule` shim can arm wakes from
-    /// handler context. So the target of a wake is customer input, and a
+    /// A `_sched/` record names its own dispatch target, and `_sched/` is an
+    /// ordinary key in the tenant's own rooted keyspace — the `schedule` shim
+    /// arms wakes from handler context, so a tenant can author the same rows.
+    /// So the target of a wake is customer input, and a
     /// baked module reached that way runs with `is_system_module` — the
     /// engine grants it from the module PATH, not from who armed the entry.
     ///
