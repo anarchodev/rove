@@ -275,16 +275,24 @@ fn scopeTag(allocator: std.mem.Allocator, id: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "i/{s}", .{id});
 }
 
-// ── platform.root.* (admin singleton only) ────────────────────────
+// ── platform.root.* (admin singleton only) — SLATED FOR DELETION ──
 //
 // Only installed when the handler-tenant is `__admin__` — gated on
-// `state.platform` being non-null in `installRequest`. Provides raw
-// access to the platform root store for the admin JS handler's
-// instance / domain / user / account reads. Writes currently land
-// locally on the leader only (no raft propagation of root writes
-// from JS handlers yet); multi-node correctness for admin-handler
-// writes is follow-up work. Signup + other platform-level writes
-// go through the Zig-native HTTP endpoints, which DO replicate.
+// `state.platform` being non-null in `installRequest`. Reads the platform
+// root store for the admin handler's instance / domain lookups. Root
+// WRITES are already gone: they are dispatched activations in `__root__`'s
+// own scope (`__system/root_kv_install`, `__system/root_domain`, rove#715).
+//
+// These reads go the same way, and the direction is one way to do
+// cross-tenant: a dispatched activation in the target's own scope, asking
+// for a THING rather than a key. Every caller here is a query wearing a kv
+// costume — list instances, get instance, list domains, check domain
+// ownership — so the replacement is typed verbs, not a rerooted kv door
+// (rove#852). Nothing new should be built on this surface.
+//
+// Its keys address storage as it lies, because `__root__.db` holds engine
+// rows only. That is a fact about the rows, not a decision worth pinning
+// on a door being removed.
 
 pub fn jsPlatformRootGet(
     ctx: ?*c.JSContext,
@@ -579,28 +587,15 @@ pub fn jsPlatformScope(
 // until then, which is why it is stated in one place *here* rather than at four
 // call sites.
 //
-// Two carve-outs, and the boundary between them is WHO WROTE THE ROW, not what
-// it is named. Both of these are engine state, written by Zig below any binding
-// (`worker.zig`, `starter.zig`, `worker_system.zig`), so an admin reading them
-// is reading the engine rather than the tenant, and they never carried a root.
-//
-// `_export/` deliberately is NOT here even though it looks the same: those rows
-// are written by `@rewind/export` through the HANDLER's kv, so they sit under
-// the user root with everything else the tenant owns. Carving out by "looks
-// platform-ish" would break it — which is why this is a list of two, arrived at
-// by enumerating what the dashboard actually reads through this door.
-const SCOPE_RAW_PREFIXES = [_][]const u8{ "_deploy/", "_release/" };
-
-fn scopeIsRaw(key: []const u8) bool {
-    for (SCOPE_RAW_PREFIXES) |p| {
-        if (std.mem.startsWith(u8, key, p)) return true;
-    }
-    return false;
-}
-
 /// A key the admin NAMED, as the target tenant's store holds it.
+///
+/// EVERY key, unconditionally. There is no prefix that means "raw" — an
+/// escape decided by spelling is available to whoever spells it, and has
+/// to be kept in sync with whatever the engine writes below the bindings
+/// (rove#850). The engine's own rows are reached through a typed verb on
+/// the dispatched successor (`__system/scope_kv`'s `release` request),
+/// which answers one question and cannot be widened by a caller's string.
 fn scopeStoreKey(buf: []u8, named: []const u8) ?[]const u8 {
-    if (scopeIsRaw(named)) return named;
     return std.fmt.bufPrint(buf, "{s}{s}", .{ reserved.USER_KEY_ROOT, named }) catch null;
 }
 
