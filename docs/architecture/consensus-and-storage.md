@@ -96,6 +96,42 @@ apply must land each inner in *its* tenant's store (`""` = the node root
 store, per the `StoreResolver` contract). A target the node cannot resolve is
 a loud `UnroutedApply`, not a silent mis-write.
 
+## The keyspace boundary — a rooting rule, not a reserved-prefix rule
+
+**Which rows a handler can reach is decided by the shape of the capability
+it holds, never by a check on the key.** A customer activation's `kv` is
+rooted (`reserved.USER_KEY_ROOT`): every key it names resolves under
+`_user/`, and it never learns the difference. The engine's own namespaces
+(`_usage/`, `_keys/`, the log and keyring rows) live outside that root, so
+they are not *refused* to a handler — they are **unnameable** by one. A
+handler that writes `_usage/x` has written its own `_user/_usage/x`; the
+meter is untouched, and nothing had to decide that.
+
+Two other roots exist, and both are grants rather than checks
+(`package-isolation.md` §3.3a):
+
+- a baked `__system/*` module holds **one** kv, the storage-rooted
+  `rootKv`, and spells the user root explicitly when it wants a row a
+  handler named — one module, one spelling, because the same row nameable
+  at two depths is the prefix-depth hazard that surfaces as a scan
+  silently missing rows;
+- a durability **facet** (`webhook.send`, `blob.*`, `platform.dispatch`,
+  the scheduler core) holds a kv rooted at its own namespace, constructed
+  by the engine's invoker from the native slice — a view the handler
+  never holds and cannot build.
+
+This replaced a policed boundary: reserved-prefix lists plus predicates
+consulted on every read and write, with an allowlist of exceptions for the
+shims (`isCustomerWriteReserved`, `isEngineOnly`, and the rest). All of it
+is deleted (rove#862). The rule it enforced is now a property of what a
+capability *is*, which is why there is nothing left to keep in sync, and
+why a new platform `_…/` family can be introduced later without colliding
+with customer data — it is in a different keyspace, not a defended one.
+
+What survives at the storage seam are the LIMITS, which are real and
+unrelated: the key and value caps, the per-activation write budgets, and
+the entry-size chain below.
+
 ## Write path & durability
 
 A customer write lands in a speculative **volatile overlay** (kvexp), then a

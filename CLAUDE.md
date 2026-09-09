@@ -163,7 +163,7 @@ Envelopes are typed byte blobs (`src/js/apply.zig`). Only two types are live (po
 
 | Type | Target store | Producer |
 |---|---|---|
-| `0` writeset | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset; `_deploy/current` release marker; the `webhook.send` / `email.send` JS-shim's `_send/owed/{id}` markers and the durable `scheduler` lib's `_sched/*` wake entries ride here too (ordinary kv writes — no apply-time special-case; `decisions.md` §3.3 + §3.7) |
+| `0` writeset | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset; `_deploy/current` release marker; the `webhook.send` / `email.send` JS-shim's `_send/owed/{id}` markers and the durable `scheduler` lib's `_sched/*` wake entries ride here too (kv writes through the shims' namespace-rooted capability — no apply-time special-case; `decisions.md` §3.3 + §3.7) |
 | `1` multi | per-inner-envelope target | Worker dispatcher — atomically bundles multiple writeset envelopes into one raft entry |
 
 

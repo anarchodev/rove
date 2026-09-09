@@ -1,11 +1,10 @@
 # Handler shape — pattern-matching at module level
 
 > **Effects are received, not ambient — see §1.1.** Every export takes one
-> argument and destructures what it needs. The ambient spellings used
-> throughout the examples below still work and are being migrated;
-> §1.1 is the form to write new code in. The arc is
-> [`architecture/package-isolation.md`](architecture/package-isolation.md)
-> (tracker #753).
+> argument and destructures what it needs. This is the only form: an
+> effect is not a global, and naming one as a free variable is a
+> `ReferenceError`. The model is
+> [`architecture/package-isolation.md`](architecture/package-isolation.md).
 
 
 > **Status:** SHIPPED (2026-06-03). All phases of the implementation plan
@@ -84,10 +83,11 @@ case; everything else is opt-in via additional named exports.
 **Every export the platform invokes receives one argument: the
 activation.** Destructure what you need.
 
-The same names are also still bound as globals, so the ambient spellings
-in the examples further down keep working — that is the migration, not
-the contract. Write new code against the parameter: the globals go away,
-and when they do, a capability you were not handed is simply not there.
+These names are **not** globals. A capability you were not handed is not
+there to reach for — naming one as a free variable is a `ReferenceError`,
+not a silent `undefined` you discover three frames later. That is the
+whole point: what an activation can do is decided where it is assembled,
+and is legible at the signature.
 
 ```js
 export default async ({ request, response, kv, webhook }) => {
