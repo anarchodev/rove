@@ -1,13 +1,15 @@
 # The effect algebra
 
-> **Effects are received, not ambient.** This doc spells them as globals
-> throughout; they arrive as a destructured parameter — see
-> [`handler-shape.md`](handler-shape.md) §1.1 for the form, and
+> **Effects are received, not ambient.** Some prose below still spells a
+> primitive as a bare name for readability; every one of them arrives as a
+> destructured parameter — see [`handler-shape.md`](handler-shape.md) §1.1
+> for the form and
 > [`architecture/package-isolation.md`](architecture/package-isolation.md)
-> (tracker #753) for the arc. The algebra is unchanged — the same four
-> primitives, reached differently — but the classification rule there is
-> what decides whether a *new* effect is ambient or granted: if it can
-> reach outside the module, it is a capability.
+> for the model. The algebra is unchanged — the same four primitives,
+> reached differently — and the classification rule there is what decides
+> whether a *new* effect is ambient or granted: **if it can reach outside
+> the module, it is a capability**, and a capability is passed, never
+> installed.
 
 
 > **Status**: principles — the effect model every shipped or proposed

@@ -275,9 +275,24 @@ makes the entry fit.
 - **Decision** (shipped 2026-05-24, `b908953`, net −4.7 kLOC Zig): there is **one
   outbound HTTP primitive** (`http.fetch`). `webhook.send` / `email.send` /
   `retry.*` are JS standard-library shims that compose durability on top of it
-  (`kv.set` owed-marker + `http.fetch` + a durable scheduled wake, §3.7). The
+  (a kv owed-marker + `http.fetch` + a durable scheduled wake, §3.7). The
   dedicated `http.send` Zig primitive, the schedule envelopes, the leader-local
   `SendDispatch`, and later the per-feature owed sweep were all retired.
+- **Amendment (rove#864, with the capability cutover)**: the shims' marker
+  writes are no longer *ordinary* `kv.set` calls, and the wording above is
+  amended to say so. Under the received-capability model a durability shim is
+  a **facet** (`package-isolation.md` §3.3b): the engine's invoker constructs
+  it over a kv **rooted at its own namespace** (`_send/`, `_blob/`,
+  `_dispatch/`, `_sched/`) — a view the handler never holds and cannot
+  construct. The **claim is untouched**: durability is still composed in
+  JavaScript over the four primitives, not from Zig primitives, and a facet is
+  still JS composing over a kv. Only the *door* changed — from a shim writing
+  the handler's own kv under a policed-prefix exception, to a shim writing
+  through a narrowed capability, with the exception mechanism deleted
+  (rove#862). This is an amendment, not a retraction, and it is named here so
+  the point resolves *by* the capability arc rather than being rediscovered
+  after it (rove#814).
+
 - **Inputs durable / outputs derivable**: `blob.put` / `blob.get` are likewise
   **JS shims, not Zig Cmd primitives** — the marker key holds a pointer
   (`{saga_id, seq, call_index, dest_key}`), never the bytes; recovery is

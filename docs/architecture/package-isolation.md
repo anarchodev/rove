@@ -182,6 +182,86 @@ Passing raw authority stays possible, because a package may genuinely need
 open egress and the model must be able to express that. It just stops
 being the shortest thing to type (§4.3).
 
+### 3.3a Who receives what — the per-origin table
+
+Which set an activation holds is decided **at assembly, by code origin**,
+and never consulted again — there is no runtime discrimination to get
+wrong. Two templates exist, plus the narrowed views a facet's factory is
+handed.
+
+| Origin | Receives | Kv it holds |
+|---|---|---|
+| Customer handler, and any package it imports | `__rove.caps` — the nine capability names (§3.1) | `kv`, **rooted**: every key it names resolves under `_user/` |
+| Baked `__system/*` module | `__rove.capsSystem` — the same set minus `kv`, plus `__system` | `__system.rootKv`, **raw**: storage as it lies, and it spells the user root explicitly when it wants a row a handler named |
+| A facet (§3.3b) | exactly what its factory was handed | a **namespace-rooted** view (`_send/`, `_blob/`, `_dispatch/`, `_sched/`) — keys resolve under that root and come back in the holder's spelling |
+
+Two consequences worth stating, because both replace machinery that used
+to exist:
+
+- **A baked module holds ONE kv.** Handing it both spellings is the
+  writer/reader prefix-depth hazard: the same row nameable at two depths,
+  and the mismatch surfaces as a scan that silently misses. One kv per
+  module, and the root written out where it is meant.
+- **The engine keyspace is not reserved — it is unnameable.** A handler's
+  keys resolve under its root, so a key it spells `_usage/x` is its own
+  row and the engine's meter is untouched. The reserved-prefix lists and
+  the predicates that policed them are deleted (rove#862); what a
+  capability *is* replaced what a check had to *decide*.
+
+### 3.3b The facet/package criterion
+
+A `@rewind/*` module is one of two things, and the difference is not
+first-partyness:
+
+> **A module that needs authority its caller lacks is a FACET: it is
+> constructed by a factory over capabilities the caller never receives.
+> A module that needs no more than its caller is a PACKAGE: it receives
+> what it needs as a parameter, from the caller's own grant.**
+
+Being first-party buys no ambient reach — a package takes caps as its
+first argument like any other function (`users.create({ kv }, input)`),
+and its authority is a subset of the handler's, visible in source at the
+call site.
+
+A facet is the exception the rule has to express. `webhook.send` writes a
+durable `_send/owed/{id}` marker, and the shim's kv is **rooted at
+`_send/`** — a view the handler never holds and cannot construct, because
+the invoker built it from the native slice, not from the handler's kv.
+That is what makes the durability composable in JS without the handler
+being able to forge the platform's half of it.
+
+The criterion is what settles cases the tree previously duplicated:
+`schedule` existed twice — as the private `_system.sched` core and as the
+`@rewind/schedule` package writing the same rows — because there was no
+stated rule to pick one. Under the criterion it resolves: the core writes
+platform-rooted markers, so it is a **facet** (`sched`, constructed by
+the invoker, never installed anywhere), and the customer-facing verb is
+the **package**. The duplicate collapses.
+
+### 3.3c The factory shape — a parameter beats capture-then-delete
+
+A shim is a **factory**: `__rove_factories.<name> = function (caps) { …
+return surface; }`. Evaluating the file registers it; the engine's one
+invoker (`globals/_invoke.js`, shared verbatim by the worker, the CLI sim
+and the browser arena) calls each with exactly its slice and installs the
+result on the activation template.
+
+The shape it replaced was an IIFE that captured `_system.*` at eval and
+relied on a later `delete globalThis._system` to hide the door. That is
+strictly weaker, and it failed **measurably**: a handler read `sysHttp`
+as a live object while `_system` was correctly `undefined`, because the
+IIFE's top-level `const`s landed in the base context's global lexical
+scope — shared by every request the worker serves, whatever tenant. The
+same channel let a handler write `STD_LOOKUP[0]` in `globals/base64.js`
+(rove#748).
+
+A parameter is scoped by the language. A factory has no module-scope
+bindings for a handler to resolve, its capabilities exist only inside the
+closure the engine invoked, and there is no window during which anything
+is reachable and later hidden — which is why `_system` is now built
+**detached** and never installed at all (§4.1). Delete-after-the-fact
+hides a name; not installing removes it.
+
 ### 3.4 The audit — effects hiding on data objects
 
 `request` is documented as a data shape. Three of its members are not:
@@ -254,10 +334,20 @@ adding one.** An earlier draft denied ambient names only inside `/pkg/`
 via an injected module prologue; that machinery exists only if the handler
 keeps ambient authority, and it dissolves once nothing is ambient (§10).
 
-What changes instead is the shims: `globals/*.js` assemble the activation
-object rather than assigning to `globalThis`, and `installRequest` hands it
-to the entry export. The `_system.*` internal ABI and the baked
-`__system/*` privileged surface are untouched.
+What changed instead is the shims: `globals/*.js` are factories (§3.3c)
+whose returns the invoker installs on the activation template, and
+`installRequest` hands each activation an object with that template as its
+prototype.
+
+**`_system` is not installed either.** The worker builds the native ABI on
+a **detached** object and passes it to the invoker as an argument, so
+there is no phase in which handler code could name it and no
+`delete globalThis._system` to sequence — the pre-harden/post-harden
+distinction that used to shape this file's reasoning is gone from the
+model entirely. The offline engines assemble their recorder `_system` for
+construction and drop it before the base freezes; observationally the
+same surface. The baked `__system/*` privileged surface is reached
+through the system template (§3.3a), not through a global.
 
 ### 4.2 Realm hardening
 
@@ -335,6 +425,17 @@ show the narrowed form so the ecosystem copies it.
 The shape is already proven in-tree: `platform.scope(id)` returns a
 `{kv:{get,prefix,set,delete}}` bound to one instance — an attenuator on
 the admin surface.
+
+**Two layers, and they are different operations.** `scoped(prefix)` here
+is a **restricting** attenuator: it narrows what an already-rooted holder
+may reach, and the keys it refuses were nameable before. The capability
+root (§3.3a) is a **rerooting** one: it does not refuse a key, it changes
+which row a key *means*, so nothing outside the root is nameable to
+begin with. They compose without interacting — a facet's namespace-rooted
+view is a reroot inside the tenant's own space, and §4.3's
+intersect-never-replace invariant applies to restricting attenuators
+exactly as written. Neither layer weakens the other, and confusing them
+is how someone eventually argues one makes the other redundant.
 
 **Invariant: narrowing intersects, never replaces.** If an attenuated
 object still exposes `to()`, a package handed `http.to("api.stripe.com")`

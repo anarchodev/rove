@@ -314,8 +314,10 @@ naming layer is the customer's kv (decisions.md §3.8). Engine pieces:
   `src/js/fetch_engine.zig`) rewrites + SigV4-signs in-process — tenant prefix
   from `pf.tenant_id`, keys never reachable from JS, no extra hop or listener.
   `blob.url` presigns the same way (timestamp from the **taped clock**, so
-  replay reproduces the URL bit-for-bit). `_blob/` markers are ordinary
-  customer kv, deliberately not platform-reserved (the `_send/` rule).
+  replay reproduces the URL bit-for-bit). `_blob/` markers are rows in the
+  tenant's own keyspace, written by the blob shim through a kv **rooted at
+  `_blob/`** — the durability-facet shape (`package-isolation.md` §3.3b),
+  the same as `_send/`.
 - **Upload sessions** (`blob.write`/`seal`): a capped Zig-side buffer (64 MiB,
   2/tenant, 120 s idle-TTL sweep) on the worker-owned `blob_sessions`
   collection, keyed `(tenant, saga_id)`, **connection-scoped** — one
