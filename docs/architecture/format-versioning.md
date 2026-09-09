@@ -167,23 +167,25 @@ in lockstep with the JS-side `rtap.mjs` parser.
 
 Each `_`-prefixed namespace is an implicit format, and none carries a version
 field. The reservation itself is blanket rather than enumerated: `kv.set` /
-`kv.delete` from customer or shim JS refuse **every** leading-`_` key except the
-shim-writable exceptions, so the platform can claim a new `_…/` family later
-without colliding with customer data (`src/reserved/root.zig`
-`isCustomerWriteReserved`).
+the platform can claim a new `_…/` family later without colliding with customer
+data — but not because writes to it are refused. A handler's capability is
+**rooted** (`src/reserved/root.zig` `USER_KEY_ROOT`): every key it names
+resolves under `_user/`, so the platform's keyspace is not reserved from it, it
+is unnameable by it. The predicate lists that used to police this are retired
+(rove#862); what survives is the distinction between WHO writes a namespace,
+which is what its versioning story inherits from:
 
-Three lists in `src/reserved/root.zig` carve that keyspace up, and a namespace's
-list membership is what its versioning story will inherit from:
-
-- `PLATFORM_KV_PREFIXES` — the catalog of known platform-owned namespaces,
-  used for the bidirectional trigger-prefix collision check.
-- `SHIM_WRITABLE_PREFIXES` — the exceptions: prefixes platform JS *libraries*
-  write from ordinary handler context. Platform-managed but not
-  platform-reserved; a tenant that writes one corrupts only its own durability
-  markers.
-- `ENGINE_ONLY_PREFIXES` — keys a handler cannot even *see*; a read behaves as
-  though the key is absent. This is what lets an engine write to them without
-  an activation or a log record, since nothing a handler observes ever moved.
+- **shim-written** — a platform JS *library* writes it from ordinary handler
+  context, so the rows land in the tenant's own rooted keyspace. Platform-
+  managed but not platform-owned: a tenant can author the same rows, and one
+  that does corrupts only its own durability markers.
+- **engine-written** — platform Zig writes it below the JS bindings, outside
+  any handler's root. A handler cannot observe these rows at all (a key it
+  spells the same way is its own row), which is what lets the engine write
+  them with no activation and no log record: nothing a handler observes moved.
+- **baked-written** — a `__system/` module writes it holding the storage-rooted
+  `rootKv`, spelling the user root explicitly when the row is one a handler
+  named (rove#848).
 
 | Key | Value | Class | Producer | Notes |
 |---|---|---|---|---|
@@ -527,7 +529,16 @@ API shapes → wire/disk formats (Part I).**
 
 ## 7. The pre-customer freeze list
 
-### 7.1 KV namespace reservation — **CRITICAL, do now**
+### 7.1 KV namespace reservation — **RESOLVED (rove#862), by a different mechanism**
+
+> **Status.** This item is closed, and not the way it proposed. The concern —
+> that a customer could claim a `_…/` family the platform would want later —
+> is answered by ROOTING rather than by reservation: a handler's capability
+> resolves every key it names under `_user/`, so the platform keyspace is
+> unnameable from handler code and there is nothing to reserve. The
+> allowlist and the four predicates below are deleted; the finding is kept
+> because the reasoning about why the enumerated list was insufficient is
+> what motivated the root. Original text follows.
 
 `src/js/reserved.zig:82-92` (the module now lives at `src/reserved/root.zig`)
 reserves only **9 enumerated prefixes** from customer

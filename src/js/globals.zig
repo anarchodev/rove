@@ -650,9 +650,9 @@ pub const DispatchState = struct {
     stream_pending_bytes: usize = 0,
     /// True ⇒ the dispatched module is a `__system/`
     /// built-in (e.g. the webhook shim's `webhook_onresult.mjs`).
-    /// `isCustomerWriteReserved` is skipped so the shim can write
-    /// `_send/owed/{id}` markers; customer modules see false and
-    /// the reserved-prefix check applies. Set by
+    /// It selects the SYSTEM capability template — one kv, the
+    /// storage-rooted `rootKv`, whose natives gate on this flag; a
+    /// customer activation gets the rooted `kv` instead. Set by
     /// `Dispatcher.runOutcome` from `Request.is_system_module`.
     is_system_module: bool = false,
     /// Resolved session id (see `Request.session_id`). 64 lowercase hex

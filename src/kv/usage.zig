@@ -46,11 +46,13 @@
 //!
 //! ## Tamper
 //!
-//! `_usage/` is outside `SHIM_WRITABLE_PREFIXES` (`src/reserved/root.zig`), so
-//! customer and shim JS get `reserved_key` on any write to it, and only
-//! platform Zig — which bypasses the JS bindings — writes rows. The `_blob/`
-//! durability markers beside it are deliberately shim-writable; a meter cannot
-//! be.
+//! `_usage/` is UNNAMEABLE from handler JS: a handler's capability is rooted
+//! (`reserved.USER_KEY_ROOT`), so a write it spells as `_usage/…` lands on its
+//! own `_user/_usage/…` row and the meter is untouched — the boundary is the
+//! shape of the capability, not a predicate consulted per write. Only platform
+//! Zig, which writes below the bindings, reaches these rows. The `_blob/`
+//! durability markers beside it ARE the tenant's own, which is exactly the
+//! difference: a marker is the tenant's to forge, a meter is not.
 
 const std = @import("std");
 const kvstore = @import("kvstore.zig");

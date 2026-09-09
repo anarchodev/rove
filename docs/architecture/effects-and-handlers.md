@@ -81,8 +81,9 @@ size (blob bytes) → pointer-in-marker + re-execution.
 
 The shims run as ordinary customer JS, so the platform cannot tell a shim's
 call from a handler's — that is the cost of composing durability in JavaScript,
-and it is why the shim-written key prefixes are customer-writable
-(`reserved.zig`'s `SHIM_WRITABLE_PREFIXES`). The same indistinguishability
+and it is why the shim-written key prefixes are ordinary keys in the
+handler's own rooted keyspace rather than a policed exception. The same
+indistinguishability
 reaches the baked `__system/` modules: the engine grants `is_system_module`
 from the module **path**, so anything a tenant can name, a tenant can run
 privileged, with a ctx it chose.

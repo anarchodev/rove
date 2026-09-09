@@ -4455,8 +4455,6 @@ test "triggerPathToPrefix: non-trigger paths return null" {
     try std.testing.expectEqual(@as(?[]const u8, null), deployment_cache.triggerPathToPrefix("_triggers/users/index.ts"));
 }
 
-// `isReservedTriggerPrefix` tests live alongside the helper in reserved.zig.
-
 pub const ADMIN_SESSION_COOKIE = auth.ADMIN_SESSION_COOKIE;
 
 // ── Tests ──────────────────────────────────────────────────────────────
