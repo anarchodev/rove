@@ -161,6 +161,15 @@ const MODULES = [_]struct {
         .src = @embedFile("builtin_root_kv_install_mjs"),
     },
     .{
+        // rove#852: typed READS of the root store (instances, domains) —
+        // the read twin of root_kv_install, dispatched by the admin app
+        // against `__root__`. Retires `platform.root.get` /
+        // `platform.root.prefix`: every caller was a query wearing a kv
+        // costume, and a rooted door cannot reach these raw rows anyway.
+        .path = "__system/root_query.mjs",
+        .src = @embedFile("builtin_root_query_mjs"),
+    },
+    .{
         // rove#715: a `domain/{host}` alias, written by `__root__` in its
         // own scope — dispatched by `/_system/v2-domain` after the CP
         // authenticates; cluster routing state stops riding another

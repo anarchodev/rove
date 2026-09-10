@@ -622,6 +622,38 @@
             }
             status = 204;
           }
+        } else if (module === "__system/root_query") {
+          // The read twin (rove#852). Root-scope only, same reasoning as
+          // the writer: these rows are raw, and a tenant target's raw
+          // keyspace is unrepresentable in the sim's flattened per-instance
+          // store.
+          if (tenant !== "__root__") throw new TypeError("platform.dispatch: root_query is only modeled against __root__ offline");
+          var q = {};
+          if (msg.instances) {
+            var ins = [];
+            rootStore_r.forEach(function (_v, k) {
+              if (k.indexOf("instance/") === 0) ins.push(k.slice("instance/".length));
+            });
+            q.instances = ins.sort();
+            q.more = false;
+          }
+          if (typeof msg.instance === "string" && msg.instance.length > 0) {
+            q.instance_exists = rootStore_r.get("instance/" + msg.instance) !== undefined;
+          }
+          if (msg.domains) {
+            var dom = [];
+            rootStore_r.forEach(function (v, k) {
+              if (k.indexOf("domain/") === 0) dom.push({ host: k.slice("domain/".length), instance_id: v });
+            });
+            dom.sort(function (a, b) { return a.host < b.host ? -1 : a.host > b.host ? 1 : 0; });
+            q.domains = dom;
+            q.more = false;
+          }
+          if (typeof msg.domain === "string" && msg.domain.length > 0) {
+            var dv = rootStore_r.get("domain/" + msg.domain);
+            q.domain_owner = dv === undefined ? null : dv;
+          }
+          body = JSON.stringify(q);
         } else if (module === "__system/root_kv_install") {
           // Only in root scope: at a TENANT target this module writes the
           // target's store RAW (below the user root), a spelling the sim's
@@ -630,8 +662,21 @@
           if (tenant !== "__root__") throw new TypeError("platform.dispatch: root_kv_install is only modeled against __root__ offline");
           var rp = Array.isArray(msg.pairs) ? msg.pairs : [];
           var rd = Array.isArray(msg.deletes) ? msg.deletes : [];
-          for (var ri = 0; ri < rp.length; ri++) rootStore_r.set(rp[ri].key, rp[ri].value);
-          for (var rj = 0; rj < rd.length; rj++) rootStore_r.delete(rd[rj].key);
+          var rq = Array.isArray(msg.requires) ? msg.requires : [];
+          var rfail = null;
+          for (var rk = 0; rk < rq.length; rk++) {
+            if (rootStore_r.get(rq[rk]) === undefined) { rfail = rq[rk]; break; }
+          }
+          if (rfail !== null) {
+            status = 409;
+            body = JSON.stringify({ error: "precondition failed", missing: rfail });
+          } else {
+            for (var ri = 0; ri < rp.length; ri++) rootStore_r.set(rp[ri].key, rp[ri].value);
+            for (var rj = 0; rj < rd.length; rj++) rootStore_r.delete(rd[rj].key);
+            // The writer reports what landed, so a caller confirms from the
+            // result row rather than reading root back (rove#852).
+            body = JSON.stringify({ wrote: rp.map(function (x) { return x.key; }), deleted: rd });
+          }
         } else {
           throw new TypeError("platform.dispatch: no offline model for " + module);
         }

@@ -1431,10 +1431,6 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
             .{ .name = "scope", .cfunc = platform_bindings.jsPlatformScope, .argc = 1 },
         },
     },
-    .{ .path = &.{ "_system", "platform", "root" }, .fns = &.{
-        .{ .name = "get", .cfunc = platform_bindings.jsPlatformRootGet, .argc = 1 },
-        .{ .name = "prefix", .cfunc = platform_bindings.jsPlatformRootPrefix, .argc = 3 },
-    } },
     .{ .path = &.{ "_system", "platform", "instances" }, .fns = &.{
         .{ .name = "deployStarter", .cfunc = platform_bindings.jsPlatformInstancesDeployStarter, .argc = 1 },
         .{ .name = "usage", .cfunc = platform_bindings.jsPlatformInstancesUsage, .argc = 1 },
@@ -1751,7 +1747,7 @@ test "lint(c): every native binding has a globals/ shim (Phase A)" {
 
     for (STATIC_NAMESPACES) |ns| {
         // The `_system` holder itself + nested paths
-        // (`_system.platform.root`) are covered by their top-level
+        // (`_system.platform.instances`) are covered by their top-level
         // shim (globals/platform.js). Pivot on the public segment.
         if (ns.path.len < 2 or !std.mem.eql(u8, ns.path[0], "_system")) continue;
         const public = ns.path[1];
@@ -1896,7 +1892,7 @@ test "cutover: effect names are absent from the global; the template holds them 
         \\  const t = globalThis.__rove.caps;
         \\  if (typeof t.kv !== "object" || typeof t.kv.get !== "function")
         \\    throw new Error("template kv missing/unwired");
-        \\  if (typeof t.platform !== "object" || typeof t.platform.root.get !== "function")
+        \\  if (typeof t.platform !== "object" || typeof t.platform.dispatch !== "function")
         \\    throw new Error("template platform missing/unwired");
         \\  if (typeof t.webhook !== "object" || typeof t.webhook.send !== "function")
         \\    throw new Error("template webhook missing/unwired");

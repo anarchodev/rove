@@ -12,16 +12,12 @@ export default function ({ platform }) {
     throws(() => platform.scope("some-tenant"), NOT_ADMIN);
   });
 
-  // root.set / root.delete / instances.create are GONE: root
-  // writes are dispatched activations in `__root__`'s own scope
-  // (platform.dispatch → __system/root_kv_install). The reads below are
-  // the whole remaining root surface.
-  check("platform.root.get", () => {
-    throws(() => platform.root.get("instance/x"), NOT_ADMIN);
-  });
-  check("platform.root.prefix", () => {
-    throws(() => platform.root.prefix("instance/", null, 10), NOT_ADMIN);
-  });
+  // `platform.root` is GONE ENTIRELY (rove#852). Root writes were already
+  // dispatched activations in `__root__`'s own scope (rove#715); the reads
+  // followed as typed queries (`__system/root_query`), because every caller
+  // was a query wearing a kv costume and a rooted door cannot reach raw
+  // root rows at all. There is no root surface left to claim — the absence
+  // is asserted by the reflector's two-way inventory, not here.
 
   check("platform.instances.deployStarter", () => {
     throws(() => platform.instances.deployStarter("acme"), NOT_ADMIN);

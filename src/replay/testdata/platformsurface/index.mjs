@@ -6,6 +6,5 @@ export default function ({ platform, http }) {
   response.status = 200;
   return {
     surface: { http: typeof http, platform: typeof platform, browser: typeof browser },
-    rootRead: platform.root.get("cfg/x"),                // reads the isolated root store
   };
 }

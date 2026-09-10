@@ -3,7 +3,10 @@
 // all succeed. `platform.compile` is ungated in both (door-side check in prod).
 import { scenario, expect } from "rewind:test";
 
-const GATED = ["scope", "root", "dispatch"];
+// `root` is not in this list: `platform.root` is GONE (rove#852), and an
+// absent name is not a gate — root reads are dispatched queries against
+// `__root__`, gated through `dispatch` like every other platform verb.
+const GATED = ["scope", "dispatch"];
 const NOT_ADMIN = /only available on the admin handler/;
 
 // Non-admin (default): the gated methods throw, compile still emits.

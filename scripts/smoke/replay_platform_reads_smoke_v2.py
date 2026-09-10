@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Cross-store reads are RECORDED — proven against a REAL capture, not a fixture.
 
-`platform.root.get/prefix` and `platform.scope(id).kv.get/prefix` return data to
-the handler, so they are inputs under the determinism boundary and must be taped
-or the activation is unreplayable. They are the first input class that leaves
-the activation's own tenant (a cross-raft-group read), so the kv channel — which
-is tenant-implicit — carries the STORE as a key prefix: `__rove_store/r/{key}`
-for the platform root store, `__rove_store/i/{id}/{key}` for another instance's.
+`platform.scope(id).kv.get/prefix` returns data to the handler, so it is an
+input under the determinism boundary and must be taped or the activation is
+unreplayable. It is the input class that leaves the activation's own tenant (a
+cross-raft-group read), so the kv channel — which is tenant-implicit — carries
+the STORE as a key prefix: `__rove_store/i/{id}/{key}`.
+
+The platform root store used to be the other half of this, under
+`__rove_store/r/{key}`. It no longer is: `platform.root.*` is gone (rove#852)
+and root reads are typed queries dispatched against `__root__`, which makes
+them ordinary same-store reads in THAT tenant's tape rather than cross-store
+reads in this one. The `r/` namespace has no producer left, so the scope door
+is the whole subject here.
 
 Why a smoke and not just a unit test: `docs/architecture/replay-and-sim.md` §5
 records the exact trap this guards. A programmatic fixture passed while a REAL
@@ -58,14 +64,13 @@ HANDLER_SRC = 'export default function ({ kv, platform }) { return "cross-read-o
 # them into the world's map, and the offline facade resolved them there.
 ADMIN_PROBE_SRC = """
 export default function ({ kv, platform }) {
-  const root = platform.root.get("probe/root");
   const scoped = platform.scope("REPLACE_TARGET").kv.get("probe/scoped");
   const rows = platform.scope("REPLACE_TARGET").kv.prefix("probe/p/", "", 10)
     .map(function (e) { return e.key + "=" + e.value; }).join(",");
-  const missing = String(platform.root.get("probe/absent"));
-  kv.set("probe/seen", root + "|" + scoped + "|" + rows + "|" + missing);
+  const missing = String(platform.scope("REPLACE_TARGET").kv.get("probe/absent"));
+  kv.set("probe/seen", scoped + "|" + rows + "|" + missing);
   response.status = 200;
-  return root + "|" + scoped + "|" + rows + "|" + missing;
+  return scoped + "|" + rows + "|" + missing;
 }
 """
 
@@ -223,7 +228,7 @@ def main() -> int:
         if live is None:
             print("\nFAIL platform-reads replay smoke (v2)")
             return 1
-        # `probe/root` was never written, so it reads null both live and on
+        # `probe/absent` was never written, so it reads null both live and on
         # replay — the point is that the two AGREE, not what the value is.
         print(f"    live body: {live.body!r}")
 
