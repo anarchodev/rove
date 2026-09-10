@@ -53,4 +53,13 @@ QJS_ARENA_WASM_ONLY=1 ROVE_ARENA_LIB="$ARCHIVE" emmake make -C "$BUILD_DIR" qjs_
 
 cp "$BUILD_DIR/qjs_arena_wasm.js" "$BUILD_DIR/qjs_arena_wasm.wasm" "$OUT_DIR/"
 sha256sum "$OUT_DIR/qjs_arena_wasm.js" "$OUT_DIR/qjs_arena_wasm.wasm" | sed "s|$OUT_DIR/||"
+
+# The provenance stamp, written HERE so that the only way to obtain a true
+# one is to have actually built the artifact it sits beside. Copy it to
+# rewind-apps with the .js/.wasm and commit all three together: the
+# conformance replay adapter reads it to decide whether the committed arena
+# was built from the sources in the checkout it is running from.
+python3 "$ROVE_ROOT/scripts/ops/arena_wasm_inputs.py" --write "$OUT_DIR"
+
 echo "== wasm arena built → $OUT_DIR =="
+echo "   copy qjs_arena_wasm.{js,wasm,inputs} into rewind-apps replay/_static/"

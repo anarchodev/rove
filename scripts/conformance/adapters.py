@@ -395,6 +395,7 @@ def _collect_sources(source_dir: Path) -> dict:
 # against the stale prelude anyway, turning one legible failure back into a
 # scatter of digest divergences.
 _PRELUDE_VERDICT: str | None | bool = False  # False = not yet checked
+_WASM_VERDICT: str | None | bool = False  # False = not yet checked
 
 
 def _check_prelude_fresh(apps: Path) -> None:
@@ -447,11 +448,70 @@ def _check_prelude_fresh(apps: Path) -> None:
     raise AdapterError(_PRELUDE_VERDICT)
 
 
+def _check_wasm_fresh(apps: Path) -> None:
+    """Fail if the committed wasm arena was built from different inputs.
+
+    The prelude check above guards the arena's JS half. This guards the
+    COMPILED half, which has the same cross-repo shape and a worse failure
+    mode: `qjs_arena_wasm.{js,wasm}` is committed in rewind-apps but built
+    from six rove Zig modules plus the pinned arenajs C sources, by an
+    explicit `zig build wasm-arena` that needs emsdk and is not part of
+    `test`. So the artifact is whatever was last copied over, and because it
+    is a compiled copy of the engine's own checks, a stale one does not fail
+    — it answers differently from the sim and the worker.
+
+    It has gone stale twice (rove#865). Once it kept a prefix table a change
+    had deleted, so the arena hid rows the rebuilt sim showed; once a
+    `rove-guards` change left it enforcing a rule the other two engines had
+    dropped. Both read as "the corpus pins deleted behaviour", which is the
+    wrong diagnosis, and both were legible only after checking the artifact's
+    provenance by hand with `strings` and `git log`.
+
+    So the artifact carries a stamp beside it — a digest over its inputs,
+    written by the build that produced it — and this compares the stamp to the
+    sources in the checkout being run from. It compares hashes and never
+    builds, so a contributor without emsdk gets this sentence rather than a
+    silent wrong answer.
+
+    An AdapterError, not `EngineUnavailable`, for the reason the prelude check
+    gives: a stale arena is not "this engine cannot run", it is "this engine
+    will quietly give wrong answers", which has to fail the gate. Skipping
+    replay instead would keep the corpus green while removing the only engine
+    that was going to disagree.
+    """
+    global _WASM_VERDICT
+    if _WASM_VERDICT is not False:
+        if _WASM_VERDICT is None:
+            return
+        raise AdapterError(_WASM_VERDICT)
+
+    stamp = REPO_ROOT / "scripts" / "ops" / "arena_wasm_inputs.py"
+    if not stamp.exists():
+        _WASM_VERDICT = None
+        return
+    proc = subprocess.run(
+        [sys.executable, str(stamp), "--check", str(apps)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if proc.returncode == 0:
+        _WASM_VERDICT = None
+        return
+    _WASM_VERDICT = (
+        "the replay engine's wasm arena was not built from this checkout's "
+        "sources, so its compiled checks are a different build's:\n"
+        f"    {(proc.stderr or proc.stdout).strip()[:600]}"
+    )
+    raise AdapterError(_WASM_VERDICT)
+
+
 def run_replay(world: dict, source_dir: Path, *, compared_headers) -> Outcome:
     apps = _apps_dir()
     if not shutil.which("node"):
         raise EngineUnavailable("node is not on PATH — it drives the WASM arena")
     _check_prelude_fresh(apps)
+    _check_wasm_fresh(apps)
 
     job = {
         "apps_dir": str(apps),
