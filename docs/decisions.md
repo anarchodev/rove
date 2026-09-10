@@ -292,6 +292,11 @@ makes the entry fit.
   (rove#862). This is an amendment, not a retraction, and it is named here so
   the point resolves *by* the capability arc rather than being rediscovered
   after it (rove#814).
+  The facet's reroot stops at the **tenant's** root: these namespaces are the
+  surface packages and handler parks compose on, so their depth is a published
+  contract and cannot be pushed below the binding. Stated with the evidence
+  under the restrict-vs-reroot rule (`package-isolation.md`, marker depth is a
+  published contract); rejected as rove#860.
 
 - **Inputs durable / outputs derivable**: `blob.put` / `blob.get` are likewise
   **JS shims, not Zig Cmd primitives** — the marker key holds a pointer
