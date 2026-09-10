@@ -21,7 +21,6 @@ expect(r.instanceKv("beta", "shared")).toBe("beta");
 // Seeds read back through the right facade.
 expect(r.body.ownSeed).toBe("own-seed");
 expect(r.body.acmeSeed).toBe("acme-old");
-expect(r.body.rootSeed).toBe("root-old");
 
 // Writes landed in the correct store; read-your-write within acme's store.
 expect(r.instanceKv("acme", "profile")).toBe("acme-new");

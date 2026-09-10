@@ -57,7 +57,10 @@ export default function ({ after, kv }) {
 # read the same scoped value; they differ only in a scoped WRITE's key and
 # value — interactions that were invisible to the digest before, so two
 # admin runs doing different things hashed alike. (The original vehicles,
-# `platform.root.set` and `instances.create`, are retired — root writes are
+# `platform.root` is GONE ENTIRELY (rove#852) — its reads are typed queries
+# dispatched against `__root__`, so the cross-store class this digest folds is
+# the scope door. Historically: `platform.root.set` and `instances.create` were
+# retired first — root writes are
 # dispatched activations now and the scoped write folds op +
 # target + key + value the same way.)
 PLATFORM_FIXTURE = {
@@ -66,7 +69,7 @@ export default function ({ platform }) {
   const q = request.query || "";
   const mode = q.includes("mode=b") ? "b" : "a";
   platform.scope("tgt").kv.set("_digest/probe-" + mode, mode === "b" ? "B" : "A");
-  platform.root.get("_digest/absent");            // a not-found cross-store read
+  platform.scope("tgt").kv.get("_digest/absent"); // a not-found cross-store read
   platform.scope("tgt").kv.get("profile");        // a cross-tenant read
   platform.scope("tgt").kv.prefix("p/", "", 10);  // and a cross-tenant scan
   response.status = 200;

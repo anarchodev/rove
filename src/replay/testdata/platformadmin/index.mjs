@@ -11,7 +11,9 @@ export default function ({ platform }) {
     catch (e) { out[name] = String((e && e.message) || e); }
   };
   probe("scope", () => platform.scope("acme").kv.get("x"));
-  probe("root", () => platform.root.get("x"));
+  // No `root` probe: `platform.root` is GONE (rove#852), and an absent
+  // name is not a gate — root reads are dispatched queries against
+  // `__root__`, gated like any other platform.dispatch (below).
   // releases.publish is RETIRED — the flip is a dispatched activation
   // (`__system/release_flip`); its gating rides the dispatch probe below.
   probe("dispatch", () => platform.dispatch("acme", "__system/scope_kv",

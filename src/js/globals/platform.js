@@ -20,9 +20,14 @@
 // core, and a marker kv namespace-rooted at `_dispatch/`.
 
 /**
- * Admin control plane: cross-tenant kv access, the platform root
- * store, instance lifecycle, and root-token auth. Only
- * usable from the `__admin__` handler.
+ * Admin control plane: cross-tenant kv access, instance lifecycle, and
+ * cross-tenant dispatch. Only usable from the `__admin__` handler.
+ *
+ * The platform root store is NOT here. Its reads are typed queries
+ * dispatched against `__root__` (`__system/root_query`) and its writes
+ * are dispatched activations in the same scope, so root state takes a
+ * position in the root log rather than riding this handler's — one way
+ * to do cross-tenant (rove#852, rove#715).
  *
  * @namespace platform
  */
@@ -286,35 +291,6 @@ __rove_factories.platform = function (caps) {
         "http://rove-compile.internal/",
         { method: "POST", body, ctx: opts.ctx, on: opts.on || "onFetchResult" },
       );
-    },
-
-    /**
-     * The platform root store (`__root__.db`) — instance / domain /
-     * user / account metadata.
-     *
-     * @namespace platform.root
-     */
-    root: {
-      /**
-       * @param {string} key
-       * @returns {string|null} The value, or `null` if absent.
-       * @example const acct = JSON.parse(platform.root.get(`account/${id}`));
-       */
-      get(key) {
-        return sys.root.get(key);
-      },
-      /**
-       * Prefix scan of the root store. Same pagination contract as
-       * {@link kv.prefix} (limit default 100, max 1000).
-       * @param {string} prefix
-       * @param {string} [cursor]
-       * @param {number} [limit=100]
-       * @returns {Array<{key:string,value:string}>}
-       * @example const all = platform.root.prefix("instance/", null, 1000);
-       */
-      prefix(prefix, cursor, limit) {
-        return sys.root.prefix(prefix, cursor, limit);
-      },
     },
 
     /**

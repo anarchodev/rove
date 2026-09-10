@@ -4807,7 +4807,7 @@ const PlatformFixture = struct {
     }
 };
 
-test "dispatch: platform.root + scope reads are taped under __rove_store/, keyed by store" {
+test "dispatch: a cross-store scope read is taped under __rove_store/, keyed by store" {
     // #410: a cross-store read returns data to the handler, so it is an input
     // and must be recorded — the first input class that leaves the activation's
     // own tenant. The kv channel is tenant-implicit, so the STORE rides as a
@@ -4824,7 +4824,6 @@ test "dispatch: platform.root + scope reads are taped under __rove_store/, keyed
     var pf = try PlatformFixture.init(testing.allocator);
     defer pf.deinit();
     try pf.tenant.createInstance("acme");
-    try pf.tenant.root.put("account/acme", "ROOTVAL");
     const inst = (try pf.tenant.getInstance("acme")).?;
     // Seeded at the STORE depth: `platform.scope(id).kv` answers what a handler
     // of `id` sees, so it resolves under the root like that handler's own kv.
@@ -4839,10 +4838,9 @@ test "dispatch: platform.root + scope reads are taped under __rove_store/, keyed
         kv,
         \\const s = platform.scope("acme");
         \\return [
-        \\  platform.root.get("account/acme"),
         \\  s.kv.get("profile"),
         \\  s.kv.prefix("p/", null, 10).map((e) => e.key + "=" + e.value).join(","),
-        \\  String(platform.root.get("account/ghost")),
+        \\  String(s.kv.get("nope")),
         \\].join("|");
     ,
         .{
@@ -4854,14 +4852,13 @@ test "dispatch: platform.root + scope reads are taped under __rove_store/, keyed
     );
     defer resp.deinit(testing.allocator);
     // The handler still sees exactly what it saw before — taping is additive.
-    try testing.expectEqualStrings("ROOTVAL|SCOPEDVAL|p/1=one|null", resp.body);
+    try testing.expectEqualStrings("SCOPEDVAL|p/1=one|null", resp.body);
 
-    // Root read → the `r` namespace.
-    const root_hit = tapedKv(&rs, "__rove_store/r/account/acme") orelse
-        return error.RootReadNotTaped;
-    try testing.expectEqual(tape_mod.KvOp.get, root_hit.op);
-    try testing.expectEqual(tape_mod.KvOutcome.ok, root_hit.outcome);
-    try testing.expectEqualStrings("ROOTVAL", root_hit.value);
+    // The `r` namespace (the platform root store) has no producer any
+    // more: root reads are typed queries dispatched against `__root__`
+    // (rove#852), so they are ordinary same-store reads in that tenant's own
+    // tape rather than a cross-store read in this one. The scope door is the
+    // remaining cross-store class, and the one this pins.
 
     // Scoped read → the `i/{id}` namespace, so two instances can't collide.
     const scoped_hit = tapedKv(&rs, "__rove_store/i/acme/profile") orelse
@@ -4870,7 +4867,7 @@ test "dispatch: platform.root + scope reads are taped under __rove_store/, keyed
 
     // A not_found is recorded as such — replay must reproduce the null, or a
     // handler's `if (!x)` branch diverges.
-    const missing = tapedKv(&rs, "__rove_store/r/account/ghost") orelse
+    const missing = tapedKv(&rs, "__rove_store/i/acme/nope") orelse
         return error.MissingReadNotTaped;
     try testing.expectEqual(tape_mod.KvOutcome.not_found, missing.outcome);
 

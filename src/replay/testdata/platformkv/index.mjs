@@ -1,6 +1,6 @@
-// platform.* per-store kv isolation. An admin-style handler touches four
-// distinct stores — its own tenant kv, two instances (via platform.scope), and
-// the platform root — writing the SAME key "shared" to each. In the sim these
+// platform.* per-store kv isolation. An admin-style handler touches three
+// distinct stores — its own tenant kv and two instances (via platform.scope)
+// — writing the SAME key "shared" to each. In the sim these
 // are isolated (namespaced under __rove_store/{tag}/), so no write bleeds across
 // stores, and seeded values read back through the right facade.
 export default function ({ kv, platform }) {
@@ -13,15 +13,15 @@ export default function ({ kv, platform }) {
 
   platform.scope("beta").kv.set("shared", "beta");
 
-  const rootSeed = platform.root.get("cfg"); // seeded in the root store
-  // (root WRITES are dispatched activations, so the root store here is
-  // read-only surface; the isolation matrix covers the writable facades.)
+  // The platform root store is not reachable from a handler at all now
+  // (rove#852) — both its reads and its writes are dispatched activations in
+  // `__root__`'s own scope. The isolation matrix below is the writable
+  // facades, which is what this fixture is about.
 
   return {
     ownShared: kv.get("shared"),       // "own" — untouched by scoped/root "shared"
     ownSeed: kv.get("seed-own"),        // seeded in tenant kv
     acmeSeed,                           // read back the acme seed
     acmeShared: acme.kv.get("shared"),  // read-your-write inside acme's store → "acme"
-    rootSeed,                           // read back the root seed
   };
 }

@@ -8,7 +8,7 @@
 // Canonical name grammar (tests claim these exact spellings):
 //   ns.prop            own public prop of an object namespace (one
 //                      nested level for plain-object props, e.g.
-//                      platform.root.get)
+//                      platform.instances.usage)
 //   name()             a callable global itself (schedule, cron, next,
 //                      btoa, atob)
 //   Name()             a constructible web-standard class
