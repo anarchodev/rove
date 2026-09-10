@@ -437,6 +437,48 @@ intersect-never-replace invariant applies to restricting attenuators
 exactly as written. Neither layer weakens the other, and confusing them
 is how someone eventually argues one makes the other redundant.
 
+**And the facet's reroot stops at the tenant's root — marker depth is a
+published contract.** A facet's namespace view (`rooted("_sched/")` and its
+siblings) composes *on top of* the handler's rooted kv, so `_sched/by_id/x`
+resolves to `_user/_sched/by_id/x`. It is tempting to push it one level
+further — below the binding, at storage depth — on the reasoning that these
+are the shim's private bookkeeping and the engine should commit to no format
+a tenant can read. **That is not available, and the reasoning is wrong
+twice.**
+
+Wrong first because the engine commits to no marker *value* format today:
+both readers parse a key and nothing else (`durable_wake.zig` takes the
+padded timestamp out of the `_sched/by_time/` key, whose value is `""`;
+`owed_retry.zig` matches the `_send/owed/` prefix and never opens the JSON).
+The value shapes live in JS behind versioned `__rove.formats.*`. There is no
+commitment to withdraw.
+
+Wrong second because these namespaces are the **composition surface**, not
+private state. The composition works *because* a handler can name the marker
+in its own keyspace:
+
+- a handler parks on `_dispatch/owed/{id}` — and on `_send/owed/{id}` to get
+  read-after-write on a send — through its own kv, and the park releases when
+  the marker is deleted. Park key and releasing delete must resolve to the
+  same row.
+- `@rewind/schedule` and `@rewind/export` are **packages**: by §3.3b they hold
+  only their caller's caps, so they arm a wake by writing the two `_sched/`
+  rows through the caller's kv. `parseByTimeWhenNs` is depth-exact and is the
+  engine's only reader.
+- baked `__system/*` readers hold the storage-rooted `rootKv` and spell the
+  user root explicitly for exactly this reason (§4.1).
+
+So the rule: **the facet/package criterion (§3.3b) decides who CONSTRUCTS a
+surface; marker depth decides who can COMPOSE on it.** They are different
+axes, and the criterion does not imply the move. Before re-rooting any
+reserved namespace, look for writers and readers outside the owning shim —
+`src/js/packages/`, the first-party apps, and `after.kv(` park registrations.
+Any hit means the depth is load-bearing. Lowering it converts those packages
+into facets and deletes the park-on-marker pattern, which is a far larger
+decision than a format cleanup and contradicts `decisions.md` §3.3
+(durability is composed in JS). Rejected as rove#860; the evidence is on the
+issue.
+
 **Invariant: narrowing intersects, never replaces.** If an attenuated
 object still exposes `to()`, a package handed `http.to("api.stripe.com")`
 calls `.to("attacker.example")` and walks out. `to()` on an
