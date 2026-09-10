@@ -253,14 +253,16 @@ fn runOne(
     }
 }
 
-test "dispatch: scope_kv (baked) speaks the named view — user rows rooted, engine rows raw, raw writes refused" {
-    // The named-view mapping is the module's whole job (the successor of
-    // the scoped door's `SCOPE_RAW_PREFIXES` rule): a key the caller names
-    // resolves the way the target handler's own kv does — under the user
-    // root, except the engine-written rows. A mapping bug here is the
-    // writer/reader prefix-depth split, which only ever surfaces as an
-    // empty page far from the cause — so the real embedded source is
-    // exercised against real storage.
+test "dispatch: scope_kv roots EVERY named key; the engine rows are a typed verb, not a spelling" {
+    // The named-view mapping is the module's whole job: a key the caller
+    // names resolves the way the target handler's own kv does — under the
+    // user root, with NO exception a spelling can reach (rove#850). The
+    // engine's unrooted rows are answered by the typed `release` request
+    // instead, which is the difference between a facet and an escape: a
+    // verb answers one question, a prefix carve-out answers whatever a
+    // caller spells. A mapping bug here is the writer/reader prefix-depth
+    // split, which only ever surfaces as an empty page far from the cause
+    // — so the real embedded source is exercised against real storage.
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -305,13 +307,18 @@ test "dispatch: scope_kv (baked) speaks the named view — user rows rooted, eng
     }.go;
 
     var resp = try run(&d, kv, bytecode,
-        \\{"ctx":{"gets":["orders/1","_deploy/current"],"prefixes":[{"prefix":""}],"pairs":[{"key":"note","value":"n"}]}}
+        \\{"ctx":{"gets":["orders/1","_deploy/current"],"prefixes":[{"prefix":""}],"pairs":[{"key":"note","value":"n"}],"release":true}}
     );
     defer resp.deinit(testing.allocator);
     try testing.expectEqual(@as(u16, 200), resp.status);
-    // Both gets answered — the named row through the root, the engine row raw.
+    // The named row answers through the root.
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"orders/1\":\"A\"") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.body, "\"_deploy/current\":\"0abc\"") != null);
+    // NAMING the engine row reaches the tenant's own `_user/_deploy/current`,
+    // which does not exist — a spelling buys nothing. This is the assertion
+    // that inverted: the escape used to answer it with the engine's value.
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"_deploy/current\":null") != null);
+    // The typed verb is the one path to the engine's row, and it answers.
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"dep_id\":\"0abc\"") != null);
     // The "" scan pages the USER keyspace: rows come back in the named
     // spelling, and the engine row was never in the range.
     try testing.expect(std.mem.indexOf(u8, resp.body, "_user/") == null);
@@ -323,15 +330,20 @@ test "dispatch: scope_kv (baked) speaks the named view — user rows rooted, eng
     defer testing.allocator.free(wrote);
     try testing.expectEqualStrings("n", wrote);
 
-    // A write that names an engine row is refused before anything lands.
-    var refused = try run(&d, kv, bytecode,
+    // A write that NAMES an engine row no longer needs refusing: it roots
+    // like any other, so it lands on the tenant's own row and the engine's
+    // is untouched. The rule became unreachable instead of enforced.
+    var named_write = try run(&d, kv, bytecode,
         \\{"ctx":{"pairs":[{"key":"_deploy/current","value":"clobber"}]}}
     );
-    defer refused.deinit(testing.allocator);
-    try testing.expectEqual(@as(u16, 400), refused.status);
+    defer named_write.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), named_write.status);
     const cur = try kv.get("_deploy/current");
     defer testing.allocator.free(cur);
-    try testing.expectEqualStrings("0abc", cur);
+    try testing.expectEqualStrings("0abc", cur); // the ENGINE row is intact
+    const own = try kv.get(uk("_deploy/current"));
+    defer testing.allocator.free(own);
+    try testing.expectEqualStrings("clobber", own); // the tenant's own row took it
 }
 
 /// Test helper. The JS-shim `webhook.send` writes

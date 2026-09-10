@@ -30,6 +30,8 @@ Needs S3 env: `set -a; . ./.env; set +a` first.
 from __future__ import annotations
 
 import json
+import time
+import urllib.parse
 import sys
 from pathlib import Path
 
@@ -54,8 +56,17 @@ PROBE = (
     + 'export function sset({ platform }){ platform.scope("__admin__").kv.set("k/self","SELF"); return "ok"; }\n'
     + 'export function sget({ platform }){ return JSON.stringify({v: platform.scope("__admin__").kv.get("k/self")}); }\n'
     + 'export function sdel({ platform }){ platform.scope("__admin__").kv.delete("k/self"); return "ok"; }\n'
-    # release history (read back the keys the __admin__ release wrote)
-    + 'export function rel({ platform }){ return JSON.stringify(platform.scope("__admin__").kv.prefix("_release/","",100)); }\n'
+    # Release history. The engine's `_release/` rows carry no root, so they
+    # are NOT reachable by naming them through the scoped door any more
+    # (rove#850 deleted that spelling escape). They are read through the
+    # typed `release` request on the dispatched scope_kv — the same path
+    # the dashboard's /v1/deployments uses, so this leg now exercises the
+    # real one instead of a carve-out that only tests existed to use.
+    + 'export function relStart({ platform }){ return platform.dispatch("__admin__", "__system/scope_kv", { ctx: { release: true } }); }\n'
+    + 'export function relRead({ kv }, id){ return kv.get("_dispatch/result/" + id) || ""; }\n'
+    # Naming the engine row through the door must now miss: it roots like
+    # every other key, so it reads the tenant's own (absent) row.
+    + 'export function relNamed({ platform }){ return JSON.stringify(platform.scope("__admin__").kv.prefix("_release/","",100)); }\n'
 )
 
 
@@ -103,15 +114,36 @@ def main() -> int:
         check("self-scope delete is durable across requests",
               json.loads(fn("sget").body).get("v") is None)
 
-        print("step 5: release-history key format (regression: signed '+' sign)")
-        rel = json.loads(fn("rel").body)
-        keys = [e["key"] for e in rel]
-        check("release wrote at least one _release/ key", len(keys) >= 1, repr(keys))
-        bad_plus = [k for k in keys if "+" in k]
-        check("no _release key contains a '+' sign", not bad_plus, repr(bad_plus))
-        parsable = all(k[len("_release/"):].isdigit() and
-                       int(k[len("_release/"):]) > 0 for k in keys)
-        check("every _release ts is pure digits + parses > 0", parsable, repr(keys))
+        print("step 5: the engine's release rows are a typed verb, never a spelling")
+        # Naming `_release/` through the scoped door roots like any other key
+        # (rove#850), so it reads the tenant's own keyspace and finds nothing.
+        # That miss IS the assertion: a spelling buys no engine rows.
+        named = json.loads(fn("relNamed").body)
+        check("naming _release/ through the door reaches no engine row", named == [],
+              repr(named))
+
+        print("step 6: release-history key format via the typed verb (regression: signed '+')")
+        did = fn("relStart").body.strip()
+        check("dispatch of the release read → an id", len(did) > 10, repr(did))
+        raw = ""
+        for _ in range(50):
+            raw = fn("relRead&args=" + urllib.parse.quote(json.dumps([did]))).body.strip()
+            if raw:
+                break
+            time.sleep(0.2)
+        check("the dispatched release read resolved", bool(raw), repr(raw[:120]))
+        if raw:
+            # The result row is the target's terminal body with a request-body
+            # trust posture — parse defensively.
+            outer = json.loads(raw)
+            body = json.loads(outer.get("body") or "{}")
+            hist = ((body.get("release") or {}).get("history")) or []
+            stamps = [h["ts"] for h in hist]
+            check("release wrote at least one _release/ row", len(stamps) >= 1, repr(stamps))
+            bad_plus = [t for t in stamps if "+" in t]
+            check("no _release ts contains a '+' sign", not bad_plus, repr(bad_plus))
+            parsable = all(t.isdigit() and int(t) > 0 for t in stamps)
+            check("every _release ts is pure digits + parses > 0", parsable, repr(stamps))
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
