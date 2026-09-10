@@ -2123,6 +2123,29 @@ pub fn build(b: *std.Build) void {
     prelude_fresh.has_side_effects = true;
     prelude_fresh.expectExitCode(0);
 
+    // The SECOND generator that mirrors into the same arena: the engine's
+    // baked `__system/*` modules (`scripts/ops/gen_replay_system_modules.py`).
+    // A `send_callback` activation — every durable send's result hop, every
+    // scheduler or cron tick — runs one of these, and they live in the worker
+    // binary rather than any tenant's deployment, so the arena can only get
+    // them from this mirror.
+    //
+    // Gated for exactly the reason the prelude is, and the omission cost
+    // something: the prelude was gated and this was not, so the mirror sat
+    // stale on `main` across the received-capabilities cutover — missing a
+    // module outright and carrying pre-cutover signatures for another. Two
+    // mirrors into one arena, one gate, and the ungated half is the one that
+    // drifted (rove#865).
+    const sysmods_fresh = b.addSystemCommand(&.{"python3"});
+    sysmods_fresh.addFileArg(b.path("scripts/ops/gen_replay_system_modules.py"));
+    sysmods_fresh.addArg("--verify");
+    // Always run, for the same reason as the prelude: declaring the input set
+    // here would duplicate the generator's glob, and a module added there but
+    // not here leaves the gate cached-green on the very change it exists to
+    // catch.
+    sysmods_fresh.has_side_effects = true;
+    sysmods_fresh.expectExitCode(0);
+
     // The docs site's contract pages (`handler-contract.html`,
     // `effect-algebra.html`) and API reference (`reference.html`) are
     // GENERATED into rewind-apps — the first two from `docs/handler-shape.md`
@@ -2237,6 +2260,7 @@ pub fn build(b: *std.Build) void {
     conf_step.dependOn(&conf_run.step);
     test_step.dependOn(&conf_run.step);
     test_step.dependOn(&prelude_fresh.step);
+    test_step.dependOn(&sysmods_fresh.step);
     test_step.dependOn(&docs_contract_fresh.step);
     test_step.dependOn(&ambient_ratchet.step);
     test_step.dependOn(&docs_reference_fresh.step);
