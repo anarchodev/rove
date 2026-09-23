@@ -60,6 +60,20 @@ and the sim. The runner now runs `gen_replay_prelude.py --check` before using
 the replay engine and fails with the regeneration command, rather than letting
 the staleness surface as a scatter of digest divergences (rove#474).
 
+The arena's **compiled** half has the same shape and a worse failure mode.
+`qjs_arena_wasm.{js,wasm}` is committed in rewind-apps but built from six rove
+Zig modules plus the pinned arenajs C sources by `zig build wasm-arena`, an
+explicit step that needs emsdk and is not part of `test`. Because the artifact
+is a compiled copy of the engine's own checks, a stale one does not fail — it
+enforces rules the sim and the worker have dropped, or drops rules they keep,
+and it went stale twice that way (rove#865). So the artifact carries a
+provenance stamp beside it, `qjs_arena_wasm.inputs`, written by the build that
+produced it and committed with it; the runner compares it to the sources in the
+checkout before using the replay engine. It compares hashes and never builds,
+so no emsdk is needed to be told the truth. A mismatch is an `AdapterError`
+rather than `EngineUnavailable` for the prelude's reason: skipping replay would
+keep the corpus green while removing the one engine that was going to disagree.
+
 The replay engine needs a rewind-apps checkout — the replay porcelain
 (`rtap.mjs`, `request-replay.mjs`, `qjs_arena_wasm`) lives there. The `web`
 submodule is that checkout, pinned by this commit, so `git submodule update
