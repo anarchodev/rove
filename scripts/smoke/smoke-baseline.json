@@ -34,6 +34,11 @@
     "seconds": 3.0,
     "status": "pass"
   },
+  "backup_restore_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 3.0,
+    "status": "pass"
+  },
   "blob_receive_smoke_v2.py": {
     "rc": 0,
     "seconds": 15.6,
