@@ -34,6 +34,11 @@
     "seconds": 3.0,
     "status": "pass"
   },
+  "backup_keyring_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 7.8,
+    "status": "pass"
+  },
   "backup_restore_smoke_v2.py": {
     "rc": 0,
     "seconds": 3.0,
