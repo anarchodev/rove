@@ -202,21 +202,62 @@ manifest, so its presence is the claim that every prefix it names was walked
 to the end. `verify` reports a run WITH an object mirror differently from one
 without, rather than calling both "verified".
 
-## What is not covered yet
+## The schedule, and what it lets us promise
 
-Stated plainly, because a backup whose coverage is assumed rather than known
-is the failure this document exists to prevent. Each is a leaf of rove#341:
+The units live in rewind-infra (`rove-backup.timer` nightly, one node;
+`rove-backup-prune.timer` daily) and its `docs/backup.md` is the install
+runbook. A run enumerates tenants with `rewind-backup tenants --cp`, so a
+tenant provisioned today is in tonight's backup without anyone remembering to
+add it — a hand-maintained list is a list that silently stops covering the
+newest customers.
 
-- **A schedule, a retention policy, and a scheduled restore test.** The test
-  that exists today is `scripts/smoke/backup_restore_smoke_v2.py`, which
-  restores into a second cluster and reads the value back on every suite run.
-  What is missing is the same thing running against production data on a
-  timer, and a stated RPO/RTO derived from it.
+**The cadence IS the recovery point.** Whatever the timer's interval is, a
+failure costs up to that much work, and that is the number a customer-facing
+document may state. It is deliberately written beside the `OnCalendar` that
+sets it, because changing one changes the other.
 
-## Recovery-point reality today
+**A recovery TIME is not stated yet**, and should not be until someone has
+measured a restore against a realistic data volume. A number derived from a
+smoke-sized tenant would be worse than no number.
+
+### Retention cuts both ways
+
+`rewind-backup prune --keep-daily N --keep-weekly M` keeps the N most recent
+runs, then one per day for M more. Run ids are `YYYYMMDDTHHMMSSZ` and sort
+lexically, which is why retention is an ordering problem rather than a
+date-parsing one.
+
+The window bounds how far back a bad delete or a corruption can be recovered
+from. It also bounds something less obvious: **an old backup holds keys a
+crypto-shred has since destroyed**, so an erasure is only fully true once
+every run predating it has aged out. A customer-facing document should state
+both numbers or neither.
+
+Because deleting a backup is the one operation here that cannot be undone,
+`prune` lists what it would remove and does nothing without `--yes`, and
+refuses outright a retention that would leave the store empty — a
+misconfigured `--keep-daily 0` is a configuration error, not an instruction.
+
+### The restore rehearsal
+
+Every suite run restores a tenant into a second cluster that shares no data
+directory with the first — the KV state, the keyring, the directory rows, and
+the objects each have a smoke that does it. That proves the mechanism, through
+the real tool, on every change.
+
+What it does not prove is that a particular night's production run restores;
+for that, `verify` checks every object's size, hash and framing. A periodic
+rehearsal against a real run is the remaining step, and it belongs on a canary
+tenant rather than a customer's — a rehearsal that copies customer data onto a
+scratch box to prove a point has made the problem worse.
+
+## Recovery-point reality
 
 A backup reflects the leader's committed state at the moment the snapshot was
-opened, so the recovery point is "when the run took that tenant", and the
-recovery time is dominated by re-attaching tenants and streaming them back.
-Neither is a number worth publishing until the schedule and the restore test
-exist — and no customer-facing document should claim one before then.
+opened, so the recovery point is "when the run took that tenant" — bounded by
+the timer's interval, which rewind-infra's `docs/backup.md` states next to the
+`OnCalendar` that sets it.
+
+The recovery TIME is dominated by re-attaching tenants and streaming their
+stores back, and it has not been measured against a realistic data volume. No
+customer-facing document should claim one until it has.

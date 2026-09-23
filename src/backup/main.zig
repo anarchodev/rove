@@ -92,6 +92,15 @@ const USAGE =
     \\      Print the run manifest — per tenant, the object, its size and
     \\      hash, and the INCARNATION a restore must attach under.
     \\
+    \\  rewind-backup tenants --cp <url>
+    \\      Every tenant the directory places, comma-separated — what a
+    \\      scheduled run feeds back into `--tenants`, so a tenant
+    \\      provisioned today is in tonight's backup with nobody remembering.
+    \\
+    \\  rewind-backup prune [--keep-daily N] [--keep-weekly M] --yes
+    \\      Enforce the retention window: the N most recent runs, then one
+    \\      per day for M more. Prints what it would remove without --yes.
+    \\
     \\  rewind-backup list
     \\      Runs present in the backup store, newest first.
     \\
@@ -169,6 +178,9 @@ const Args = struct {
     tenant: ?[]const u8 = null,
     cp: ?[]const u8 = null,
     no_directory: bool = false,
+    keep_daily: u32 = 14,
+    keep_weekly: u32 = 8,
+    yes: bool = false,
 };
 
 fn splitList(a: std.mem.Allocator, csv: []const u8) []const []const u8 {
@@ -210,6 +222,16 @@ fn parseArgs(a: std.mem.Allocator, argv: []const []const u8) Args {
             i += 1;
         } else if (std.mem.eql(u8, arg, "--no-directory")) {
             args.no_directory = true;
+        } else if (std.mem.eql(u8, arg, "--yes")) {
+            args.yes = true;
+        } else if (std.mem.eql(u8, arg, "--keep-daily")) {
+            args.keep_daily = std.fmt.parseInt(u32, next orelse fatal("--keep-daily needs a value", .{}), 10) catch
+                fatal("--keep-daily must be a number", .{});
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--keep-weekly")) {
+            args.keep_weekly = std.fmt.parseInt(u32, next orelse fatal("--keep-weekly needs a value", .{}), 10) catch
+                fatal("--keep-weekly must be a number", .{});
+            i += 1;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             std.debug.print("{s}", .{USAGE});
             std.process.exit(0);
@@ -622,6 +644,176 @@ fn fetchDirectory(a: std.mem.Allocator, cp: []const u8, secret: []const u8) ![]u
     return a.dupe(u8, resp.body orelse "");
 }
 
+// ── tenants ───────────────────────────────────────────────────────────
+
+/// Every tenant the directory PLACES, comma-separated, for a scheduled run to
+/// feed straight back into `run --tenants`.
+///
+/// Asked of the control plane rather than kept in a list somewhere: a tenant
+/// provisioned today is in tonight's backup without anyone remembering to add
+/// it. A hand-maintained list is a list that silently stops covering the
+/// newest customers, which is the set most likely to notice.
+fn cmdTenants(a: std.mem.Allocator, args: Args) !u8 {
+    const cp = args.cp orelse fatal("tenants needs --cp", .{});
+    const secret = moveSecret(a);
+    const rows = fetchDirectory(a, cp, secret) catch |e|
+        fatal("directory dump from {s} failed: {s}", .{ cp, @errorName(e) });
+    defer a.free(rows);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, a, rows, .{}) catch |e|
+        fatal("the CP's directory dump is not JSON: {s}", .{@errorName(e)});
+    defer parsed.deinit();
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(a);
+    var n: usize = 0;
+    for ((parsed.value.object.get("rows") orelse fatal("no rows", .{})).array.items) |row| {
+        const k = row.object.get("k").?.string;
+        const PLACEMENT = "placement/";
+        if (!std.mem.startsWith(u8, k, PLACEMENT)) continue;
+        if (n > 0) out.appendSlice(a, ",") catch @panic("OOM");
+        out.appendSlice(a, k[PLACEMENT.len..]) catch @panic("OOM");
+        n += 1;
+    }
+    var w = std.fs.File.stdout().writer(&.{});
+    w.interface.writeAll(out.items) catch {};
+    w.interface.writeAll("\n") catch {};
+    return 0;
+}
+
+// ── prune ─────────────────────────────────────────────────────────────
+
+/// A run id is `YYYYMMDDTHHMMSSZ`, so its day is the first eight characters
+/// and ids sort lexically. Retention is therefore an ordering problem rather
+/// than a date-parsing one — which is why the ids look like that.
+fn dayOf(run_id: []const u8) ?[]const u8 {
+    if (run_id.len < 8) return null;
+    for (run_id[0..8]) |c| if (c < '0' or c > '9') return null;
+    return run_id[0..8];
+}
+
+fn cmdPrune(a: std.mem.Allocator, args: Args) !u8 {
+    var target = openBackupStore(a);
+    defer target.store.deinit();
+
+    const runs = try listRuns(a, &target.store, target.owned.cfg.key_prefix_base);
+    defer {
+        for (runs) |r| a.free(r);
+        a.free(runs);
+    }
+    if (runs.len == 0) {
+        std.debug.print("no complete runs to prune\n", .{});
+        return 0;
+    }
+
+    // Newest first. Keep the N most recent runs outright, then one run per
+    // ISO week going back M weeks; everything else goes.
+    var keep: std.StringHashMapUnmanaged(void) = .empty;
+    defer keep.deinit(a);
+    var i: usize = runs.len;
+    var daily_kept: u32 = 0;
+    var weekly_days: std.StringHashMapUnmanaged(void) = .empty;
+    defer weekly_days.deinit(a);
+
+    while (i > 0) {
+        i -= 1;
+        const run = runs[i];
+        if (daily_kept < args.keep_daily) {
+            keep.put(a, run, {}) catch @panic("OOM");
+            daily_kept += 1;
+            continue;
+        }
+        // One per distinct day beyond the daily window, capped at keep_weekly.
+        const day = dayOf(run) orelse {
+            // An id this tool did not mint — keep it. Deleting something we
+            // cannot date is the one irreversible way to be wrong here.
+            keep.put(a, run, {}) catch @panic("OOM");
+            continue;
+        };
+        if (weekly_days.count() < args.keep_weekly and !weekly_days.contains(day)) {
+            weekly_days.put(a, day, {}) catch @panic("OOM");
+            keep.put(a, run, {}) catch @panic("OOM");
+        }
+    }
+
+    var doomed: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer doomed.deinit(a);
+    for (runs) |r| if (!keep.contains(r)) doomed.append(a, r) catch @panic("OOM");
+
+    std.debug.print("{d} run(s): keeping {d}, removing {d}\n", .{ runs.len, keep.count(), doomed.items.len });
+    for (doomed.items) |r| std.debug.print("  - {s}\n", .{r});
+
+    if (doomed.items.len == 0) return 0;
+    if (!args.yes) {
+        std.debug.print("re-run with --yes to delete. A backup removed is not recoverable,\n" ++
+            "and the window it leaves is also how long an erasure stays only mostly true.\n", .{});
+        return 2;
+    }
+
+    // Floor: never leave the store with nothing. A misconfigured retention
+    // (`--keep-daily 0`) should read as a configuration error, not as a
+    // successful deletion of every backup we have.
+    if (keep.count() == 0) {
+        std.debug.print("REFUSED: that retention would delete every run. Check --keep-daily/--keep-weekly.\n", .{});
+        return 1;
+    }
+
+    var removed: usize = 0;
+    for (doomed.items) |run| {
+        const n = target.store.deletePrefix(run) catch |e| {
+            std.debug.print("  FAILED {s}: {s}\n", .{ run, @errorName(e) });
+            return 1;
+        };
+        std.debug.print("  removed {s} ({d} object(s))\n", .{ run, n });
+        removed += 1;
+    }
+    std.debug.print("pruned {d} run(s)\n", .{removed});
+    return 0;
+}
+
+/// Complete runs in the backup store, oldest first. A run is complete iff it
+/// has a manifest — the same rule `verify` applies, so a prune can never
+/// mistake an interrupted run for a keepable one or vice versa.
+///
+/// `key_prefix` is the store's own prefix, and stripping it is not cosmetic:
+/// `listPrefix` returns FULLY-QUALIFIED keys (its sibling `deleteObjects`
+/// says so), while every other verb here takes a bare run id and lets the
+/// store prepend. Without the strip, a run id read from a listing is one
+/// depth deeper than a run id typed by an operator — so `prune` could not
+/// date it, kept everything, and would have deleted nothing under a
+/// double-prefixed key while reporting success.
+fn listRuns(a: std.mem.Allocator, store: *blob.S3BlobStore, key_prefix: []const u8) ![][]const u8 {
+    var token: ?[]u8 = null;
+    defer if (token) |t| a.free(t);
+    var runs: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (runs.items) |r| a.free(r);
+        runs.deinit(a);
+    }
+    while (true) {
+        var page = try store.listPrefix(a, "", token);
+        defer page.deinit(a);
+        for (page.keys) |k| {
+            if (!std.mem.endsWith(u8, k, "/manifest.json")) continue;
+            const qualified = k[0 .. k.len - "/manifest.json".len];
+            const run = if (std.mem.startsWith(u8, qualified, key_prefix))
+                qualified[key_prefix.len..]
+            else
+                qualified;
+            runs.append(a, a.dupe(u8, run) catch @panic("OOM")) catch @panic("OOM");
+        }
+        const next = page.next_token orelse break;
+        if (token) |t| a.free(t);
+        token = a.dupe(u8, next) catch @panic("OOM");
+    }
+    std.mem.sort([]const u8, runs.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.lt);
+    return runs.toOwnedSlice(a);
+}
+
 // ── mirror ────────────────────────────────────────────────────────────
 
 /// Open the LIVE object store — the one the cluster writes to — at the
@@ -996,36 +1188,20 @@ fn restoreKeyring(
 fn cmdList(a: std.mem.Allocator) !u8 {
     var target = openBackupStore(a);
     defer target.store.deinit();
-    var token: ?[]u8 = null;
-    var runs: std.ArrayListUnmanaged([]const u8) = .empty;
+    const runs = try listRuns(a, &target.store, target.owned.cfg.key_prefix_base);
     defer {
-        for (runs.items) |r| a.free(r);
-        runs.deinit(a);
+        for (runs) |r| a.free(r);
+        a.free(runs);
     }
-    while (true) {
-        var page = target.store.listPrefix(a, "", token) catch |e|
-            fatal("list failed: {s}", .{@errorName(e)});
-        defer page.deinit(a);
-        for (page.keys) |k| {
-            // One line per RUN, named by its manifest: an object with no
-            // manifest belongs to a run that never completed.
-            if (!std.mem.endsWith(u8, k, "/manifest.json")) continue;
-            const run = k[0 .. k.len - "/manifest.json".len];
-            runs.append(a, a.dupe(u8, run) catch @panic("OOM")) catch @panic("OOM");
-        }
-        const next = page.next_token orelse break;
-        if (token) |t| a.free(t);
-        token = a.dupe(u8, next) catch @panic("OOM");
-    }
-    if (token) |t| a.free(t);
-    if (runs.items.len == 0) {
+    if (runs.len == 0) {
         std.debug.print("no complete runs in the backup store\n", .{});
         return 0;
     }
-    var i = runs.items.len;
+    // Newest first: the one an operator wants is almost always the last one.
+    var i = runs.len;
     while (i > 0) {
         i -= 1;
-        std.debug.print("{s}\n", .{runs.items[i]});
+        std.debug.print("{s}\n", .{runs[i]});
     }
     return 0;
 }
@@ -1045,6 +1221,10 @@ pub fn main() !void {
         try cmdVerify(a, args)
     else if (std.mem.eql(u8, args.cmd, "restore"))
         try cmdRestore(a, args)
+    else if (std.mem.eql(u8, args.cmd, "tenants"))
+        try cmdTenants(a, args)
+    else if (std.mem.eql(u8, args.cmd, "prune"))
+        try cmdPrune(a, args)
     else if (std.mem.eql(u8, args.cmd, "mirror"))
         try cmdMirror(a, args)
     else if (std.mem.eql(u8, args.cmd, "restore-directory"))
