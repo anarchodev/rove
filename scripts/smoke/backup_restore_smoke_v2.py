@@ -114,7 +114,8 @@ def main():
 
         print("leg A: back the tenant up, then verify the run")
         rc, _ = backup_tool("run", "--nodes", a.node_url(0),
-                            "--tenants", TENANT, "--run-id", RUN_ID)
+                            "--tenants", TENANT, "--run-id", RUN_ID,
+                            "--cp", f"http://127.0.0.1:{a.cp_port}")
         check("backup run", rc, 0)
         rc, out = backup_tool("verify", "--run", RUN_ID)
         check("verify", rc, 0)
@@ -122,7 +123,8 @@ def main():
 
         print("leg B: a run covering a tenant that does not exist writes no manifest")
         rc, out = backup_tool("run", "--nodes", a.node_url(0),
-                             "--tenants", "no-such-tenant", "--run-id", f"{RUN_ID}-partial")
+                             "--tenants", "no-such-tenant", "--run-id", f"{RUN_ID}-partial",
+                             "--cp", f"http://127.0.0.1:{a.cp_port}")
         check("partial run fails", rc != 0, True)
         check("says no manifest was written", "no manifest written" in out, True)
         rc, _ = backup_tool("verify", "--run", f"{RUN_ID}-partial")

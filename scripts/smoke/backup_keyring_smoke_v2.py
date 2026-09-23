@@ -16,9 +16,11 @@ store. Two factors, separated by construction.
 Proof legs:
   A. a tenant that seals a value has a keyring, and the backup's manifest
      names its parts — the secret plus every shard.
-  B. restoring into a cluster that never had the tenant lands those parts
-     BYTE-IDENTICALLY on disk. Same bytes, so the same keys; nothing was
-     decrypted to make the copy.
+  B. restoring into a cluster that never had the tenant lands the LEADER's
+     parts byte-identically on disk. Same bytes, so the same keys; nothing
+     was decrypted to make the copy. (Shards are replicated verbatim, so
+     every voter's are identical — but `tenant.kr` is sealed per node under
+     its own nonce, so only the leader's bytes are the right comparand.)
   C. a cluster running a DIFFERENT cluster KEK refuses them (409) instead of
      writing key material it cannot open. An unverified install surfaces at a
      failover, which is exactly when that copy becomes the only copy.
@@ -46,7 +48,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import smoke_lib_v2  # noqa: E402
-from smoke_lib_v2 import V2Cluster, MOVE_SECRET, attach_join, BIN_DIR  # noqa: E402
+from smoke_lib_v2 import V2Cluster, MOVE_SECRET, attach_join, BIN_DIR, _curl  # noqa: E402
 
 BACKUP_BIN = os.path.join(BIN_DIR, "rewind-backup")
 TENANT = "acme"
@@ -74,6 +76,17 @@ def keyring_dir(data_dir: Path, tenant: str) -> Path:
     directory listing does not enumerate tenants."""
     digest = hashlib.sha256(tenant.encode()).digest()[:16].hex()
     return data_dir / "keyrings" / digest
+
+
+def leader_index(c) -> int | None:
+    """Which node leads the tenant's group — the node the backup door answers
+    on, and so the node whose keyring bytes a restore should equal."""
+    for i in range(len(c.node_ports)):
+        r = _curl(f"{c.node_url(i)}/_system/v2-leader?tenant={TENANT}",
+                  headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+        if r.status == 200:
+            return i
+    return None
 
 
 def keyring_files(d: Path) -> dict[str, bytes]:
@@ -129,20 +142,29 @@ def main() -> int:
         check("handler sealed a value", "sealed" in resp.body,
               f"got {resp.status} {resp.body[:120]!r}")
 
-        # Whichever node leads the tenant is the one the backup reads from;
-        # every voter should hold the shards, so take the union.
-        dirs = [keyring_dir(d, TENANT) for d in a.data_dirs]
-        per_node = [keyring_files(d) for d in dirs]
+        per_node = [keyring_files(keyring_dir(d, TENANT)) for d in a.data_dirs]
         with_shards = [f for f in per_node if any(n != "tenant.kr" for n in f)]
         check("the tenant minted keys on at least a quorum",
               len(with_shards) >= 2, f"nodes with shards: {len(with_shards)}")
-        source_files = with_shards[0] if with_shards else {}
+
+        # Compare against the LEADER's files, not any node's. Shard files are
+        # replicated verbatim, so every voter holds identical bytes — but
+        # `tenant.kr` is sealed independently on each birth node, same
+        # plaintext secret under a fresh nonce, so its BYTES differ per node
+        # by construction. The backup reads the leader (the door is
+        # leader-only), so the leader is the only honest comparand. Comparing
+        # against an arbitrary node passes whenever node 0 happens to lead and
+        # fails under load when it does not.
+        leader = leader_index(a)
+        check("found the tenant's leader", leader is not None, f"got {leader}")
+        source_files = per_node[leader] if leader is not None else {}
 
         # Every node: the door is leader-only and answers 421 elsewhere, so
         # the run walks them until it finds the leader.
         rc, _ = backup_tool("run", "--nodes",
                             ",".join(a.node_url(i) for i in range(3)),
-                            "--tenants", TENANT, "--run-id", RUN_ID)
+                            "--tenants", TENANT, "--run-id", RUN_ID,
+                            "--cp", f"http://127.0.0.1:{a.cp_port}")
         check("backup run", rc == 0)
 
         rc, out = backup_tool("show", "--run", RUN_ID)

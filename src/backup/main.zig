@@ -47,13 +47,10 @@
 //!
 //! ## What it does not yet cover (rove#341's remaining leaves)
 //!
-//! - **The CP directory rows** (placement, incarnation, plan), which a restore
-//!   into a fresh cluster needs in order to re-attach a tenant with the
-//!   storage identity its blobs are keyed by.
 //! - **The object store itself** (bundles, static assets, log/tape batches).
 //!
-//! Until those land, a restore reconstitutes a tenant's KV state into a
-//! cluster an operator has already attached the tenant to.
+//! So a restore reconstitutes a tenant's placement, identity and state — its
+//! deployed code still comes from the live object store.
 
 const std = @import("std");
 const blob = @import("rove-blob");
@@ -63,9 +60,13 @@ const curl = blob.curl;
 const USAGE =
     \\rewind-backup — off-provider backup + restore of tenant state (rove#341)
     \\
-    \\  rewind-backup run --nodes <url,...> --tenants <id,...> [--run-id <id>]
-    \\      Back up each tenant from whichever node leads it, then write the
-    \\      run manifest. Prints the run id.
+    \\  rewind-backup run --nodes <url,...> --tenants <id,...> --cp <url>
+    \\                    [--run-id <id>] [--no-directory]
+    \\      Back up each tenant from whichever node leads it, capture the CP
+    \\      directory rows that say where each one lives and what identity its
+    \\      data is keyed by, then write the run manifest. Prints the run id.
+    \\      `--no-directory` omits the directory — say it out loud, because a
+    \\      run without it restores tenants nobody can place.
     \\
     \\  rewind-backup verify --run <id>
     \\      Re-read every object the manifest names and check it is a whole,
@@ -75,6 +76,12 @@ const USAGE =
     \\  rewind-backup restore --run <id> --tenant <id> --nodes <url,...>
     \\      Stream a backed-up tenant into a cluster that has already attached
     \\      it (an empty group). Tries each node until one is the leader.
+    \\
+    \\  rewind-backup restore-directory --run <id> --cp <url>
+    \\      Put the directory rows back into a REBUILT control plane — one
+    \\      that places no tenants of its own. Do this BEFORE restoring
+    \\      tenants: it is what says which cluster each belongs to and under
+    \\      which incarnation to attach it.
     \\
     \\  rewind-backup show --run <id>
     \\      Print the run manifest — per tenant, the object, its size and
@@ -123,6 +130,13 @@ fn manifestKey(a: std.mem.Allocator, run_id: []const u8) []u8 {
     return std.fmt.allocPrint(a, "{s}/manifest.json", .{run_id}) catch @panic("OOM");
 }
 
+/// The CP directory rows for a run: where each tenant lives, its plan, and
+/// the incarnation its own data is keyed by. One object, because it is one
+/// consistent read of one raft group.
+fn directoryKey(a: std.mem.Allocator, run_id: []const u8) []u8 {
+    return std.fmt.allocPrint(a, "{s}/directory.json", .{run_id}) catch @panic("OOM");
+}
+
 /// `YYYYMMDDTHHMMSSZ` — sorts lexically, which is what makes `list` and a
 /// retention sweep simple later.
 fn defaultRunId(a: std.mem.Allocator) []u8 {
@@ -148,6 +162,8 @@ const Args = struct {
     tenants: []const []const u8 = &.{},
     run_id: ?[]const u8 = null,
     tenant: ?[]const u8 = null,
+    cp: ?[]const u8 = null,
+    no_directory: bool = false,
 };
 
 fn splitList(a: std.mem.Allocator, csv: []const u8) []const []const u8 {
@@ -184,6 +200,11 @@ fn parseArgs(a: std.mem.Allocator, argv: []const []const u8) Args {
         } else if (std.mem.eql(u8, arg, "--tenant")) {
             args.tenant = next orelse fatal("--tenant needs a value", .{});
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--cp")) {
+            args.cp = next orelse fatal("--cp needs a value", .{});
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--no-directory")) {
+            args.no_directory = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             std.debug.print("{s}", .{USAGE});
             std.process.exit(0);
@@ -291,6 +312,37 @@ fn cmdRun(a: std.mem.Allocator, args: Args) !u8 {
 
     std.debug.print("run {s}: {d} tenant(s)\n", .{ run_id, args.tenants.len });
 
+    // The directory FIRST. It is the smallest object in the run and the one
+    // that makes the rest meaningful: without it a restored tenant has no
+    // placement, no plan, and no incarnation to attach under. Captured before
+    // the dumps so a run that cannot reach the CP fails before spending
+    // twenty minutes streaming stores.
+    var directory_bytes: u64 = 0;
+    var directory_sha: ?[]u8 = null;
+    defer if (directory_sha) |d| a.free(d);
+    if (args.cp) |cp| {
+        const rows = fetchDirectory(a, cp, secret) catch |e|
+            fatal("directory dump from {s} failed: {s}", .{ cp, @errorName(e) });
+        defer a.free(rows);
+        const dkey = directoryKey(a, run_id);
+        defer a.free(dkey);
+        target.store.blobStore().put(dkey, rows) catch |e|
+            fatal("directory dump write failed: {s}", .{@errorName(e)});
+        const facts = describeObject(a, &target.store, dkey) catch |e|
+            fatal("directory dump stored but unreadable: {s}", .{@errorName(e)});
+        directory_bytes = facts.bytes;
+        directory_sha = facts.sha_hex;
+        std.debug.print("  ok directory: {d} bytes\n", .{facts.bytes});
+    } else if (!args.no_directory) {
+        fatal(
+            "run needs --cp (the control plane to capture the directory from), " ++
+                "or an explicit --no-directory. A run without it restores tenants nobody can place.",
+            .{},
+        );
+    } else {
+        std.debug.print("  NO DIRECTORY — this run restores tenant data only\n", .{});
+    }
+
     var manifest: std.ArrayListUnmanaged(u8) = .empty;
     defer manifest.deinit(a);
     const w = manifest.writer(a);
@@ -374,7 +426,18 @@ fn cmdRun(a: std.mem.Allocator, args: Args) !u8 {
             incarnation,
         });
     }
-    try w.print("],\"failures\":{d}}}", .{failures});
+    try w.writeAll("],");
+    if (directory_sha) |sha| {
+        try w.print("\"directory\":{{\"key\":\"{s}/directory.json\",\"bytes\":{d},\"sha256\":\"{s}\"}},", .{
+            run_id, directory_bytes, sha,
+        });
+    } else {
+        // Recorded as absent rather than omitted: `verify` says so out loud,
+        // and a reader of the manifest should never have to infer coverage
+        // from a missing key.
+        try w.writeAll("\"directory\":null,");
+    }
+    try w.print("\"failures\":{d}}}", .{failures});
 
     if (failures > 0) {
         // No manifest on a partial run. A manifest is the claim that this set
@@ -411,6 +474,33 @@ fn cmdVerify(a: std.mem.Allocator, args: Args) !u8 {
         fatal("run {s}: manifest has no tenants", .{run_id});
 
     var bad: usize = 0;
+
+    // The directory first, because a run that lost it restores tenant data
+    // nobody can place — a fact worth reading before a list of green tenants.
+    if (parsed.value.object.get("directory")) |d| {
+        if (d == .null) {
+            std.debug.print("  NOTE {s}: no directory in this run (--no-directory) — tenant data only\n", .{run_id});
+        } else {
+            const dkey = d.object.get("key").?.string;
+            const want_b: u64 = @intCast(d.object.get("bytes").?.integer);
+            const want_s = d.object.get("sha256").?.string;
+            if (describeObject(a, &target.store, dkey)) |obj| {
+                defer a.free(obj.sha_hex);
+                if (obj.bytes != want_b or !std.mem.eql(u8, obj.sha_hex, want_s)) {
+                    std.debug.print("  FAIL directory: {d}b/{s} vs manifest {d}b/{s}\n", .{
+                        obj.bytes, obj.sha_hex, want_b, want_s,
+                    });
+                    bad += 1;
+                } else {
+                    std.debug.print("  ok directory: {d} bytes\n", .{obj.bytes});
+                }
+            } else |e| {
+                std.debug.print("  FAIL directory: unreadable: {s}\n", .{@errorName(e)});
+                bad += 1;
+            }
+        }
+    }
+
     for (tenants.array.items) |entry| {
         const tenant = entry.object.get("tenant").?.string;
         const prefix = entry.object.get("prefix").?.string;
@@ -478,6 +568,70 @@ fn cmdVerify(a: std.mem.Allocator, args: Args) !u8 {
     }
     std.debug.print("run {s}: verified\n", .{run_id});
     return 0;
+}
+
+/// Ask the CP for its backed-up directory rows.
+fn fetchDirectory(a: std.mem.Allocator, cp: []const u8, secret: []const u8) ![]u8 {
+    const url = try std.fmt.allocPrint(a, "{s}/_control/directory-dump", .{cp});
+    defer a.free(url);
+    var resp = try curl.cpRequest(a, .POST, url, "", .{
+        .headers = &.{.{ .name = wire.MOVE_SECRET, .value = secret }},
+    });
+    defer resp.deinit(a);
+    if (resp.status != 200) {
+        std.debug.print("  directory dump → {d}\n", .{resp.status});
+        return error.DirectoryDumpRefused;
+    }
+    return a.dupe(u8, resp.body orelse "");
+}
+
+// ── restore-directory ─────────────────────────────────────────────────
+
+fn cmdRestoreDirectory(a: std.mem.Allocator, args: Args) !u8 {
+    const run_id = args.run_id orelse fatal("restore-directory needs --run", .{});
+    const cp = args.cp orelse fatal("restore-directory needs --cp", .{});
+    var target = openBackupStore(a);
+    defer target.store.deinit();
+    const secret = moveSecret(a);
+
+    const dkey = directoryKey(a, run_id);
+    defer a.free(dkey);
+    const rows = target.store.blobStore().get(dkey, a) catch |e|
+        fatal("run {s} carries no directory ({s}) — it was taken with --no-directory", .{ run_id, @errorName(e) });
+    defer a.free(rows);
+
+    const url = try std.fmt.allocPrint(a, "{s}/_control/directory-restore", .{cp});
+    defer a.free(url);
+    var resp = curl.cpRequest(a, .POST, url, rows, .{
+        .headers = &.{
+            .{ .name = wire.MOVE_SECRET, .value = secret },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .timeout_ms = 5 * 60 * 1000,
+    }) catch |e| {
+        std.debug.print("directory restore to {s}: {s}\n", .{ cp, @errorName(e) });
+        return 1;
+    };
+    defer resp.deinit(a);
+    switch (resp.status) {
+        204 => {
+            std.debug.print("directory restored into {s} ({d} bytes of rows)\n", .{ cp, rows.len });
+            return 0;
+        },
+        409 => {
+            std.debug.print(
+                "REFUSED: {s} already places tenants of its own. A directory restore is for a\n" ++
+                    "REBUILT control plane; against a live one it would overwrite the placements,\n" ++
+                    "plans and incarnations of tenants that are serving.\n",
+                .{cp},
+            );
+            return 1;
+        },
+        else => {
+            std.debug.print("directory restore → {d} {s}\n", .{ resp.status, std.mem.trim(u8, resp.body orelse "", "\n") });
+            return 1;
+        },
+    }
 }
 
 // ── show ──────────────────────────────────────────────────────────────
@@ -682,6 +836,8 @@ pub fn main() !void {
         try cmdVerify(a, args)
     else if (std.mem.eql(u8, args.cmd, "restore"))
         try cmdRestore(a, args)
+    else if (std.mem.eql(u8, args.cmd, "restore-directory"))
+        try cmdRestoreDirectory(a, args)
     else if (std.mem.eql(u8, args.cmd, "show"))
         try cmdShow(a, args)
     else if (std.mem.eql(u8, args.cmd, "list"))

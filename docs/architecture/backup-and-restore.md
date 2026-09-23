@@ -122,14 +122,60 @@ would leave a window where the keyring is open and the tombstones are not yet
 there, and reconciliation does not re-run on its own. The interlock is pinned
 by a test in `tenant_keys.zig` that fails if reconciliation is skipped.
 
+## The directory says where a tenant belongs
+
+A tenant's pairs are addressed by a store id derived from its **storage
+incarnation** — a random token minted at provision and recorded in the CP
+directory, alongside its placement and its plan. Lose the CP's raft state and
+every restored tenant is data with no identity: nothing says which cluster it
+belongs to, nothing says what to attach it under.
+
+So a run captures the directory rows first — it is the smallest object in the
+run and the one that makes the rest meaningful, and capturing it first means a
+run that cannot reach the CP fails before spending twenty minutes streaming
+stores. `POST /_control/directory-dump` returns them as base64 values (the
+rows are opaque; nothing in the copy path should start caring what a plan blob
+means), and `/_control/directory-restore` puts them back.
+
+`rewind-backup run` **requires `--cp`** unless `--no-directory` is passed. An
+operator may take tenant-data-only backups, but has to say so out loud: the
+alternative is a run that silently restores tenants nobody can place.
+
+### What the dump leaves out, and why
+
+`Directory.BACKUP_AXES` is the list, and everything in a dump is something the
+restore will apply — a dump carrying rows the restore refuses reads like data
+that was saved when it was not. Three axes are absent:
+
+- **`cluster/` and `node/`** are topology, not tenant state. A cluster rebuilt
+  after a loss has its own node addresses, and restoring the dead ones would
+  point the directory at hosts that are gone. They come from config, which is
+  where the operator already declares them; placement references a cluster by
+  logical id, so a rebuild that keeps the ids restores cleanly.
+- **`cert/`** holds custom domains' private keys in the clear — the directory
+  has no KEK to seal them under, and the backup store is off-provider by
+  design. A certificate re-issues over ACME at the cost of rate limits
+  (rove#269 measured exactly that); a private key copied somewhere it need not
+  be is not undoable. **The backup holds no key material it cannot seal.**
+
+### A restore is for a rebuilt control plane
+
+`/_control/directory-restore` refuses (409) when the directory already places
+tenants. Run against a live CP it would overwrite the placements, plans and
+incarnations of tenants that are serving — which is not a restore, it is an
+outage with a manifest.
+
+Order, end to end:
+
+    restore-directory   →  the rebuilt CP can place tenants again
+    attach each tenant  →  at the incarnation the directory now holds
+    restore each tenant →  store dump, then keyring
+
 ## What is not covered yet
 
 Stated plainly, because a backup whose coverage is assumed rather than known
 is the failure this document exists to prevent. Each is a leaf of rove#341:
 
-- **The CP directory rows** — placement, incarnation, plan. The incarnation in
-  particular is what a restore must attach under, so today it survives only
-  because the backup manifest copies it.
 - **The object store** — bundles, static assets, log and tape batches. These
   are content- or id-addressed and survive a cluster wipe, but not the loss of
   the provider account.
