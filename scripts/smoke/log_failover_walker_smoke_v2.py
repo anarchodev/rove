@@ -161,14 +161,30 @@ def main() -> int:
         # — past the record threshold, tripping `shouldFlush`. The walker runs
         # each poll tick on the new leader, so it has re-derived the target by
         # the time these commit.
+        # Write until enough have COMMITTED, bounded by a deadline — rather
+        # than firing a fixed count and requiring most of them to land.
+        #
+        # What this step needs is `RECORD_THRESHOLD` records in the new
+        # leader's buffer: that is what trips `shouldFlush`, and a commit is
+        # also the proof that a follower took over. What it asserted instead
+        # was that ≥25 of the FIRST 30 attempts returned 200 — a race against
+        # the election window, because every request issued before a follower
+        # wins is a 503 the front cannot place. Five spare attempts covers an
+        # election on an idle box and does not cover one on a loaded box, so
+        # the smoke failed on CPU contention while the behaviour it tests was
+        # working. Now a slow election costs time instead of a failure, and
+        # the condition under test is unchanged.
         burst_ok = 0
-        for i in range(RECORD_THRESHOLD + 5):
-            br = c.request(TENANT, f"/burst?fn=walk&i={i}", timeout=30.0)
+        attempts = 0
+        burst_deadline = time.time() + 120.0
+        while burst_ok < RECORD_THRESHOLD and time.time() < burst_deadline:
+            br = c.request(TENANT, f"/burst?fn=walk&i={attempts}", timeout=30.0)
+            attempts += 1
             if br.status == 200:
                 burst_ok += 1
         check("follower promoted + burst committed on the surviving quorum",
               burst_ok >= RECORD_THRESHOLD,
-              f"{burst_ok}/{RECORD_THRESHOLD + 5} ok")
+              f"{burst_ok}/{RECORD_THRESHOLD} committed in {attempts} attempt(s)")
 
         # ── The recovered target must now surface via the log query ──
         found = False
