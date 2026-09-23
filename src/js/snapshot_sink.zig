@@ -69,6 +69,10 @@ pub const Box = struct {
     eof: bool = false,
     /// A `feed()` rejected the stream (bad frame / apply error) — finalize 500.
     failed: bool = false,
+    /// Why it failed, so the finalize can answer a REFUSAL differently from a
+    /// breakage: a store-id mismatch is a well-formed stream aimed at the
+    /// wrong tenant lifetime (409), not a server fault (500).
+    fail_err: ?kv.snapshot_stream.Error = null,
     /// The client reset the upload mid-stream — no response is possible.
     aborted: bool = false,
     /// h2 receive-window bytes to repay (apply outpaces the wire, so we repay
@@ -153,8 +157,9 @@ pub const Box = struct {
         // After a failure, keep draining so the closing stream can't wedge on a
         // shut window; the bytes are dropped (the loader is dead).
         if (!self.failed) {
-            self.loader.feed(bytes) catch {
+            self.loader.feed(bytes) catch |e| {
                 self.failed = true;
+                self.fail_err = e;
             };
         }
         self.drained_pending +%= @intCast(bytes.len);

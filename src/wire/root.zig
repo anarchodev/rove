@@ -40,6 +40,7 @@ pub const LEARNERS = header_names.LEARNERS;
 pub const PEER_ADDRS = header_names.PEER_ADDRS;
 pub const MOVE_SECRET = header_names.MOVE_SECRET;
 pub const DEST = header_names.DEST;
+pub const BACKUP_KEY = header_names.BACKUP_KEY;
 pub const SNAPSHOT_INDEX = header_names.SNAPSHOT_INDEX;
 pub const SNAPSHOT_TERM = header_names.SNAPSHOT_TERM;
 pub const SNAPSHOT_MODE = header_names.SNAPSHOT_MODE;

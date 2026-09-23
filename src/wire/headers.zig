@@ -62,6 +62,11 @@ pub const MOVE_SECRET = "x-rewind-move-secret";
 /// v2-snapshot-push: the dest node base URL the source streams to.
 pub const DEST = "x-rewind-dest";
 
+/// v2-backup: the object key the tenant's dump is written to in the backup
+/// store. The OPERATOR names it — one backup run groups every tenant under a
+/// prefix it chose, and only the run knows what that set is called.
+pub const BACKUP_KEY = "x-rewind-backup-key";
+
 // Streamed-snapshot baseline, carried in headers so the body stays the
 // pure pair stream.
 pub const SNAPSHOT_INDEX = "x-rewind-snapshot-index";

@@ -171,6 +171,12 @@ const WorkerCtx = struct {
     /// leader-push target for the out-of-band snapshot catch-up driver. Empty
     /// (single-node / unset) → the catch-up thread logs + no-ops any job.
     peer_urls: []const []const u8,
+    /// The off-provider backup target (`BACKUP_S3_*`, rove#341), or null when
+    /// unset — the backup door then refuses loudly. A SEPARATE store, not a
+    /// prefix in the live bucket: a backup reachable by the credentials that
+    /// address the data it protects does not survive the scenarios that
+    /// motivate keeping one.
+    backup_store: ?*blob_mod.S3BlobStore,
     ready: *std.Thread.ResetEvent,
     /// Dedicated loopback HTTP/1.1 operator-metrics listener
     /// (`REWIND_METRICS_PORT`). The worker thread renders the Prometheus
@@ -461,10 +467,12 @@ fn workerMain(args: *WorkerCtx) !void {
         args.peer_urls,
     );
     defer catchup.deinit();
+    catchup.backup_store = args.backup_store;
     try catchup.start();
     defer catchup.shutdown();
     // The same off-loop driver also runs CP-triggered move
-    // pushes (`/_system/v2-snapshot-push` → `armSnapshotPush` enqueues here).
+    // pushes (`/_system/v2-snapshot-push` → `armSnapshotPush` enqueues here)
+    // and operator-triggered backups (`/_system/v2-backup`, rove#341).
     worker.snapshot_push_driver = catchup;
 
     std.log.info("rewind worker {d}: ready ({s})", .{
@@ -947,6 +955,38 @@ pub fn main() !void {
     defer allocator.free(ns_segment);
     _ = try blob_owned.applyNamespace(allocator, ns_segment);
 
+    // The off-provider backup target (rove#341). Optional: unset means this
+    // node takes no backups, and the door says so rather than succeeding
+    // silently. Deliberately NOT namespaced — `applyNamespace` scopes the
+    // live keyspace to the storage generation so a wiped cluster cannot
+    // re-issue ids over a previous lifetime's keys, but a backup exists to
+    // be read AFTER exactly that kind of event, and a restore that could not
+    // find the objects of the generation it is recovering from would be no
+    // restore at all.
+    var backup_owned: ?blob_mod.env.BlobBackendOwned =
+        blob_mod.env.loadFromEnvPrefixed(allocator, blob_mod.env.BACKUP_ENV_PREFIX) catch |err| blk: {
+            if (blob_mod.env.errorEnvName(err)) |name| {
+                std.log.info("rewind-worker: no backup target ({s} unset) — /_system/v2-backup will refuse", .{name});
+            }
+            break :blk null;
+        };
+    defer if (backup_owned) |*b| b.deinit(allocator);
+    var backup_s3: ?blob_mod.S3BlobStore = null;
+    if (backup_owned) |b| {
+        backup_s3 = try blob_mod.S3BlobStore.init(allocator, .{
+            .endpoint = b.cfg.endpoint,
+            .region = b.cfg.region,
+            .bucket = b.cfg.bucket,
+            .key_prefix = b.cfg.key_prefix_base,
+            .access_key = b.cfg.access_key,
+            .secret_key = b.cfg.secret_key,
+            .use_tls = b.cfg.use_tls,
+        });
+        std.log.info("rewind-worker: backup target {s}/{s} prefix={s}", .{ b.cfg.endpoint, b.cfg.bucket, b.cfg.key_prefix_base });
+    }
+    defer if (backup_s3) |*st| st.deinit();
+    const backup_store: ?*blob_mod.S3BlobStore = if (backup_s3) |*st| st else null;
+
     // Node-wide root store + seq counters + tenant registry. The
     // worker opens the root store directly.
     const root_kv = try kv.KvStore.openClusterOwned(allocator, data_dir, "cluster.kv", "__root__");
@@ -1249,6 +1289,7 @@ pub fn main() !void {
             .log_push_bases = log_push_bases,
             .services_jwt_secret = services_jwt_secret,
             .peer_urls = peer_urls,
+            .backup_store = backup_store,
             .ready = ready,
             // The metrics render reads live h2 + dispatch state only its
             // own thread may touch, so exactly one worker publishes. The

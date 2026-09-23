@@ -56,6 +56,7 @@ The maintained set. Subsystem-owned, kept current with the code.
 - **[configuration-and-network.md](architecture/configuration-and-network.md)** — per-binary env/port config map, the public/private firewall boundary + its security note, two-tier TLS architecture
 - **[auth-and-domains.md](architecture/auth-and-domains.md)** — OIDC, custom domains, ACME, service/admin authz
 - **[observability.md](architecture/observability.md)** — operator telemetry (Grafana Cloud)
+- **[backup-and-restore.md](architecture/backup-and-restore.md)** — the off-provider copy and the tested restore: why the bytes are a tenant move's, why storage identity travels with them, and what is not covered yet
 
 > Design-rationale reference (not a primary subsystem doc, but cited by ~10 source files): [raft-native-alignment.md](architecture/raft-native-alignment.md) — how membership + catch-up were re-aligned onto raft-rs's native model (all phases landed; Phase 3 in `decisions.md` §10.12).
 >

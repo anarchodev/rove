@@ -72,6 +72,10 @@ pub const Error = error{
     /// ended mid-pair (truncated transfer / mid-stream reset).
     TruncatedStream,
     StoreNotFound,
+    /// The stream's store id is not the one the destination expects
+    /// (`LoaderOptions.expect_store_id`). Refused at the header, before a
+    /// single pair is applied.
+    StoreIdMismatch,
     Kvexp,
     OutOfMemory,
 };
@@ -187,6 +191,18 @@ pub const LoaderOptions = struct {
     /// (a cleared store has nothing to preserve); set `clear_existing = false`
     /// alongside this.
     skip_existing: bool = false,
+    /// The store id the destination expects, or null to accept whatever the
+    /// stream carries (the catch-up path, where source and destination are the
+    /// same group by construction).
+    ///
+    /// Pairs are addressed by the store id in the stream HEADER, and a store
+    /// id is derived from the tenant's storage incarnation. So a stream from a
+    /// tenant attached under one incarnation, loaded into a group attached
+    /// under another, writes every pair into a store this process has no
+    /// reader for: the load reports success and the destination reads back
+    /// empty. That is the failure this refuses — at the header, so nothing is
+    /// applied, rather than after the fact when the rows are already there.
+    expect_store_id: ?u64 = null,
     /// Commit the in-flight txn once it accumulates this many pairs …
     batch_max_pairs: usize = 4096,
     /// … or this many key+value bytes, whichever first. Bounds resident memory
@@ -284,6 +300,9 @@ pub const StreamLoader = struct {
                     if (magic != STREAM_MAGIC) return Error.InvalidStreamFormat;
                     if (self.scratch[4] != STREAM_VERSION) return Error.UnsupportedStreamVersion;
                     self.store_id = std.mem.readInt(u64, self.scratch[5..13], .little);
+                    if (self.opts.expect_store_id) |want| {
+                        if (self.store_id != want) return Error.StoreIdMismatch;
+                    }
                     self.header_seen = true;
                     self.scratch_filled = 0;
                     self.phase = .lens;
@@ -748,6 +767,46 @@ test "snapshot stream from a newer node is refused, not replayed at v1 widths" {
     var loader2 = try StreamLoader.init(a, dst.manifest, .{});
     defer loader2.deinit();
     try testing.expectError(Error.UnsupportedStreamVersion, loader2.feed(&older));
+}
+
+test "a stream for another tenant lifetime is refused before any pair lands" {
+    // The failure this guards is silent: pairs are addressed by the store id
+    // in the header, so a dump loaded into a group attached under a different
+    // incarnation writes into a store this process has no reader for — the
+    // load reports success and the destination reads back empty. That is a
+    // restore that says it worked (rove#341).
+    const a = testing.allocator;
+    var src = try TestManifest.init();
+    defer src.deinit();
+    var dst = try TestManifest.init();
+    defer dst.deinit();
+
+    const src_store: u64 = 0xAAAA;
+    const dst_store: u64 = 0xBBBB;
+    const k = try a.dupe(u8, "k");
+    defer a.free(k);
+    const v = try a.dupe(u8, "v");
+    defer a.free(v);
+    try writePairs(src.manifest, src_store, &.{.{ .key = k, .val = v }});
+
+    var dumper = try StreamDumper.init(a, src.manifest, src_store);
+    defer dumper.deinit();
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(a);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try dumper.pull(&buf);
+        if (n == 0) break;
+        try wire.appendSlice(a, buf[0..n]);
+    }
+
+    var loader = try StreamLoader.init(a, dst.manifest, .{ .expect_store_id = dst_store });
+    defer loader.deinit();
+    try testing.expectError(Error.StoreIdMismatch, loader.feed(wire.items));
+    // Refused AT THE HEADER: the destination store was never even created,
+    // so there is nothing to clean up and nothing to read back as empty.
+    try testing.expect(!try dst.manifest.hasStore(src_store));
+    try testing.expect(!try dst.manifest.hasStore(dst_store));
 }
 
 test "snapshot stream rejects a foreign magic" {
