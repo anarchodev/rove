@@ -417,6 +417,97 @@ pub const Directory = struct {
         return bridge.isLeaderOf(self.dir_gid);
     }
 
+    // ── Backup (rove#964) ────────────────────────────────────────────
+
+    /// The axes a directory backup covers, and therefore exactly the axes a
+    /// restore applies. Everything in a dump is something the restore will
+    /// put back — a dump carrying rows the restore refuses reads like data
+    /// that was saved when it was not.
+    ///
+    /// Three axes are deliberately absent, each for its own reason:
+    ///
+    ///   - `cluster/` and `node/` are TOPOLOGY, not tenant state. A cluster
+    ///     rebuilt after a loss has its own node addresses, and restoring the
+    ///     dead ones would point the directory at hosts that are gone. They
+    ///     come from config (`REWIND_CLUSTERS`), which is where the operator
+    ///     already declares them. Placement references a cluster by logical
+    ///     id, so a rebuild that keeps the ids restores cleanly.
+    ///   - `cert/` holds custom domains' PRIVATE KEYS, in the clear — the
+    ///     directory has no KEK to seal them under, and the backup store is
+    ///     off-provider by design. A certificate is re-issuable over ACME at
+    ///     the cost of rate limits (rove#269 measured exactly that); a
+    ///     private key copied somewhere it need not be is not undoable. So
+    ///     the backup holds no key material it cannot seal.
+    pub const BACKUP_AXES = [_][]const u8{
+        "placement/",
+        "plan/",
+        "suspend/",
+        "incarnation/",
+        "host/",
+    };
+
+    pub const Row = struct { key: []u8, value: []u8 };
+
+    pub fn freeRows(a: std.mem.Allocator, rows: []Row) void {
+        for (rows) |r| {
+            a.free(r.key);
+            a.free(r.value);
+        }
+        a.free(rows);
+    }
+
+    /// Every backed-up row, read from the directory group's STORE rather than
+    /// the in-memory projection: the projection is a typed view that has
+    /// already dropped what it did not need, and a backup has to carry what
+    /// the rows actually say.
+    pub fn dumpRows(self: *Directory, a: std.mem.Allocator) Error![]Row {
+        const bridge = self.bridge orelse return Error.BadConfig;
+        var out: std.ArrayListUnmanaged(Row) = .empty;
+        errdefer {
+            for (out.items) |r| {
+                a.free(r.key);
+                a.free(r.value);
+            }
+            out.deinit(a);
+        }
+
+        for (BACKUP_AXES) |prefix| {
+            var cursor: []u8 = a.dupe(u8, "") catch return Error.OutOfMemory;
+            defer a.free(cursor);
+            while (true) {
+                var rr = bridge.node.prefix(self.dir_gid, prefix, cursor, 256) catch
+                    return Error.Replication;
+                defer rr.deinit();
+                if (rr.entries.len == 0) break;
+                for (rr.entries) |e| {
+                    out.append(a, .{
+                        .key = a.dupe(u8, e.key) catch return Error.OutOfMemory,
+                        .value = a.dupe(u8, e.value) catch return Error.OutOfMemory,
+                    }) catch return Error.OutOfMemory;
+                }
+                const done = rr.entries.len < 256;
+                const last = a.dupe(u8, rr.entries[rr.entries.len - 1].key) catch
+                    return Error.OutOfMemory;
+                a.free(cursor);
+                cursor = last;
+                if (done) break;
+            }
+        }
+        return out.toOwnedSlice(a) catch Error.OutOfMemory;
+    }
+
+    /// Put one backed-up row back, through the same replicated write every
+    /// other directory change takes. Refuses a key outside `BACKUP_AXES`: this
+    /// is reachable from an operator door, and a restore that could write any
+    /// key could rewrite the cluster topology out from under a live fleet.
+    pub fn restoreRow(self: *Directory, key: []const u8, value: []const u8) Error!void {
+        for (BACKUP_AXES) |prefix| {
+            if (std.mem.startsWith(u8, key, prefix) and key.len > prefix.len)
+                return self.applyDirWrite(key, value);
+        }
+        return Error.BadConfig;
+    }
+
     // ── Boot replay ──────────────────────────────────────────────────
 
     /// Rebuild the in-memory projection from the directory group's store:

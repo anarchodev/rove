@@ -142,7 +142,8 @@ def main() -> int:
         # the run walks them until it finds the leader.
         rc, _ = backup_tool("run", "--nodes",
                             ",".join(a.node_url(i) for i in range(3)),
-                            "--tenants", TENANT, "--run-id", RUN_ID)
+                            "--tenants", TENANT, "--run-id", RUN_ID,
+                            "--cp", f"http://127.0.0.1:{a.cp_port}")
         check("backup run", rc == 0)
 
         rc, out = backup_tool("show", "--run", RUN_ID)

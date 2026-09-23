@@ -535,7 +535,14 @@ const Router = struct {
         const is_delete = std.mem.eql(u8, path, "/_control/delete");
         const is_suspend = std.mem.eql(u8, path, "/_control/suspend");
         const is_unsuspend = std.mem.eql(u8, path, "/_control/unsuspend");
-        if (!(is_move or is_move_live or is_provision or is_plan or is_host or is_cert or is_cluster or is_node_addr or is_delete or is_suspend or is_unsuspend) or !std.mem.eql(u8, method_s, "POST")) {
+        // The directory backup pair (rove#964). Both are POSTs like everything
+        // else here, including the dump: it is a read, but a read of every
+        // tenant's placement and plan, so it takes the same gate and the same
+        // leader-forward as the writes rather than sitting on the unauthenticated
+        // `/_cp/` read surface.
+        const is_dir_dump = std.mem.eql(u8, path, "/_control/directory-dump");
+        const is_dir_restore = std.mem.eql(u8, path, "/_control/directory-restore");
+        if (!(is_move or is_move_live or is_provision or is_plan or is_host or is_cert or is_cluster or is_node_addr or is_delete or is_suspend or is_unsuspend or is_dir_dump or is_dir_restore) or !std.mem.eql(u8, method_s, "POST")) {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         }
@@ -560,7 +567,11 @@ const Router = struct {
         }
 
         const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
-        if (is_plan)
+        if (is_dir_dump)
+            try self.handleDirectoryDump(server, ent, sid, sess)
+        else if (is_dir_restore)
+            try self.handleDirectoryRestore(server, ent, sid, sess, body)
+        else if (is_plan)
             try self.handlePlan(server, ent, sid, sess, body)
         else if (is_host)
             try self.handleHost(server, ent, sid, sess, body)
@@ -582,6 +593,104 @@ const Router = struct {
             // `move` and `move-live` name the SAME (zero-downtime) move; both
             // route names are accepted so callers can use either.
             try self.handleMoveLive(server, ent, sid, sess, body);
+    }
+
+    /// `POST /_control/directory-dump` — every backed-up directory row, as
+    /// `{"rows":[{"k":…,"v":…}]}` with base64 values (rove#964).
+    ///
+    /// Base64 because the values are opaque: a plan blob is JSON, and nothing
+    /// here should start caring what a row means in order to copy it.
+    ///
+    /// What the dump covers and what it deliberately leaves out is
+    /// `Directory.BACKUP_AXES` — topology comes from config on a rebuilt
+    /// cluster, and certificates hold private keys this layer cannot seal.
+    fn handleDirectoryDump(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session) !void {
+        const a = self.allocator;
+        const rows = self.directory.dumpRows(a) catch |err| {
+            std.log.warn("rewind-cp: directory-dump failed: {s}", .{@errorName(err)});
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        defer Directory.freeRows(a, rows);
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(a);
+        const w = out.writer(a);
+        try w.writeAll("{\"rows\":[");
+        for (rows, 0..) |row, i| {
+            if (i > 0) try w.writeAll(",");
+            const enc = std.base64.standard.Encoder;
+            const buf = try a.alloc(u8, enc.calcSize(row.value.len));
+            defer a.free(buf);
+            _ = enc.encode(buf, row.value);
+            try w.print("{{\"k\":\"{s}\",\"v\":\"{s}\"}}", .{ row.key, buf });
+        }
+        try w.print("],\"count\":{d}}}", .{rows.len});
+        // `replyText` hands the buffer to the response, which frees it.
+        try replyText(server, ent, sid, sess, 200, try out.toOwnedSlice(a));
+    }
+
+    /// `POST /_control/directory-restore` — put a dump back into a directory
+    /// that has none of its own (rove#964).
+    ///
+    /// Refuses unless the directory holds NO placements. A restore is for a
+    /// rebuilt control plane; run against a live one it would overwrite
+    /// placements, plans and incarnations for tenants that are serving —
+    /// which is not a restore, it is an outage with a manifest. The cluster
+    /// definitions the rows reference must already be configured, because a
+    /// dump carries no topology by design.
+    fn handleDirectoryRestore(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
+        const a = self.allocator;
+        const placed = self.directory.listPlacements(a) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        defer {
+            for (placed) |p| a.free(p);
+            a.free(placed);
+        }
+        if (placed.len > 0) {
+            std.log.warn(
+                "rewind-cp: directory-restore refused — this directory already places {d} tenant(s)",
+                .{placed.len},
+            );
+            try replyStatus(server, ent, sid, sess, 409);
+            return;
+        }
+
+        var parsed = std.json.parseFromSlice(struct {
+            rows: []const struct { k: []const u8, v: []const u8 },
+        }, a, body, .{ .ignore_unknown_fields = true }) catch {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        defer parsed.deinit();
+
+        var applied: usize = 0;
+        for (parsed.value.rows) |row| {
+            const dec = std.base64.standard.Decoder;
+            const n = dec.calcSizeForSlice(row.v) catch {
+                try replyStatus(server, ent, sid, sess, 400);
+                return;
+            };
+            const value = try a.alloc(u8, n);
+            defer a.free(value);
+            dec.decode(value, row.v) catch {
+                try replyStatus(server, ent, sid, sess, 400);
+                return;
+            };
+            self.directory.restoreRow(row.k, value) catch |err| {
+                // A row outside the backed-up axes, or a write that did not
+                // commit. Either way the restore is incomplete, and saying so
+                // beats leaving an operator to discover it tenant by tenant.
+                std.log.warn("rewind-cp: directory-restore {s}: {s}", .{ row.k, @errorName(err) });
+                try replyStatus(server, ent, sid, sess, if (err == error.BadConfig) 422 else 500);
+                return;
+            };
+            applied += 1;
+        }
+        std.log.info("rewind-cp: directory-restore applied {d} row(s)", .{applied});
+        try replyStatus(server, ent, sid, sess, 204);
     }
 
     /// `POST /_control/cluster {id, nodes:[url,…]}` — define/update a cluster's
