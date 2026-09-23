@@ -468,6 +468,9 @@ fn workerMain(args: *WorkerCtx) !void {
     );
     defer catchup.deinit();
     catchup.backup_store = args.backup_store;
+    // A backup carries the tenant's sealed keyring alongside its store
+    // (rove#963); without the KEK this node cannot read its own copy.
+    catchup.keyring_kek = args.keyring_kek;
     try catchup.start();
     defer catchup.shutdown();
     // The same off-loop driver also runs CP-triggered move

@@ -28,6 +28,11 @@
 //!                 backup object store instead of a peer (rove#341). It lives
 //!                 in this family because it is the same capability: read a
 //!                 tenant's whole state out of the leader.
+//!   v2-keyring-restore — install one sealed keyring part (the tenant secret,
+//!                 or one shard) from a backup. The sibling of
+//!                 `v2-keyring-shard`, which replicates a shard a peer just
+//!                 minted; this one lands a tenant's keyring on a node that
+//!                 never had it (rove#963).
 //!
 //! ## Auth
 //!
@@ -162,6 +167,8 @@ pub fn tryHandleV2(
         try armSnapshotPush(server, allocator, worker, ent, sid, sess, method, rh);
     } else if (std.mem.eql(u8, sys_rest, "v2-backup")) {
         try armBackup(server, allocator, worker, ent, sid, sess, method, rh);
+    } else if (std.mem.eql(u8, sys_rest, "v2-keyring-restore")) {
+        try handleKeyringRestore(server, allocator, worker, ent, sid, sess, method, rh, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-plan")) {
         try handlePlan(server, allocator, worker, ent, sid, sess, method, path, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-suspend")) {
@@ -1830,6 +1837,85 @@ pub fn armBackup(
     driver.enqueueBackup(ent, tenant, key) catch
         return reply(server, allocator, ent, sid, sess, 500, "enqueue failed\n");
     // No reply — deferred to drainSnapshotPushes on completion.
+}
+
+/// `POST /_system/v2-keyring-restore` — land one sealed keyring part from a
+/// backup (rove#963). `X-Rewind-Keyring-Part` names it: `secret`, or
+/// `shard-{8 hex}`. The body is the sealed bytes, verbatim.
+///
+/// The sibling door, `v2-keyring-shard`, replicates a shard a peer just
+/// minted, and its frame carries the tenant and shard index because the
+/// SENDER is a live node. Here the sender is an object store with no opinion,
+/// so the addressing is in headers and the body is only bytes. Both verify
+/// under this node's KEK before anything lands: an unverified install poisons
+/// a node silently and surfaces at a failover.
+///
+/// Restore ORDER matters and the tool enforces it: the store dump goes first,
+/// so the tenant's `_keys/dead/` tombstones are present before the keyring is
+/// opened. `TenantKeys.open` reconciles against them, which is what stops a
+/// restore from resurrecting a key a crypto-shred destroyed — the erasure
+/// claim in docs (rove#592) depends on that ordering holding.
+pub fn handleKeyringRestore(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    rh: h2.ReqHeaders,
+    body: []const u8,
+) !void {
+    const secret = worker.move_secret orelse
+        return reply(server, allocator, ent, sid, sess, 404, "move surface disabled\n");
+    const presented = respb.findHeader(rh, MOVE_SECRET_HEADER) orelse "";
+    if (!constantTimeEql(presented, secret))
+        return reply(server, allocator, ent, sid, sess, 401, "bad move secret\n");
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+
+    const kek = worker.keyring_kek orelse
+        return reply(server, allocator, ent, sid, sess, 404, "keyring surface disabled\n");
+    const data_dir = worker.data_dir orelse
+        return reply(server, allocator, ent, sid, sess, 404, "keyring surface disabled\n");
+
+    const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing " ++ TENANT_HEADER ++ "\n");
+    const part = respb.findHeader(rh, wire.KEYRING_PART) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing " ++ wire.KEYRING_PART ++ "\n");
+
+    const dir = try keyring_shard.keyringDir(allocator, data_dir);
+    defer allocator.free(dir);
+
+    const err_ = blk: {
+        if (std.mem.eql(u8, part, "secret")) {
+            break :blk crypt.keyring.installSealedSecret(allocator, dir, tenant, kek, body);
+        }
+        const SHARD_PREFIX = "shard-";
+        if (std.mem.startsWith(u8, part, SHARD_PREFIX)) {
+            const shard = std.fmt.parseInt(u32, part[SHARD_PREFIX.len..], 16) catch
+                return reply(server, allocator, ent, sid, sess, 400, "bad shard in " ++ wire.KEYRING_PART ++ "\n");
+            break :blk crypt.keyring.installSealedShard(allocator, dir, tenant, kek, shard, body);
+        }
+        return reply(server, allocator, ent, sid, sess, 400, "unknown keyring part\n");
+    };
+    err_ catch |err| {
+        const status: u16 = switch (err) {
+            // Sealed under a different cluster KEK than this node opens
+            // with: the backup and this cluster are configured differently,
+            // and every part will fail the same way until that is fixed.
+            error.AuthFailed => 409,
+            // Includes the refusal to replace the secret of a keyring that
+            // has already minted — that would strand every pseudonym derived
+            // from the old one.
+            error.Corrupt => 422,
+            else => 500,
+        };
+        std.log.warn("v2-keyring-restore {s} part={s}: install failed: {s}", .{ tenant, part, @errorName(err) });
+        return reply(server, allocator, ent, sid, sess, status, "keyring install failed\n");
+    };
+
+    try reply(server, allocator, ent, sid, sess, 204, "");
 }
 
 /// SOURCE tick: respond to parked `v2-snapshot-push` requests as

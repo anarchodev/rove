@@ -454,6 +454,70 @@ pub const TenantKeys = struct {
 
 const testing = std.testing;
 
+test "a restored keyring does not resurrect a key the tenant destroyed" {
+    // The interlock a backup depends on (rove#963 / rove#592). Key material
+    // lives outside raft in node-local files, so an OLD backup's shard still
+    // holds a key that has since been destroyed. What makes restoring it safe
+    // is that the destroy rode the tenant's LOG: the tombstone comes back with
+    // the store, and `open` reconciles against it before anyone can reach the
+    // keyring.
+    //
+    // Get this wrong and a restore silently undoes an erasure — the one thing
+    // a backup must never do, and the reason the restore order (store first,
+    // keyring second) is load-bearing rather than stylistic.
+    const a = testing.allocator;
+    var path_buf: [96]u8 = undefined;
+    const seed = std.crypto.random.int(u64);
+    const db_path = try std.fmt.bufPrintZ(&path_buf, "/tmp/rove-tk-test-{x}.kv", .{seed});
+    // LMDB (NOSUBDIR) writes `path` and `path-lock`; both go.
+    var lock_buf: [128]u8 = undefined;
+    const lock_path = try std.fmt.bufPrint(&lock_buf, "{s}-lock", .{db_path});
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        std.fs.cwd().deleteFile(lock_path) catch {};
+    }
+    var dir_buf: [96]u8 = undefined;
+    const kr_dir = try std.fmt.bufPrint(&dir_buf, "/tmp/rove-tk-keyring-{x}", .{seed});
+    defer std.fs.cwd().deleteTree(kr_dir) catch {};
+
+    const kek = "a cluster key-encryption key";
+    const destroyed_slot: u64 = 7;
+    const live_slot: u64 = 8;
+
+    // The backup's keyring: both slots present, taken before the destroy.
+    {
+        var kr = try crypt.keyring.Keyring.create(a, kr_dir, "acme", kek, [_]u8{0x5A} ** 32);
+        defer kr.deinit();
+        try kr.mintRange(destroyed_slot, 2, 1);
+        try testing.expect(kr.keyAt(destroyed_slot) != null);
+    }
+
+    // The store that comes back with it: the destroy is in the log, so the
+    // tombstone is in the restored state.
+    const store = try kv_mod.KvStore.open(a, db_path);
+    defer store.close();
+    const dead = try keyspace.deadKey(a, destroyed_slot);
+    defer a.free(dead);
+    try store.put(dead, &keyspace.encodeDead(1));
+
+    const keys = (try TenantKeys.open(a, kr_dir, "acme", kek, store)).?;
+    defer keys.deinit();
+
+    // Reconciliation runs inside `open`, before this line can observe
+    // anything — a node that served before reconciling could hand out a key
+    // it had already been told to destroy.
+    try testing.expect(keys.lookup(destroyed_slot) == .shredded);
+    try testing.expect(keys.lookup(live_slot) == .key);
+
+    // And it is gone from the FILE, not merely hidden in memory: a restore
+    // that left the key on disk would hand it back at the next open.
+    _ = try keys.drainDestroys();
+    var reopened = try crypt.keyring.Keyring.open(a, kr_dir, "acme", kek);
+    defer reopened.deinit();
+    try testing.expect(reopened.keyAt(destroyed_slot) == null);
+    try testing.expect(reopened.keyAt(live_slot) != null);
+}
+
 test "the two locks have distinct jobs, and reads never take the slow one" {
     // The reason this object exists. A read resolving a sealed value runs
     // on the poll loop, so it must never wait on a shard rewrite — the

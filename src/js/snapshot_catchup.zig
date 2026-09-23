@@ -36,6 +36,8 @@ const tenant_mod = @import("rove-tenant");
 const blob_mod = @import("rove-blob");
 const bridge_mod = @import("bridge");
 const snapshot_sink_mod = @import("snapshot_sink.zig");
+const crypt = @import("rove-crypt");
+const keyring_mod = @import("rove-keyring");
 const wire = @import("rove-wire");
 const curl = blob_mod.curl;
 
@@ -111,6 +113,11 @@ pub const SnapshotCatchupThread = struct {
     /// loudly rather than reporting success for a backup nobody took.
     /// Borrowed: the worker owns it for the process lifetime.
     backup_store: ?*blob_mod.S3BlobStore = null,
+    /// Cluster KEK (`REWIND_KEYRING_KEK`), for reading a tenant's sealed
+    /// keyring out of the node's own directory during a backup (rove#963).
+    /// Null → keyrings are disabled on this node and a backup carries the
+    /// store alone, which it says in the parts it reports.
+    keyring_kek: ?[]const u8 = null,
     /// Page-pinning bound: max wall-clock per-transfer duration
     /// (`REWIND_SNAPSHOT_XFER_MAX_MS`). Read once at init.
     xfer_max_ms: i64 = 10 * 60 * 1000,
@@ -475,6 +482,7 @@ pub const SnapshotCatchupThread = struct {
     /// Multipart above `BACKUP_PART_BYTES` so a tenant larger than memory is
     /// still backed up: parts are uploaded as they fill, never accumulated.
     fn runBackup(self: *Self, job: *Job) void {
+        var key_buf: [1024]u8 = undefined;
         const store = self.backup_store orelse {
             std.log.warn("v2 backup tenant={s}: no backup target configured (BACKUP_S3_*)", .{job.id_str});
             self.postCompletion(job.entity, 0);
@@ -490,7 +498,22 @@ pub const SnapshotCatchupThread = struct {
         };
         defer dumper.deinit();
 
-        if (!self.uploadDump(store, key, job.id_str, &dumper)) {
+        const snap_key = storeKey(&key_buf, key) orelse {
+            std.log.warn("v2 backup tenant={s}: backup key too long", .{job.id_str});
+            self.postCompletion(job.entity, 0);
+            return;
+        };
+        if (!self.uploadDump(store, snap_key, job.id_str, &dumper)) {
+            self.postCompletion(job.entity, 0);
+            return;
+        }
+
+        // The keyring, as SEALED bytes. Without it a restored tenant's sealed
+        // values stay sealed: the store carries the ciphertext and the keys
+        // live outside raft, in node-local files.
+        var parts: std.ArrayListUnmanaged(u8) = .empty;
+        defer parts.deinit(self.allocator);
+        if (!self.uploadKeyring(store, key, job.id_str, &parts)) {
             self.postCompletion(job.entity, 0);
             return;
         }
@@ -513,10 +536,91 @@ pub const SnapshotCatchupThread = struct {
             // `store_id` is a STRING: it is a u64, and both JSON numbers and
             // the JS that may one day read this manifest lose precision above
             // 2^53. An identity that arrives rounded is not an identity.
-            "{{\"tenant\":\"{s}\",\"key\":\"{s}\",\"store_id\":\"{d}\",\"incarnation\":\"{s}\"}}",
-            .{ job.id_str, key, inst.kv.store_id, incarnation },
+            "{{\"tenant\":\"{s}\",\"prefix\":\"{s}\",\"store_id\":\"{d}\"," ++
+                "\"incarnation\":\"{s}\",\"keyring_parts\":[{s}]}}",
+            .{ job.id_str, key, inst.kv.store_id, incarnation, parts.items },
         ) catch null;
         self.postCompletionDetail(job.entity, 200, detail);
+    }
+
+    /// The object names inside one tenant's backup. The door takes a PREFIX
+    /// and the worker names the parts, because the worker is what knows which
+    /// parts exist — a tenant may have one shard or twenty, and only this
+    /// process can see its keyring directory.
+    fn storeKey(buf: []u8, prefix: []const u8) ?[]const u8 {
+        // Null rather than the bare prefix on overflow: falling back would
+        // upload the dump to a key the manifest does not name, and the
+        // restore that found nothing would be the first anyone heard of it.
+        return std.fmt.bufPrint(buf, "{s}.snap", .{prefix}) catch null;
+    }
+
+    /// Copy the tenant's keyring — the sealed secret plus every sealed shard —
+    /// into the backup store beside its dump, and append each part's name to
+    /// `parts` as a JSON string (the door reports them; the manifest records
+    /// them, and a restore replays exactly that list).
+    ///
+    /// Bytes move VERBATIM, never re-encoded: what a restore installs is then
+    /// exactly what this node holds, and nothing is decrypted to make the
+    /// copy. The backup is ciphertext throughout — useless without the cluster
+    /// KEK, which lives in SOPS and never in the backup store. That is the
+    /// property that makes shipping it off-provider defensible at all.
+    ///
+    /// A tenant with no keyring (keyrings disabled, or a tenant that never
+    /// sealed anything) yields no parts and is not an error: the empty list in
+    /// the manifest is the honest record of what was there.
+    fn uploadKeyring(
+        self: *Self,
+        store: *blob_mod.S3BlobStore,
+        prefix: []const u8,
+        tenant: []const u8,
+        parts: *std.ArrayListUnmanaged(u8),
+    ) bool {
+        const a = self.allocator;
+        const kek = self.keyring_kek orelse return true;
+        const dir = keyring_mod.keyspace.keyringDir(a, self.tenant.dir) catch return false;
+        defer a.free(dir);
+
+        var key_buf: [1024]u8 = undefined;
+
+        const secret = crypt.keyring.readSealedSecret(a, dir, tenant, kek) catch |e| {
+            std.log.warn("v2 backup tenant={s}: keyring secret unreadable: {s}", .{ tenant, @errorName(e) });
+            return false;
+        };
+        if (secret) |sealed| {
+            defer a.free(sealed);
+            const key = std.fmt.bufPrint(&key_buf, "{s}.kr", .{prefix}) catch return false;
+            store.blobStore().put(key, sealed) catch |e| {
+                std.log.warn("v2 backup tenant={s}: keyring secret put failed: {s}", .{ tenant, @errorName(e) });
+                return false;
+            };
+            parts.appendSlice(a, "\"secret\"") catch return false;
+        } else {
+            // No secret means no keyring at all: a tenant that has never
+            // sealed anything. Shards cannot exist without it, so stop here
+            // rather than report a partial keyring as a whole one.
+            return true;
+        }
+
+        const shards = crypt.keyring.listShards(a, dir, tenant) catch |e| {
+            std.log.warn("v2 backup tenant={s}: keyring listing failed: {s}", .{ tenant, @errorName(e) });
+            return false;
+        };
+        defer a.free(shards);
+
+        for (shards) |shard| {
+            const sealed = (crypt.keyring.readSealedShard(a, dir, tenant, kek, shard) catch |e| {
+                std.log.warn("v2 backup tenant={s} shard={d}: unreadable: {s}", .{ tenant, shard, @errorName(e) });
+                return false;
+            }) orelse continue; // emptied between the listing and the read
+            defer a.free(sealed);
+            const key = std.fmt.bufPrint(&key_buf, "{s}.shard-{x:0>8}", .{ prefix, shard }) catch return false;
+            store.blobStore().put(key, sealed) catch |e| {
+                std.log.warn("v2 backup tenant={s} shard={d}: put failed: {s}", .{ tenant, shard, @errorName(e) });
+                return false;
+            };
+            parts.writer(a).print(",\"shard-{x:0>8}\"", .{shard}) catch return false;
+        }
+        return true;
     }
 
     /// Pull the dump and put it in the backup store. True on success; every
