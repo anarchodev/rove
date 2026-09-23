@@ -553,15 +553,18 @@ pub const SnapshotCatchupThread = struct {
 
         // The CLUSTER-wide object families, from the same authority for the
         // same reason: they hang off the resolved key-prefix base, which
-        // includes the storage generation. A tool that composed
-        // `{base}_logs/` from its own env would walk a prefix the cluster
-        // does not write to and report a cheerful zero.
-        const shared = std.fmt.allocPrint(
-            self.allocator,
-            "\"{s}_logs/\",\"{s}_pool/\"",
-            .{ self.key_prefix_base, self.key_prefix_base },
-        ) catch null;
-        defer if (shared) |sh| self.allocator.free(sh);
+        // carries the storage generation. A tool that composed `{base}_logs/`
+        // from its own env walks a prefix the cluster does not write to and
+        // reports a cheerful zero — so the rule lives with the per-tenant one
+        // (`tenant_mod.sharedPrefix`), not here.
+        var shared_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer shared_buf.deinit(self.allocator);
+        for (tenant_mod.SHARED_FAMILIES, 0..) |family, fi| {
+            const p = tenant_mod.sharedPrefix(self.allocator, self.key_prefix_base, family) catch continue;
+            defer self.allocator.free(p);
+            if (fi > 0) shared_buf.appendSlice(self.allocator, ",") catch {};
+            shared_buf.writer(self.allocator).print("\"{s}\"", .{p}) catch {};
+        }
 
         const detail = std.fmt.allocPrint(
             self.allocator,
@@ -571,7 +574,7 @@ pub const SnapshotCatchupThread = struct {
             "{{\"tenant\":\"{s}\",\"prefix\":\"{s}\",\"store_id\":\"{d}\"," ++
                 "\"incarnation\":\"{s}\",\"keyring_parts\":[{s}]," ++
                 "\"object_prefixes\":[{s}],\"shared_prefixes\":[{s}]}}",
-            .{ job.id_str, key, inst.kv.store_id, incarnation, parts.items, prefixes.items, shared orelse "" },
+            .{ job.id_str, key, inst.kv.store_id, incarnation, parts.items, prefixes.items, shared_buf.items },
         ) catch null;
         self.postCompletionDetail(job.entity, 200, detail);
     }

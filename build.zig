@@ -822,6 +822,12 @@ pub fn build(b: *std.Build) void {
 
     const tenant_tests = b.addTest(.{ .root_module = tenant_mod });
     test_step.dependOn(&b.addRunArtifact(tenant_tests).step);
+    // Named step, like `keyring-test`: the storage-identity rules are edited
+    // far more often than the whole gate is worth paying for, and a module
+    // whose tests only the gate builds is one whose compile errors surface
+    // ten minutes late.
+    const tenant_step = b.step("tenant-test", "Run the tenant storage-identity tests");
+    tenant_step.dependOn(&b.addRunArtifact(tenant_tests).step);
 
     // ── wire-headers: THE registry of platform-reserved header names.
     //    Pure std — no rove-blob, so no libcurl — because the binaries that

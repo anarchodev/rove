@@ -64,6 +64,9 @@ pub const TenantStorage = storage_mod.TenantStorage;
 pub const Incarnation = storage_mod.Incarnation;
 /// Every per-tenant S3 subdir — the set a teardown sweep must cover.
 pub const SUBDIRS = storage_mod.SUBDIRS;
+/// The cluster-scoped object families + their prefix rule (rove#965).
+pub const SHARED_FAMILIES = storage_mod.SHARED_FAMILIES;
+pub const sharedPrefix = storage_mod.sharedPrefix;
 
 pub const Error = error{
     InvalidInstanceId,
