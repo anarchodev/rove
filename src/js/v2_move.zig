@@ -24,6 +24,10 @@
 //!   v2-forward-* — open/close the source→dest live-write forward stream.
 //!   v2-evict    — destroy the source raft group + drop the instance once the
 //!                 directory has flipped (source cleanup).
+//!   v2-backup   — the same held-snapshot dump, written to the off-provider
+//!                 backup object store instead of a peer (rove#341). It lives
+//!                 in this family because it is the same capability: read a
+//!                 tenant's whole state out of the leader.
 //!
 //! ## Auth
 //!
@@ -156,6 +160,8 @@ pub fn tryHandleV2(
         try keyring_shard.handlePush(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-snapshot-push")) {
         try armSnapshotPush(server, allocator, worker, ent, sid, sess, method, rh);
+    } else if (std.mem.eql(u8, sys_rest, "v2-backup")) {
+        try armBackup(server, allocator, worker, ent, sid, sess, method, rh);
     } else if (std.mem.eql(u8, sys_rest, "v2-plan")) {
         try handlePlan(server, allocator, worker, ent, sid, sess, method, path, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-suspend")) {
@@ -1566,7 +1572,17 @@ pub fn armSnapshotStream(
             // Zero-downtime move: insert-if-absent into the already-attached,
             // already-forwarded group. No baseline, no leadership check — it
             // applies out-of-band on EVERY destination node.
-            loader_opts = .{ .clear_existing = false, .skip_existing = true };
+            loader_opts = .{
+                .clear_existing = false,
+                .skip_existing = true,
+                // A move's source and destination are the same tenant
+                // lifetime, so their store ids agree by construction; a
+                // restore from a backup only agrees if the destination was
+                // attached under the incarnation the dump came from. Pin it
+                // either way: the failure is a load that reports success and
+                // reads back empty.
+                .expect_store_id = inst.kv.store_id,
+            };
         },
         .replace => {
             // Catch-up / promote-back: a data-free baseline must be a real
@@ -1602,7 +1618,7 @@ pub fn armSnapshotStream(
                 return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
             if (worker.raft.isLeaderOf(gid))
                 return reply(server, allocator, ent, sid, sess, 409, "leader can't restore a snapshot to itself\n");
-            loader_opts = .{ .clear_existing = true };
+            loader_opts = .{ .clear_existing = true, .expect_store_id = inst.kv.store_id };
         },
     }
 
@@ -1645,7 +1661,18 @@ pub fn drainSnapshotStreams(worker: anytype) !void {
 
         var status: u16 = 204;
         if (box.failed) {
-            status = 500;
+            status = if (box.fail_err != null and box.fail_err.? == kv_mod.snapshot_stream.Error.StoreIdMismatch) blk: {
+                // A whole, well-formed stream for a DIFFERENT tenant lifetime.
+                // Refused at the header, so nothing was applied. Named loudly
+                // because the alternative — accepting it — is a restore that
+                // reports success and reads back empty.
+                std.log.warn(
+                    "v2-snapshot-stream {s}: refused — the stream's store id is not this group's; " ++
+                        "the destination must be attached under the incarnation the dump came from",
+                    .{box.tenant},
+                );
+                break :blk 409;
+            } else 500;
         } else if (box.finish()) |_| {
             switch (box.mode) {
                 .replace => {
@@ -1749,6 +1776,62 @@ pub fn armSnapshotPush(
     // No reply — deferred to drainSnapshotPushes on completion.
 }
 
+/// `POST /_system/v2-backup` — write this tenant's state to the off-provider
+/// backup store (rove#341). Leader-only, like every other read of the whole
+/// store: a follower can lag arbitrarily, and a backup whose recency is
+/// unknown cannot support a stated RPO.
+///
+/// The operator names the object (`X-Rewind-Backup-Key`), because the run that
+/// groups a fleet's tenants into one restorable set is the one that knows what
+/// that set is called. The worker refuses a key it cannot safely address.
+///
+/// Restore is NOT a door: the operator fetches the object and POSTs it to
+/// `v2-snapshot-stream`, the same path a move's destination already serves —
+/// so the restore side has no code of its own to be wrong.
+pub fn armBackup(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    rh: h2.ReqHeaders,
+) !void {
+    const secret = worker.move_secret orelse
+        return reply(server, allocator, ent, sid, sess, 404, "move surface disabled\n");
+    const presented = respb.findHeader(rh, MOVE_SECRET_HEADER) orelse "";
+    if (!constantTimeEql(presented, secret))
+        return reply(server, allocator, ent, sid, sess, 401, "bad move secret\n");
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing " ++ TENANT_HEADER ++ "\n");
+    const key = respb.findHeader(rh, wire.BACKUP_KEY) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing " ++ wire.BACKUP_KEY ++ "\n");
+    // The same validation every other key this platform writes gets. A key
+    // with a traversal segment would address another run's object.
+    blob.validateKey(key) catch
+        return reply(server, allocator, ent, sid, sess, 400, "invalid backup key\n");
+
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 409, "tenant not active on this cluster\n");
+    if (!worker.raft.isLeaderOf(gid))
+        return reply(server, allocator, ent, sid, sess, 421, "not the leader for this tenant; try another node\n");
+
+    const driver = worker.snapshot_push_driver orelse
+        return reply(server, allocator, ent, sid, sess, 503, "snapshot push driver not wired\n");
+    if (driver.backup_store == null)
+        return reply(server, allocator, ent, sid, sess, 503, "no backup target configured (BACKUP_S3_*)\n");
+
+    // Park FIRST (deferred move — walk-safe), then enqueue; the upload runs
+    // off-loop and `drainSnapshotPushes` matches the completion back here.
+    try server.reg.move(ent, server.coll(.request_out), worker.snapshot_pushes);
+    driver.enqueueBackup(ent, tenant, key) catch
+        return reply(server, allocator, ent, sid, sess, 500, "enqueue failed\n");
+    // No reply — deferred to drainSnapshotPushes on completion.
+}
+
 /// SOURCE tick: respond to parked `v2-snapshot-push` requests as
 /// the off-loop driver finishes them. Each completion carries the parked
 /// `Entity` + the dest's HTTP status (0 = local/transport failure → 502).
@@ -1762,14 +1845,22 @@ pub fn drainSnapshotPushes(worker: anytype, driver: anytype) !void {
         if (!server.reg.isInCollection(c.entity, worker.snapshot_pushes)) {
             // The park move hasn't flushed yet (a completion that beat the same
             // tick's flush — vanishingly rare given network RTT ≫ flush). Re-post
-            // so we match it next tick rather than drop the reply.
-            driver.postCompletion(c.entity, c.status);
+            // so we match it next tick rather than drop the reply. The body
+            // rides along; dropping it here would answer the retry with an
+            // empty one.
+            driver.postCompletionDetail(c.entity, c.status, c.detail);
             continue;
         }
         const status: u16 = if (c.status == 0) 502 else c.status;
         try server.reg.set(c.entity, worker.snapshot_pushes, h2.Status, .{ .code = status });
         try server.reg.set(c.entity, worker.snapshot_pushes, h2.RespHeaders, .{ .fields = null, .count = 0 });
-        try server.reg.set(c.entity, worker.snapshot_pushes, h2.RespBody, .{ .data = null, .len = 0 });
+        // Ownership of `detail` passes to the response (freed with the rest of
+        // the response allocation), exactly as `setSystemResponse`'s dupe is.
+        if (c.detail) |d| {
+            try server.reg.set(c.entity, worker.snapshot_pushes, h2.RespBody, .{ .data = d.ptr, .len = @intCast(d.len) });
+        } else {
+            try server.reg.set(c.entity, worker.snapshot_pushes, h2.RespBody, .{ .data = null, .len = 0 });
+        }
         try server.reg.set(c.entity, worker.snapshot_pushes, h2.H2IoResult, .{ .err = 0 });
         try server.reg.move(c.entity, worker.snapshot_pushes, server.coll(.response_in));
     }

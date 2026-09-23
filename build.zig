@@ -1074,6 +1074,28 @@ pub fn build(b: *std.Build) void {
     const ls_step = b.step("rewind-logs", "Build the V2 log-server / tape indexer binary");
     ls_step.dependOn(&b.addInstallArtifact(ls_standalone, .{}).step);
 
+    // rewind-backup: off-provider backup + restore of tenant state (rove#341).
+    // Its own binary rather than a `rewind-ops` verb because it holds
+    // DIFFERENT credentials — the backup target's keys and the move secret,
+    // never the cluster root token. The thing that can read every tenant's
+    // state out of the cluster should not also be the thing that can deploy
+    // code into it.
+    const backup_mod = b.addModule("rewind-backup", .{
+        .root_source_file = b.path("src/backup/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    backup_mod.addImport("rove-blob", blob_mod);
+    backup_mod.addImport("wire-headers", wire_headers_mod);
+    backup_mod.link_libc = true;
+    const backup_exe = b.addExecutable(.{
+        .name = "rewind-backup",
+        .root_module = backup_mod,
+    });
+    b.installArtifact(backup_exe);
+    const backup_step = b.step("rewind-backup", "Build the off-provider backup/restore tool");
+    backup_step.dependOn(&b.addInstallArtifact(backup_exe, .{}).step);
+
     // V1→V2 cutover: `kv-maelstrom` (examples/kv_maelstrom.zig) drove
     // Maelstrom linearizability against the V1 willemt `RaftNode` — RETIRED.
     // V2 consensus (raft-rs) is exercised by the `v2-test` + cluster smokes.
@@ -1954,6 +1976,7 @@ pub fn build(b: *std.Build) void {
     for ([_]*std.Build.Step.Compile{
         rewind_exe, cp_exe,      front_exe,      ls_standalone, ops_exe,
         cli_exe,    echo_server, h2_echo_server, ws_echo_exe,   s3_blob_smoke,
+        backup_exe,
     }) |exe| {
         smoke_bins_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
         // The gate COMPILES the whole closure (installing nothing): a

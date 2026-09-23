@@ -90,11 +90,43 @@ pub fn envOpt(allocator: std.mem.Allocator, name: []const u8) error{OutOfMemory}
     };
 }
 
+/// The env prefix naming the OFF-PROVIDER backup target (rove#341). A backup
+/// that lives in the same account as the data it protects does not survive
+/// the scenarios that motivate having one — a compromise, a billing dispute,
+/// an operator mistake with broad reach — so the target is configured as a
+/// SEPARATE store with its own endpoint and its own credentials, not as a
+/// second prefix in the live bucket.
+pub const BACKUP_ENV_PREFIX = "BACKUP_";
+
+/// Read an optional env var whose name is `prefix ++ name`.
+fn envOptPrefixed(
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    name: []const u8,
+) error{OutOfMemory}!?[]u8 {
+    if (prefix.len == 0) return envOpt(allocator, name);
+    var buf: [128]u8 = undefined;
+    const full = std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, name }) catch
+        return error.OutOfMemory;
+    return envOpt(allocator, full);
+}
+
 /// Build a `BlobBackendOwned` from process env. Returns specific
 /// `LoadError` values for missing required S3 settings so each binary
 /// can print its own diagnostic.
 pub fn loadFromEnv(allocator: std.mem.Allocator) LoadError!BlobBackendOwned {
-    const endpoint_raw = (try envOpt(allocator, ENV_S3_ENDPOINT)) orelse return LoadError.MissingS3Endpoint;
+    return loadFromEnvPrefixed(allocator, "");
+}
+
+/// `loadFromEnv` against a prefixed copy of the same variable names, so a
+/// binary can open a SECOND store — the backup target (`BACKUP_ENV_PREFIX`)
+/// — through the one loader rather than a parallel env contract that drifts
+/// from this one.
+pub fn loadFromEnvPrefixed(
+    allocator: std.mem.Allocator,
+    env_prefix: []const u8,
+) LoadError!BlobBackendOwned {
+    const endpoint_raw = (try envOptPrefixed(allocator, env_prefix, ENV_S3_ENDPOINT)) orelse return LoadError.MissingS3Endpoint;
     // Normalize to a bare host at the single load point: operators
     // habitually set `S3_ENDPOINT=https://…` and `S3BlobStore.init`
     // tolerates it by stripping, but every OTHER consumer of
@@ -114,21 +146,21 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) LoadError!BlobBackendOwned {
         break :blk trimmed;
     };
     errdefer allocator.free(endpoint);
-    const region = (try envOpt(allocator, ENV_S3_REGION)) orelse return LoadError.MissingS3Region;
+    const region = (try envOptPrefixed(allocator, env_prefix, ENV_S3_REGION)) orelse return LoadError.MissingS3Region;
     errdefer allocator.free(region);
-    const bucket = (try envOpt(allocator, ENV_S3_BUCKET)) orelse return LoadError.MissingS3Bucket;
+    const bucket = (try envOptPrefixed(allocator, env_prefix, ENV_S3_BUCKET)) orelse return LoadError.MissingS3Bucket;
     errdefer allocator.free(bucket);
-    const access_key = (try envOpt(allocator, ENV_AWS_AK)) orelse return LoadError.MissingS3AccessKey;
+    const access_key = (try envOptPrefixed(allocator, env_prefix, ENV_AWS_AK)) orelse return LoadError.MissingS3AccessKey;
     errdefer allocator.free(access_key);
-    const secret_key = (try envOpt(allocator, ENV_AWS_SK)) orelse return LoadError.MissingS3SecretKey;
+    const secret_key = (try envOptPrefixed(allocator, env_prefix, ENV_AWS_SK)) orelse return LoadError.MissingS3SecretKey;
     errdefer allocator.free(secret_key);
 
-    const key_prefix_base = (try envOpt(allocator, ENV_S3_KEY_PREFIX_BASE)) orelse
+    const key_prefix_base = (try envOptPrefixed(allocator, env_prefix, ENV_S3_KEY_PREFIX_BASE)) orelse
         try allocator.dupe(u8, "");
     errdefer allocator.free(key_prefix_base);
 
     const use_tls = blk: {
-        const v = (try envOpt(allocator, ENV_S3_USE_TLS)) orelse break :blk true;
+        const v = (try envOptPrefixed(allocator, env_prefix, ENV_S3_USE_TLS)) orelse break :blk true;
         defer allocator.free(v);
         if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) break :blk false;
         break :blk true;
