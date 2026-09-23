@@ -144,6 +144,23 @@ pub const H2IoResult = struct {
     /// left this process (never serialized, or its covering write failed
     /// before any byte was queued), so a re-send cannot double-execute.
     head_written: bool = false,
+    /// The PEER attested that it did not process this stream: `REFUSED_STREAM`,
+    /// which is what a draining server sends for streams above its GOAWAY's
+    /// `last_stream_id` (RFC 9113 §8.7).
+    ///
+    /// Distinct from `head_written = false`, and the difference is the whole
+    /// point. That field answers "did this process put the head on the wire",
+    /// which a caller may over-estimate to stay safe; this one is the far end
+    /// saying it ran nothing. A caller hedging on its own uncertainty must let
+    /// the attestation win, or a polite shutdown is indistinguishable from a
+    /// crash and every in-flight request pays a 502 for it.
+    head_refused: bool = false,
+    /// The h2 error code the stream ended with (RFC 9113 §7), 0 when it
+    /// ended cleanly or the failure was not stream-level. Diagnostic only —
+    /// no decision reads it — but "the forward failed" is unattributable
+    /// without it, which is how a stream reset by the peer and a connection
+    /// that died came to look identical in the logs (rove#353).
+    stream_error: u32 = 0,
 };
 
 /// Per-WebSocket-message metadata on a WS seam entity
@@ -978,12 +995,47 @@ pub fn H2(comptime opts: Options) type {
         }
 
         /// Find the current collection of a client stream entity, set H2IoResult, and move to client_response_out.
-        fn clientStreamClose(h2: *Self, entity: Entity, err: i32, head_written: bool) void {
+        fn clientStreamClose(
+            h2: *Self,
+            entity: Entity,
+            err: i32,
+            head_written: bool,
+            head_refused: bool,
+            stream_error: u32,
+        ) void {
             if (comptime !has_client) return;
             const k = h2.collectionOf(entity) orelse return;
             const src = h2.clientChainColl(k) orelse return;
-            h2.reg.set(entity, src, H2IoResult, .{ .err = err, .head_written = head_written }) catch {};
+            h2.reg.set(entity, src, H2IoResult, .{
+                .err = err,
+                .head_written = head_written,
+                .head_refused = head_refused,
+                .stream_error = stream_error,
+            }) catch {};
             h2.reg.move(entity, src, h2.coll(.client_response_out)) catch {};
+        }
+
+        /// Record ON THE ENTITY that this request's head entered the send
+        /// buffer. `Stream.head_send_mark` says the same thing, but it lives
+        /// in nghttp2's stream user data and dies with the connection — and
+        /// the terminal path that matters most for a peer going away,
+        /// `sweepOrphanedClient`, fires precisely BECAUSE the connection is
+        /// gone, with no stream left to ask. A consumer reading
+        /// `head_written = false` there would replay a request that may have
+        /// executed (rove#532), so the fact is written down where it
+        /// survives the connection, at the moment it becomes true.
+        ///
+        /// This is the coarse floor. `clientStreamClose` still recomputes the
+        /// refined answer on the normal path (a head serialized into a write
+        /// that then failed queued nothing, and REFUSED_STREAM is the peer
+        /// saying it ran nothing) and overwrites this.
+        fn markHeadWritten(h2: *Self, entity: Entity) void {
+            if (comptime !has_client) return;
+            if (entity.isNil() or h2.reg.isStale(entity)) return;
+            const k = h2.collectionOf(entity) orelse return;
+            const src = h2.clientChainColl(k) orelse return;
+            const io = h2.reg.get(entity, src, H2IoResult) catch return;
+            io.head_written = true;
         }
 
         /// Get the Conn component for a connection entity (searches the three conn collections).
@@ -1259,6 +1311,41 @@ pub fn H2(comptime opts: Options) type {
             const conn_ptr = getConn(h2, conn_entity) orelse return;
             const ng = conn_ptr.ng_session orelse return;
             _ = c.nghttp2_submit_rst_stream(ng, c.NGHTTP2_FLAG_NONE, @intCast(stream_id), c.NGHTTP2_CANCEL);
+        }
+
+        /// Can this client session still open a NEW stream? False once the
+        /// peer's GOAWAY has landed (or the stream-id space is exhausted).
+        ///
+        /// A GOAWAY leaves the socket open, so nothing a connection pool can
+        /// see from the outside changes — the session is live, the entity is
+        /// not stale — while nghttp2 refuses every subsequent
+        /// `submit_request` on it. Without this question a pool keeps
+        /// choosing such a leg and spends one failed attempt per request for
+        /// the whole of the peer's drain window (rove#547).
+        pub fn clientSessionAcceptsStreams(h2: *Self, conn_entity: Entity) bool {
+            if (comptime !has_client) return false;
+            const conn_ptr = getConn(h2, conn_entity) orelse return false;
+            // Our OWN queued GOAWAY counts too — `reapIdleConnections` marks
+            // a leg `draining` a poll before it dies. Only the peer's GOAWAY
+            // reaches `check_request_allowed`, so without this a caller keeps
+            // picking a connection this process has already decided to close.
+            if (conn_ptr.draining) return false;
+            const ng = conn_ptr.ng_session orelse return false;
+            return c.nghttp2_session_check_request_allowed(ng) != 0;
+        }
+
+        /// Mark a client session as in use. The idle reaper judges by
+        /// `last_active_ns`, which a request does not move until its bytes
+        /// are actually serialized — a poll pass or more after a caller
+        /// commits to the connection. In that window the reaper can retire a
+        /// leg out from under a request already aimed at it, and the head
+        /// then lands on a connection this process is closing: a failure the
+        /// caller can only read as ambiguous, and so may not retry. Callers
+        /// that pool connections stamp the leg when they choose it.
+        pub fn touchClientSession(h2: *Self, conn_entity: Entity) void {
+            if (comptime !has_client) return;
+            const conn_ptr = getConn(h2, conn_entity) orelse return;
+            conn_ptr.last_active_ns = monotonicNs();
         }
 
         /// Abort a server-direction stream whose response can no longer
@@ -2295,7 +2382,14 @@ pub fn H2(comptime opts: Options) type {
                     }
                     break :blk true;
                 };
-                clientStreamClose(nctx.h2, s.entity, err, head_written);
+                clientStreamClose(
+                    nctx.h2,
+                    s.entity,
+                    err,
+                    head_written,
+                    error_code == c.NGHTTP2_REFUSED_STREAM,
+                    error_code,
+                );
             }
 
             s.send_data = null;
@@ -2327,6 +2421,7 @@ pub fn H2(comptime opts: Options) type {
             if (getConn(nctx.h2, nctx.conn_entity)) |cp| {
                 s.head_send_mark = cp.send_seq + 1;
             }
+            markHeadWritten(nctx.h2, s.entity);
             return 0;
         }
 
@@ -2417,6 +2512,14 @@ pub fn H2(comptime opts: Options) type {
             request_out: usize,
             response_in: usize,
             response_out: usize,
+            /// Server-direction streams open right now: HEADERS read and the
+            /// response's END_STREAM not yet sent. This is the in-flight
+            /// REQUEST count, and unlike the collection lengths above it
+            /// cannot miss a state — a request parked mid-body, waiting on a
+            /// raft commit, or having its response written is open on all of
+            /// them. A drain that judges quiescence from anything narrower
+            /// exits on top of live work (rove#547).
+            server_open_streams: usize,
             conn_active: usize,
             conn_tls_handshake: usize,
             handshake_reaped: u64,
@@ -2431,6 +2534,13 @@ pub fn H2(comptime opts: Options) type {
         };
 
         pub fn connStats(self: *Self) ConnStats {
+            var server_open: usize = 0;
+            for (self._conn_active.entitySlice()) |ent| {
+                if (self.reg.isStale(ent)) continue;
+                const cp = self.reg.get(ent, self.coll(._conn_active), Conn) catch continue;
+                if (cp.direction != .server) continue;
+                server_open += cp.open_streams;
+            }
             const drain = self.io.recv_buffers_returned;
             // Structurally zero: a registered buffer is released by
             // TRANSITION, so every path that drops a read entity returns it
@@ -2455,6 +2565,7 @@ pub fn H2(comptime opts: Options) type {
                 .request_out = self.request_out.entitySlice().len,
                 .response_in = self.response_in.entitySlice().len,
                 .response_out = self.response_out.entitySlice().len,
+                .server_open_streams = server_open,
                 .conn_active = self._conn_active.entitySlice().len,
                 .conn_tls_handshake = self._conn_tls_handshake.entitySlice().len,
                 .handshake_reaped = self.handshake_reaped_total,
@@ -2504,6 +2615,9 @@ pub fn H2(comptime opts: Options) type {
                 \\# HELP h2_response_out_size responses in-flight on the send path.
                 \\# TYPE h2_response_out_size gauge
                 \\h2_response_out_size {d}
+                \\# HELP h2_server_open_streams requests taken and not yet answered — HEADERS read, response END_STREAM not sent. What a graceful drain waits to reach zero.
+                \\# TYPE h2_server_open_streams gauge
+                \\h2_server_open_streams {d}
                 \\# HELP h2_conn_active_size active h2 sessions.
                 \\# TYPE h2_conn_active_size gauge
                 \\h2_conn_active_size {d}
@@ -2538,6 +2652,7 @@ pub fn H2(comptime opts: Options) type {
                 s.request_out,
                 s.response_in,
                 s.response_out,
+                s.server_open_streams,
                 s.conn_active,
                 s.conn_tls_handshake,
                 s.handshake_reaped,
@@ -2816,10 +2931,17 @@ pub fn H2(comptime opts: Options) type {
         }
 
         fn pollPostlude(self: *Self) !void {
-            // The terminal phases first: conns io retired into
-            // `conn_dead` this pass get their foreign state freed, and
-            // the stream dead-letter is reaped — both at a known phase
-            // outside nghttp2's callbacks.
+            // BEFORE the conn reaper below frees them: client streams on a
+            // connection that died this pass are closed out while that
+            // connection can still answer whether their heads reached the
+            // peer. See `closeOutDeadConnStreams`.
+            if (has_client) {
+                self.closeOutDeadConnStreams();
+                try self.reg.flush();
+            }
+            // The terminal phases: conns io retired into `conn_dead` this
+            // pass get their foreign state freed, and the stream dead-letter
+            // is reaped — both at a known phase outside nghttp2's callbacks.
             self.processConnDead();
             self.processStreamDead();
             try self.reg.flush();
@@ -2905,6 +3027,59 @@ pub fn H2(comptime opts: Options) type {
         /// sinks on those streams are aborted + released by
         /// `sweepBodySinks`, which detects the dead conn the same
         /// way.)
+        /// Close out the client streams of connections that died THIS pass,
+        /// while their `Conn` and nghttp2 session are still intact.
+        ///
+        /// The retry-safety answer needs both halves — the stream's
+        /// `head_send_mark` and the conn's `send_fail_seq` — and
+        /// `processConnDead` frees both at the top of `pollPostlude`, after
+        /// which `sweepOrphanedClient` can only guess, and must guess
+        /// conservatively. That guess is not free: a head serialized into a
+        /// socket write that PROVABLY failed comes back "may have executed",
+        /// and a proxy must then refuse to re-send a request nothing ever
+        /// delivered (rove#532's rule). Asking while the answer still exists
+        /// is the difference between a clean failover and a 502.
+        fn closeOutDeadConnStreams(self: *Self) void {
+            if (comptime !has_client) return;
+            const dead = self.io.coll(.conn_dead);
+            if (dead.entitySlice().len == 0) return;
+            for ([_]*ClientStreamColl{
+                self.coll(.client_stream_data_out),
+                self.coll(._client_stream_data_sending),
+                self.coll(._client_request_sending),
+            }) |cl| {
+                const entities = cl.entitySlice();
+                const sessions = cl.column(Session);
+                const sids = cl.column(StreamId);
+                for (entities, sessions, sids) |ent, sess, sid| {
+                    if (self.reg.isStale(ent) or self.reg.isMoving(ent)) continue;
+                    if (!self.reg.isInCollection(sess.entity, dead)) continue;
+                    const conn_ptr = self.reg.getFat(sess.entity, Conn) catch continue;
+                    // Same three proofs as `onStreamCloseCb`'s, from the same
+                    // two places — never serialized, or serialized at/after
+                    // the conn's first failed write (a failed write queues
+                    // nothing). Anything else may be on the wire.
+                    const head_written = blk: {
+                        if (sid.id == 0) break :blk false;
+                        const ng = conn_ptr.ng_session orelse break :blk true;
+                        const sp: ?*Stream = @ptrCast(@alignCast(
+                            c.nghttp2_session_get_stream_user_data(ng, @intCast(sid.id)),
+                        ));
+                        const st = sp orelse break :blk true;
+                        if (st.head_send_mark == 0) break :blk false;
+                        if (conn_ptr.send_fail_seq != 0 and
+                            st.head_send_mark >= conn_ptr.send_fail_seq) break :blk false;
+                        break :blk true;
+                    };
+                    self.reg.set(ent, cl, H2IoResult, .{
+                        .err = -1,
+                        .head_written = head_written,
+                    }) catch {};
+                    self.reg.move(ent, cl, self.coll(.client_response_out)) catch {};
+                }
+            }
+        }
+
         fn sweepOrphanedClient(self: *Self) void {
             if (!has_client) return;
             for ([_]*ClientStreamColl{ self.coll(.client_stream_data_out), self.coll(._client_stream_data_sending), self.coll(._client_request_sending) }) |cl| {
@@ -2912,7 +3087,23 @@ pub fn H2(comptime opts: Options) type {
                 const sessions = cl.column(Session);
                 for (entities, sessions) |ent, sess| {
                     if (getConn(self, sess.entity) == null) {
-                        self.reg.set(ent, cl, H2IoResult, .{ .err = -1 }) catch {};
+                        // Only the error is news. `head_written` was stamped
+                        // on the entity when the head was serialized
+                        // (`markHeadWritten`), and it is the consumer's
+                        // retry-safety signal: replacing the whole result
+                        // here would tell a proxy that a request which may
+                        // have executed never left, which is the rove#532
+                        // duplicate-commit shape. Unreadable ⇒ assume the
+                        // head went out; over-stating it costs a 502, and
+                        // under-stating it costs a double execution.
+                        if (self.reg.get(ent, cl, H2IoResult)) |io| {
+                            io.err = -1;
+                        } else |_| {
+                            self.reg.set(ent, cl, H2IoResult, .{
+                                .err = -1,
+                                .head_written = true,
+                            }) catch {};
+                        }
                         self.reg.move(ent, cl, self.coll(.client_response_out)) catch {};
                     }
                 }
@@ -5339,6 +5530,14 @@ pub fn H2(comptime opts: Options) type {
         /// drain deadline. Idempotent — the caller re-invokes each
         /// drain-loop iteration, which also covers connections
         /// accepted after the first sweep.
+        /// Stop taking new connections; keep serving the ones already open
+        /// (rove#547). The first move of a graceful drain — a GOAWAY tells
+        /// existing peers to go elsewhere, and this stops new ones arriving
+        /// at a server that has already said no.
+        pub fn stopAccepting(self: *Self) void {
+            self.io.stopAccepting();
+        }
+
         pub fn drainServerConns(self: *Self, grace_ns: u64) !void {
             const entities = self._conn_active.entitySlice();
             const now = monotonicNs();
@@ -5347,6 +5546,16 @@ pub fn H2(comptime opts: Options) type {
                 const conn_ptr = self.reg.get(ent, self.coll(._conn_active), Conn) catch continue;
                 if (conn_ptr.direction != .server) continue;
                 if (conn_ptr.ng_session) |ng| {
+                    // Every h2 connection is GOAWAY'd, idle ones included —
+                    // never closed out from under the peer (rove#547). A
+                    // GOAWAY leaves the socket open and says "no more
+                    // streams" while the peer can still read it, so a pooled
+                    // client learns to stop submitting BEFORE it serializes
+                    // its next head. Closing instead gives no warning: the
+                    // client writes a head into a socket that is already
+                    // gone, and a head that may be on the wire is ambiguous
+                    // for every method — an unretryable 502 per in-flight
+                    // request for as long as this process takes to die.
                     if (conn_ptr.draining) continue;
                     _ = c.nghttp2_session_terminate_session(ng, c.NGHTTP2_NO_ERROR);
                     conn_ptr.draining = true;
@@ -5607,6 +5816,20 @@ pub fn H2(comptime opts: Options) type {
 
                 const ng_session = conn_ptr.ng_session.?;
 
+                // The peer GOAWAY'd this session, so nghttp2 will start no
+                // further stream on it. Nothing is serialized and the refusal
+                // is the PEER's, so report it as one: a proxy may re-aim this
+                // attempt for any method, exactly as for REFUSED_STREAM (RFC
+                // 9113 §8.7). Callers that pool connections retire such a
+                // session, which leaves this as the narrow race where the
+                // GOAWAY lands between their pick and this submit.
+                if (c.nghttp2_session_check_request_allowed(ng_session) == 0) {
+                    io_res.err = -1;
+                    io_res.head_refused = true;
+                    try self.reg.move(ent, self.coll(.client_request_in), self.coll(.client_response_out));
+                    continue;
+                }
+
                 const nv_count: usize = @as(usize, rh.count);
                 if (nv_count == 0) {
                     io_res.err = -1;
@@ -5704,6 +5927,20 @@ pub fn H2(comptime opts: Options) type {
                 }
 
                 const ng_session = conn_ptr.ng_session.?;
+
+                // The peer GOAWAY'd this session, so nghttp2 will start no
+                // further stream on it. Nothing is serialized and the refusal
+                // is the PEER's, so report it as one: a proxy may re-aim this
+                // attempt for any method, exactly as for REFUSED_STREAM (RFC
+                // 9113 §8.7). Callers that pool connections retire such a
+                // session, which leaves this as the narrow race where the
+                // GOAWAY lands between their pick and this submit.
+                if (c.nghttp2_session_check_request_allowed(ng_session) == 0) {
+                    io_res.err = -1;
+                    io_res.head_refused = true;
+                    try self.reg.move(ent, self.coll(.client_stream_request_in), self.coll(.client_response_out));
+                    continue;
+                }
 
                 const nv_count: usize = @as(usize, rh.count);
                 if (nv_count == 0) {

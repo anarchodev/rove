@@ -132,6 +132,11 @@ pub fn Fns(comptime FrontH2: type) type {
             const up = self.poolEntry(origin) catch return .err;
             const now = std.time.nanoTimestamp();
             if (self.pickLeg(up)) |leg| {
+                // Committed to this leg: it is in use from here, not idle.
+                // Stamping it now keeps the idle reaper from retiring it in
+                // the poll pass between this pick and the head actually
+                // reaching the wire (see `touchClientSession`).
+                self.server.touchClientSession(leg.sess);
                 // Background scale-out: the chosen leg is getting busy and
                 // a spare leg exists — dial it for FUTURE submits; this
                 // attempt rides the live leg now.
@@ -176,6 +181,22 @@ pub fn Fns(comptime FrontH2: type) type {
                     leg.state = .down;
                     leg.sess = Entity.nil;
                     leg.last_fail_ns = 0;
+                    continue;
+                }
+                // The peer GOAWAY'd: the socket is still open and the session
+                // is not stale, so the check above sees nothing, but no new
+                // stream can be submitted on this leg ever again. Retire it
+                // here instead of burning one failed submit per request until
+                // the socket finally closes (rove#547).
+                //
+                // WITH backoff, unlike the stale case: a GOAWAY is the node
+                // saying it is going away, so the right next move is to
+                // fail over, not to redial it. The backoff is short, so once
+                // the node is back it rejoins on its own.
+                if (!self.server.clientSessionAcceptsStreams(leg.sess)) {
+                    leg.state = .down;
+                    leg.sess = Entity.nil;
+                    leg.last_fail_ns = std.time.nanoTimestamp();
                     continue;
                 }
                 if (leg.inflight >= self.leg_stream_cap) continue;
