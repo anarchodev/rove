@@ -177,6 +177,9 @@ const WorkerCtx = struct {
     /// address the data it protects does not survive the scenarios that
     /// motivate keeping one.
     backup_store: ?*blob_mod.S3BlobStore,
+    /// The live store's key prefix with the storage generation applied — what
+    /// a per-tenant object prefix is built on (rove#965).
+    key_prefix_base: []const u8,
     ready: *std.Thread.ResetEvent,
     /// Dedicated loopback HTTP/1.1 operator-metrics listener
     /// (`REWIND_METRICS_PORT`). The worker thread renders the Prometheus
@@ -471,6 +474,7 @@ fn workerMain(args: *WorkerCtx) !void {
     // A backup carries the tenant's sealed keyring alongside its store
     // (rove#963); without the KEK this node cannot read its own copy.
     catchup.keyring_kek = args.keyring_kek;
+    catchup.key_prefix_base = args.key_prefix_base;
     try catchup.start();
     defer catchup.shutdown();
     // The same off-loop driver also runs CP-triggered move
@@ -1293,6 +1297,7 @@ pub fn main() !void {
             .services_jwt_secret = services_jwt_secret,
             .peer_urls = peer_urls,
             .backup_store = backup_store,
+            .key_prefix_base = blob_owned.cfg.key_prefix_base,
             .ready = ready,
             // The metrics render reads live h2 + dispatch state only its
             // own thread may touch, so exactly one worker publishes. The

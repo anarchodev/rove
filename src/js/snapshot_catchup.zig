@@ -118,6 +118,12 @@ pub const SnapshotCatchupThread = struct {
     /// Null → keyrings are disabled on this node and a backup carries the
     /// store alone, which it says in the parts it reports.
     keyring_kek: ?[]const u8 = null,
+    /// The live object store's key prefix AFTER namespace resolution — the
+    /// base every per-tenant prefix is built on. Borrowed from the worker's
+    /// blob config, which resolved the storage generation once at startup
+    /// (rove#965: the mirror must copy the generation this cluster is
+    /// actually writing, not the one an operator assumes).
+    key_prefix_base: []const u8 = "",
     /// Page-pinning bound: max wall-clock per-transfer duration
     /// (`REWIND_SNAPSHOT_XFER_MAX_MS`). Read once at init.
     xfer_max_ms: i64 = 10 * 60 * 1000,
@@ -531,14 +537,41 @@ pub const SnapshotCatchupThread = struct {
             .legacy => "legacy",
             .token => |t| t,
         };
+        // The tenant's OBJECT-STORE prefixes, reported by the one process that
+        // can derive them: the prefix depends on the storage incarnation, and
+        // a second formatter somewhere else is how a writer and a reader end
+        // up at different depths (rove#357/#355). The mirror copies exactly
+        // what this list names.
+        var prefixes: std.ArrayListUnmanaged(u8) = .empty;
+        defer prefixes.deinit(self.allocator);
+        for (tenant_mod.SUBDIRS, 0..) |subdir, si| {
+            const p = inst.storage.keyPrefix(self.allocator, self.key_prefix_base, subdir) catch continue;
+            defer self.allocator.free(p);
+            if (si > 0) prefixes.appendSlice(self.allocator, ",") catch {};
+            prefixes.writer(self.allocator).print("\"{s}\"", .{p}) catch {};
+        }
+
+        // The CLUSTER-wide object families, from the same authority for the
+        // same reason: they hang off the resolved key-prefix base, which
+        // includes the storage generation. A tool that composed
+        // `{base}_logs/` from its own env would walk a prefix the cluster
+        // does not write to and report a cheerful zero.
+        const shared = std.fmt.allocPrint(
+            self.allocator,
+            "\"{s}_logs/\",\"{s}_pool/\"",
+            .{ self.key_prefix_base, self.key_prefix_base },
+        ) catch null;
+        defer if (shared) |sh| self.allocator.free(sh);
+
         const detail = std.fmt.allocPrint(
             self.allocator,
             // `store_id` is a STRING: it is a u64, and both JSON numbers and
             // the JS that may one day read this manifest lose precision above
             // 2^53. An identity that arrives rounded is not an identity.
             "{{\"tenant\":\"{s}\",\"prefix\":\"{s}\",\"store_id\":\"{d}\"," ++
-                "\"incarnation\":\"{s}\",\"keyring_parts\":[{s}]}}",
-            .{ job.id_str, key, inst.kv.store_id, incarnation, parts.items },
+                "\"incarnation\":\"{s}\",\"keyring_parts\":[{s}]," ++
+                "\"object_prefixes\":[{s}],\"shared_prefixes\":[{s}]}}",
+            .{ job.id_str, key, inst.kv.store_id, incarnation, parts.items, prefixes.items, shared orelse "" },
         ) catch null;
         self.postCompletionDetail(job.entity, 200, detail);
     }
