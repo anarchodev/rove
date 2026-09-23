@@ -64,6 +64,11 @@
     "seconds": 2.9,
     "status": "pass"
   },
+  "cert_renew_flow_smoke.py": {
+    "rc": 0,
+    "seconds": 0.3,
+    "status": "pass"
+  },
   "cert_survives_genesis_smoke.py": {
     "rc": 0,
     "seconds": 10.7,
@@ -187,6 +192,16 @@
   "front_body_stall_smoke.py": {
     "rc": 0,
     "seconds": 17.2,
+    "status": "pass"
+  },
+  "front_cert_deploy_smoke.py": {
+    "rc": 0,
+    "seconds": 9.5,
+    "status": "pass"
+  },
+  "front_cert_reload_smoke.py": {
+    "rc": 0,
+    "seconds": 6.7,
     "status": "pass"
   },
   "front_connect_timeout_smoke.py": {

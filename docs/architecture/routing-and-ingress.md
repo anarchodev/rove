@@ -101,6 +101,14 @@ wire only after the activation that produced it commits — and a blob coordinat
 - **SNI**: `host_store` maps host → per-host `SSL_CTX` (built with the same ALPN
   + TLS-min), wildcard fallback for unknown SNI. `reloadCustomCerts` polls the
   cert dir (mtime-driven) so newly-issued certs install within ~1 s.
+- **The default context reloads too**: the platform wildcard is replaced on
+  disk by the renewal hook, and `CertSync.reloadDefault` swaps it into the
+  default context on the cert-sync tick — in-flight `*SSL` instances stay on
+  the old context, and the expiry gauge is re-observed from the bytes actually
+  installed. A cert distributed ahead of its key is refused and retried, so a
+  torn distribution window never takes TLS down. Renewal that needs a restart
+  is renewal that gets skipped on a node, and a restart cuts every in-flight
+  request on the path that keeps every host serving.
 - **ACME HTTP-01** runs on a dedicated `:80` plaintext listener:
   `/.well-known/acme-challenge/<token>` is answered from the CP; everything else
   308-redirects to HTTPS. Issuance itself lives in the control plane / auth layer

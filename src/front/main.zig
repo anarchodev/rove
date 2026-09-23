@@ -87,11 +87,12 @@ var stop_flag: std.atomic.Value(bool) = .init(false);
 // The front door terminates public TLS and SNI-selects a per-host cert. The
 // SNI servername callback runs *inside* the handshake and cannot block on a CP
 // fetch, so certs are synced PROACTIVELY into the `TlsConfig` host store on a
-// timer: poll `/_cp/certs` (the certed-host list), pull each host's frame via
-// `/_cp/cert`, and install it (`putHostCertInMemory`, a no-op when the content
-// version is unchanged). A freshly-issued domain's first connection in the poll
-// gap falls back to the wildcard; the next connection (post-sync) gets its
-// cert. Null `tls` (h2c front door, no TLS env) ⇒ this is inert.
+// timer: reload the platform wildcard if it changed on disk, then poll
+// `/_cp/certs` (the certed-host list), pull each host's frame via `/_cp/cert`,
+// and install it (`putHostCertInMemory`, a no-op when the content version is
+// unchanged). A freshly-issued domain's first connection in the poll gap falls
+// back to the wildcard; the next connection (post-sync) gets its cert. Null
+// `tls` (h2c front door, no TLS env) ⇒ this is inert.
 const CertSync = struct {
     allocator: std.mem.Allocator,
     cp_urls: []const []const u8,
@@ -116,10 +117,39 @@ const CertSync = struct {
         return null;
     }
 
-    /// One sync pass: install/renew every certed host's cert. Best-effort — a
-    /// CP that's unreachable leaves the current SNI store untouched.
+    /// Pick up a platform wildcard renewed on disk, without a restart. The
+    /// wildcard covers every first-party and tenant host, so its expiry is a
+    /// total outage for all of them; distribution that requires a restart is
+    /// distribution that gets skipped, and a restart also cuts every in-flight
+    /// request on the node. `reloadIfChanged` stats the pair and swaps the
+    /// default ctx only when it changed, keeping in-flight `*SSL` instances on
+    /// the old one.
+    ///
+    /// The gauge is re-observed from the exact bytes the swap installed, so it
+    /// can never describe a certificate the front is not serving — the boot-time
+    /// observation alone would report the retired expiry until a restart, which
+    /// keeps an alert firing on a certificate that was already replaced.
+    fn reloadDefault(self: *CertSync) void {
+        const pem = self.tls.reloadIfChanged() catch |e| {
+            // A torn write or a cert replaced ahead of its key lands here with
+            // the old ctx still serving; the mtime cache advances only on a
+            // successful build, so the next tick retries the same pair.
+            std.log.warn("front: default TLS cert reload failed: {s}", .{@errorName(e)});
+            return;
+        } orelse return;
+        defer self.allocator.free(pem);
+        self.expiry.observe(cert_expiry_mod.DEFAULT_LABEL, pem);
+        std.log.info("front: default TLS cert reloaded (no restart)", .{});
+    }
+
+    /// One sync pass: reload the default cert, then install/renew every certed
+    /// host's cert. Best-effort — a CP that's unreachable leaves the current SNI
+    /// store untouched. The wildcard reload runs FIRST, and off the CP entirely:
+    /// the platform cert lives on local disk, so an unreachable CP must not be
+    /// able to hold back the renewal that keeps every host serving.
     fn sync(self: *CertSync) void {
         const a = self.allocator;
+        self.reloadDefault();
         const list = self.cpGet("/_cp/certs") orelse return;
         defer a.free(list);
         var it = std.mem.tokenizeScalar(u8, list, '\n');
@@ -559,8 +589,11 @@ pub fn main() !void {
         if (cert == null or key == null) break :blk null;
         const t = try h2.TlsConfig.createFromFiles(allocator, cert.?, key.?, null);
         // The default context is built by OpenSSL from files, so its expiry is
-        // learned by reading the same PEM. This is the platform wildcard —
-        // renewed by hand, and therefore the one most worth watching.
+        // learned by reading the same PEM. This is the platform wildcard, the
+        // one certificate whose expiry takes every host down at once. Boot is
+        // only the first observation: the cert-sync tick re-reads it on every
+        // renewal (`CertSync.reloadDefault`), because a gauge that is only
+        // written at boot reports the retired certificate until a restart.
         cert_expiry.observeFile(cert_expiry_mod.DEFAULT_LABEL, cert.?);
         break :blk t;
     };

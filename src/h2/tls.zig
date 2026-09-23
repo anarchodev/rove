@@ -130,14 +130,28 @@ pub const TlsConfig = struct {
     /// current on-disk bytes and atomically swap it in. In-flight
     /// `*SSL` instances hold their own ref on the old ctx (bumped by
     /// `SSL_new`), so the old ctx lives until all of its SSLs are
-    /// freed. Returns `true` if a swap happened.
+    /// freed.
+    ///
+    /// Returns the cert PEM the new ctx was built from when a swap
+    /// happened (caller frees it with this config's allocator), else
+    /// null. It is returned rather than left for the caller to re-read
+    /// because an observer of the served certificate — the front's
+    /// expiry gauge — must describe the bytes actually installed: a
+    /// second read of the same path can catch a half-written PEM and
+    /// record an unparseable (⇒ already-expired) certificate the front
+    /// is not serving, with no later reload to correct it.
+    ///
+    /// A cert/key pair that does not load — a torn write, or a cert
+    /// replaced before its key — fails here with the OLD ctx still
+    /// serving, and the mtime cache advances only on success, so the
+    /// next call retries instead of latching the broken pair.
     ///
     /// Safe to call from any thread; internally locks the config's
     /// mutex. Callers should back off to every ~1s or so — stat() is
     /// cheap but still a syscall per call.
-    pub fn reloadIfChanged(self: *TlsConfig) !bool {
-        const cp = self.cert_path orelse return false;
-        const kp = self.key_path orelse return false;
+    pub fn reloadIfChanged(self: *TlsConfig) !?[]u8 {
+        const cp = self.cert_path orelse return null;
+        const kp = self.key_path orelse return null;
 
         const cert_stat = try std.fs.cwd().statFile(cp);
         const key_stat = try std.fs.cwd().statFile(kp);
@@ -146,10 +160,10 @@ pub const TlsConfig = struct {
         defer self.mu.unlock();
 
         if (cert_stat.mtime == self.cached_cert_mtime and
-            key_stat.mtime == self.cached_key_mtime) return false;
+            key_stat.mtime == self.cached_key_mtime) return null;
 
         const cert_pem = try std.fs.cwd().readFileAlloc(self.allocator, cp, 1024 * 1024);
-        defer self.allocator.free(cert_pem);
+        errdefer self.allocator.free(cert_pem);
         const key_pem = try std.fs.cwd().readFileAlloc(self.allocator, kp, 1024 * 1024);
         defer self.allocator.free(key_pem);
 
@@ -166,7 +180,7 @@ pub const TlsConfig = struct {
         // old_ctx each hold their own ref via `SSL_new`, so the ctx
         // hangs around until they all die.
         c.SSL_CTX_free(old_ctx);
-        return true;
+        return cert_pem;
     }
 
     /// Block the calling thread until `stop_flag` flips, periodically
@@ -190,11 +204,14 @@ pub const TlsConfig = struct {
             tick += 1;
             if (tls_config) |cfg| {
                 if (tick % reload_interval_ticks == 0) {
-                    const changed = cfg.reloadIfChanged() catch |err| blk: {
+                    const reloaded = cfg.reloadIfChanged() catch |err| blk: {
                         std.log.warn("tls: reloadIfChanged failed: {s}", .{@errorName(err)});
-                        break :blk false;
+                        break :blk null;
                     };
-                    if (changed) std.log.info("tls: cert/key reloaded", .{});
+                    if (reloaded) |pem| {
+                        cfg.allocator.free(pem);
+                        std.log.info("tls: cert/key reloaded", .{});
+                    }
                     // Independent of the default-cert reload above
                     // (which no-ops for in-memory configs): pick up
                     // newly-issued / renewed per-host custom certs.

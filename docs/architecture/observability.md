@@ -158,6 +158,13 @@ hand** — Let's Encrypt issues wildcards over DNS-01 only, so the in-tree
 HTTP-01 issuer cannot produce one (auth-and-domains.md) — which makes a person
 the renewal mechanism.
 
+The default-context series tracks the certificate the front is *serving*, not
+the one it booted with: the cert-sync tick re-observes it from the bytes each
+reload installs. That is what lets the ticket clear when the renewal lands
+instead of persisting until someone restarts the process — and it is why the
+alert is meaningful at all, since a gauge written once at boot reports a
+certificate that may have been replaced days ago.
+
 Two deliberate choices, both so an alert cannot silently stop covering
 something:
 
