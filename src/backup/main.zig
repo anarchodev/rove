@@ -45,12 +45,10 @@
 //! The manifest is written LAST: a run without one is an incomplete run, and
 //! `verify` says so rather than reporting a partial set as restorable.
 //!
-//! ## What it does not yet cover (rove#341's remaining leaves)
+//! ## What it does not yet cover (rove#341's remaining leaf)
 //!
-//! - **The object store itself** (bundles, static assets, log/tape batches).
-//!
-//! So a restore reconstitutes a tenant's placement, identity and state — its
-//! deployed code still comes from the live object store.
+//! - **A schedule, a retention policy, and a scheduled restore test**, which
+//!   is also where a stated RPO/RTO comes from (rove#966).
 
 const std = @import("std");
 const blob = @import("rove-blob");
@@ -67,6 +65,13 @@ const USAGE =
     \\      data is keyed by, then write the run manifest. Prints the run id.
     \\      `--no-directory` omits the directory — say it out loud, because a
     \\      run without it restores tenants nobody can place.
+    \\
+    \\  rewind-backup mirror --run <id>
+    \\      Copy the run's tenants' OBJECTS — bundles, static assets, exports,
+    \\      deployment manifests — plus the shared log and body-pool families,
+    \\      from the live store into the backup store. Copy-if-absent, so a
+    \\      re-run resumes. Needs the live store's env (S3_*) as well as the
+    \\      backup target's.
     \\
     \\  rewind-backup verify --run <id>
     \\      Re-read every object the manifest names and check it is a whole,
@@ -414,10 +419,30 @@ fn cmdRun(a: std.mem.Allocator, args: Args) !u8 {
         }
 
         if (i > 0) try w.writeAll(",");
+        // The object prefixes come straight from the node, verbatim: the
+        // prefix depends on the storage incarnation, and deriving it a second
+        // time here is how a writer and a reader end up at different depths.
+        var obj_prefixes: std.ArrayListUnmanaged(u8) = .empty;
+        defer obj_prefixes.deinit(a);
+        if (parsed_id.value.object.get("object_prefixes")) |ops| {
+            for (ops.array.items, 0..) |op, oi| {
+                if (oi > 0) obj_prefixes.appendSlice(a, ",") catch @panic("OOM");
+                obj_prefixes.writer(a).print("\"{s}\"", .{op.string}) catch @panic("OOM");
+            }
+        }
+        var shared_json: std.ArrayListUnmanaged(u8) = .empty;
+        defer shared_json.deinit(a);
+        if (parsed_id.value.object.get("shared_prefixes")) |sps| {
+            for (sps.array.items, 0..) |sp, si| {
+                if (si > 0) shared_json.appendSlice(a, ",") catch @panic("OOM");
+                shared_json.writer(a).print("\"{s}\"", .{sp.string}) catch @panic("OOM");
+            }
+        }
         try w.print(
             "{{\"tenant\":\"{s}\",\"prefix\":\"{s}\",\"bytes\":{d},\"sha256\":\"{s}\"," ++
-                "\"store_id\":\"{s}\",\"incarnation\":\"{s}\",\"keyring_parts\":[{s}]}}",
-            .{ tenant, prefix, dump.bytes, dump.sha_hex, store_id, incarnation, parts_json.items },
+                "\"store_id\":\"{s}\",\"incarnation\":\"{s}\",\"keyring_parts\":[{s}]," ++
+                "\"object_prefixes\":[{s}],\"shared_prefixes\":[{s}]}}",
+            .{ tenant, prefix, dump.bytes, dump.sha_hex, store_id, incarnation, parts_json.items, obj_prefixes.items, shared_json.items },
         );
         std.debug.print("  ok {s}: {d} bytes, {d} keyring part(s) (incarnation {s})\n", .{
             tenant,
@@ -499,6 +524,18 @@ fn cmdVerify(a: std.mem.Allocator, args: Args) !u8 {
                 bad += 1;
             }
         }
+    }
+
+    // The mirror record, if this run has one. Absent is not a failure — the
+    // objects are a separate pass — but `verify` says which it is, because
+    // "the backup is complete" means different things with and without it.
+    const rkey = std.fmt.allocPrint(a, "{s}/mirror.json", .{run_id}) catch @panic("OOM");
+    defer a.free(rkey);
+    if (target.store.blobStore().get(rkey, a)) |rec| {
+        defer a.free(rec);
+        std.debug.print("  ok objects mirrored: {s}\n", .{std.mem.trim(u8, rec, "\n")});
+    } else |_| {
+        std.debug.print("  NOTE no object mirror in this run — KV, keyring and directory only\n", .{});
     }
 
     for (tenants.array.items) |entry| {
@@ -583,6 +620,178 @@ fn fetchDirectory(a: std.mem.Allocator, cp: []const u8, secret: []const u8) ![]u
         return error.DirectoryDumpRefused;
     }
     return a.dupe(u8, resp.body orelse "");
+}
+
+// ── mirror ────────────────────────────────────────────────────────────
+
+/// Open the LIVE object store — the one the cluster writes to — at the
+/// storage generation it is actually using. The generation is resolved from
+/// the store's own marker rather than assumed: a cluster that was wiped and
+/// bumped writes under a different prefix, and mirroring the prefix an
+/// operator remembers would copy a previous lifetime's objects while missing
+/// every current one.
+fn openLiveStore(a: std.mem.Allocator) struct { owned: blob.env.BlobBackendOwned, store: blob.S3BlobStore } {
+    var owned = blob.env.loadFromEnv(a) catch |err| {
+        const name = blob.env.errorEnvName(err) orelse "S3_*";
+        fatal("the live object store is not configured: set {s}", .{name});
+    };
+    const segment = blob.namespace_store.resolve(a, owned.cfg) catch |e|
+        fatal("cannot read the live store's storage-namespace marker: {s}", .{@errorName(e)});
+    defer a.free(segment);
+    _ = owned.applyNamespace(a, segment) catch |e| fatal("namespace: {s}", .{@errorName(e)});
+
+    const store = blob.S3BlobStore.init(a, .{
+        .endpoint = owned.cfg.endpoint,
+        .region = owned.cfg.region,
+        .bucket = owned.cfg.bucket,
+        .key_prefix = "", // keys from the manifest are already fully qualified
+        .access_key = owned.cfg.access_key,
+        .secret_key = owned.cfg.secret_key,
+        .use_tls = owned.cfg.use_tls,
+    }) catch |e| fatal("the live object store is unusable: {s}", .{@errorName(e)});
+    return .{ .owned = owned, .store = store };
+}
+
+const MirrorStats = struct { copied: u64 = 0, skipped: u64 = 0, bytes: u64 = 0 };
+
+/// Copy every object under `prefix` from the live store into the backup
+/// store, skipping what is already there.
+///
+/// Copy-if-absent is exactly right for this store and not a shortcut: every
+/// family here is immutable once written — content-addressed blobs by
+/// construction, and the id-keyed families (deployments, log batches, pooled
+/// bodies) because their ids are never reused within a storage generation. So
+/// a key that exists in the backup already holds the same bytes, and a
+/// re-run is a resume rather than a re-copy.
+fn mirrorPrefix(
+    a: std.mem.Allocator,
+    live: *blob.S3BlobStore,
+    backup: *blob.S3BlobStore,
+    prefix: []const u8,
+    stats: *MirrorStats,
+) !void {
+    var token: ?[]u8 = null;
+    defer if (token) |t| a.free(t);
+    while (true) {
+        var page = try live.listPrefix(a, prefix, token);
+        defer page.deinit(a);
+        for (page.keys) |key| {
+            if (backup.blobStore().exists(key) catch false) {
+                stats.skipped += 1;
+                continue;
+            }
+            const bytes = live.blobStore().get(key, a) catch |e| {
+                std.debug.print("  FAILED {s}: unreadable in the live store: {s}\n", .{ key, @errorName(e) });
+                return error.MirrorIncomplete;
+            };
+            defer a.free(bytes);
+            backup.blobStore().put(key, bytes) catch |e| {
+                std.debug.print("  FAILED {s}: {s}\n", .{ key, @errorName(e) });
+                return error.MirrorIncomplete;
+            };
+            stats.copied += 1;
+            stats.bytes += bytes.len;
+        }
+        const next = page.next_token orelse break;
+        if (token) |t| a.free(t);
+        token = a.dupe(u8, next) catch @panic("OOM");
+    }
+}
+
+fn cmdMirror(a: std.mem.Allocator, args: Args) !u8 {
+    const run_id = args.run_id orelse fatal("mirror needs --run", .{});
+    var target = openBackupStore(a);
+    defer target.store.deinit();
+    var live = openLiveStore(a);
+    defer live.store.deinit();
+    defer live.owned.deinit(a);
+
+    const mkey = manifestKey(a, run_id);
+    defer a.free(mkey);
+    const manifest = target.store.blobStore().get(mkey, a) catch |e|
+        fatal("run {s} has no manifest: {s}", .{ run_id, @errorName(e) });
+    defer a.free(manifest);
+    const parsed = std.json.parseFromSlice(std.json.Value, a, manifest, .{}) catch |e|
+        fatal("run {s}: manifest is not JSON: {s}", .{ run_id, @errorName(e) });
+    defer parsed.deinit();
+
+    var stats: MirrorStats = .{};
+    var covered: std.ArrayListUnmanaged(u8) = .empty;
+    defer covered.deinit(a);
+    var first = true;
+
+    for ((parsed.value.object.get("tenants") orelse fatal("no tenants", .{})).array.items) |entry| {
+        const tenant = entry.object.get("tenant").?.string;
+        const prefixes = entry.object.get("object_prefixes") orelse continue;
+        for (prefixes.array.items) |p| {
+            const prefix = p.string;
+            mirrorPrefix(a, &live.store, &target.store, prefix, &stats) catch {
+                std.debug.print("mirror {s}: INCOMPLETE at {s}\n", .{ run_id, prefix });
+                return 1;
+            };
+            if (!first) covered.appendSlice(a, ",") catch @panic("OOM");
+            first = false;
+            covered.writer(a).print("\"{s}\"", .{prefix}) catch @panic("OOM");
+        }
+        std.debug.print("  ok {s}: {d} copied, {d} already there\n", .{ tenant, stats.copied, stats.skipped });
+    }
+
+    // The shared families, which belong to the cluster rather than to any one
+    // tenant: request-log batches (`_logs/{node}/`) and spilled request bodies
+    // (`_pool/`). A backup that skipped them would restore tenants whose
+    // request history and large bodies had vanished — and neither is
+    // reconstructible from anything else.
+    //
+    // Their prefixes come from the NODE, like the per-tenant ones, because
+    // they hang off the resolved key-prefix base — which carries the storage
+    // generation. Composing `{base}_logs/` here from this process's own env
+    // walked a prefix the cluster does not write to and reported a cheerful
+    // zero; the node is the only thing that knows where its objects went.
+    var seen_shared: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen_shared.deinit(a);
+    for ((parsed.value.object.get("tenants").?).array.items) |entry| {
+        const sps = entry.object.get("shared_prefixes") orelse continue;
+        for (sps.array.items) |sp| {
+            const prefix = sp.string;
+            if (seen_shared.contains(prefix)) continue;
+            seen_shared.put(a, prefix, {}) catch @panic("OOM");
+            mirrorPrefix(a, &live.store, &target.store, prefix, &stats) catch {
+                std.debug.print("mirror {s}: INCOMPLETE at {s}\n", .{ run_id, prefix });
+                return 1;
+            };
+            if (!first) covered.appendSlice(a, ",") catch @panic("OOM");
+            first = false;
+            covered.writer(a).print("\"{s}\"", .{prefix}) catch @panic("OOM");
+            std.debug.print("  ok {s}\n", .{prefix});
+        }
+    }
+    if (seen_shared.count() == 0) {
+        std.debug.print(
+            "mirror {s}: the run's manifest names NO shared prefixes — it was taken by a node\n" ++
+                "that does not report them, so request logs and pooled bodies are NOT covered.\n",
+            .{run_id},
+        );
+        return 1;
+    }
+
+    // Written LAST, and only on a complete pass — the same rule the run
+    // manifest follows. A mirror record present is the claim that every
+    // prefix it names was walked to the end.
+    const rec = std.fmt.allocPrint(
+        a,
+        "{{\"run_id\":\"{s}\",\"copied\":{d},\"skipped\":{d},\"bytes\":{d},\"prefixes\":[{s}]}}",
+        .{ run_id, stats.copied, stats.skipped, stats.bytes, covered.items },
+    ) catch @panic("OOM");
+    defer a.free(rec);
+    const rkey = std.fmt.allocPrint(a, "{s}/mirror.json", .{run_id}) catch @panic("OOM");
+    defer a.free(rkey);
+    target.store.blobStore().put(rkey, rec) catch |e|
+        fatal("mirror record write failed: {s}", .{@errorName(e)});
+
+    std.debug.print("mirror {s}: {d} object(s) copied, {d} already present, {d} bytes\n", .{
+        run_id, stats.copied, stats.skipped, stats.bytes,
+    });
+    return 0;
 }
 
 // ── restore-directory ─────────────────────────────────────────────────
@@ -836,6 +1045,8 @@ pub fn main() !void {
         try cmdVerify(a, args)
     else if (std.mem.eql(u8, args.cmd, "restore"))
         try cmdRestore(a, args)
+    else if (std.mem.eql(u8, args.cmd, "mirror"))
+        try cmdMirror(a, args)
     else if (std.mem.eql(u8, args.cmd, "restore-directory"))
         try cmdRestoreDirectory(a, args)
     else if (std.mem.eql(u8, args.cmd, "show"))

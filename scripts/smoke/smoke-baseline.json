@@ -44,6 +44,11 @@
     "seconds": 7.8,
     "status": "pass"
   },
+  "backup_mirror_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 4.3,
+    "status": "pass"
+  },
   "backup_restore_smoke_v2.py": {
     "rc": 0,
     "seconds": 3.0,

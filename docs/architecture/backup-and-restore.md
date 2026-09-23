@@ -171,14 +171,42 @@ Order, end to end:
     attach each tenant  →  at the incarnation the directory now holds
     restore each tenant →  store dump, then keyring
 
+## The objects are mirrored, not dumped
+
+A tenant's deployed code, static assets, exports, deployment manifests,
+request-log batches and spilled request bodies are not rows — they are
+objects. They survive a cluster wipe (content- or id-addressed), but not the
+loss of the provider account, which is one of the three scenarios this exists
+for.
+
+`rewind-backup mirror --run <id>` copies them from the live store into the
+backup store, **copy-if-absent**. That is exactly right rather than a
+shortcut: every family here is immutable once written — content-addressed
+blobs by construction, and the id-keyed families because ids are never reused
+within a storage generation. So a key already in the backup holds the same
+bytes, and a re-run after an interruption resumes instead of re-uploading
+everything.
+
+The prefixes come from the NODE, verbatim — both the per-tenant ones (which
+carry the storage incarnation) and the cluster-wide `_logs/` and `_pool/`
+families (which hang off the resolved key-prefix base, and so carry the
+storage generation). The tool composes none of them. It did briefly compose
+the shared pair from its own environment, walked a prefix the cluster does not
+write to, and reported a cheerful zero — the same
+writer-and-reader-at-different-depths failure as the storage incarnation, and
+the reason the smoke asserts the shared prefixes share the tenant prefixes'
+base rather than just asserting something was copied.
+
+`mirror.json` is written last and only on a complete pass, like the run
+manifest, so its presence is the claim that every prefix it names was walked
+to the end. `verify` reports a run WITH an object mirror differently from one
+without, rather than calling both "verified".
+
 ## What is not covered yet
 
 Stated plainly, because a backup whose coverage is assumed rather than known
 is the failure this document exists to prevent. Each is a leaf of rove#341:
 
-- **The object store** — bundles, static assets, log and tape batches. These
-  are content- or id-addressed and survive a cluster wipe, but not the loss of
-  the provider account.
 - **A schedule, a retention policy, and a scheduled restore test.** The test
   that exists today is `scripts/smoke/backup_restore_smoke_v2.py`, which
   restores into a second cluster and reads the value back on every suite run.

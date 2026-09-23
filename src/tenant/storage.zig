@@ -87,6 +87,32 @@ pub const Incarnation = union(enum) {
 /// new subdir that is not listed here outlives its tenant, costing storage
 /// forever and leaving bytes behind that an account deletion promised to
 /// remove. Add to this list in the same change that introduces the subdir.
+/// The CLUSTER-scoped object families — keyed by the storage base alone, not
+/// by a tenant, because their contents span tenants: request-log batches
+/// (`_logs/{node}/…`, node-partitioned) and spilled request bodies
+/// (`_pool/…`).
+///
+/// Here for the same reason the per-tenant rule is here. The base carries the
+/// storage generation, so composing `{base}_logs/` at a call site is the same
+/// class of mistake as composing a tenant path by hand — and it was made
+/// exactly once, in the backup mirror, which walked a prefix the cluster does
+/// not write to and reported having copied nothing (rove#965).
+pub const SHARED_FAMILIES = [_][]const u8{
+    "_logs/",
+    // Not a literal: the pool's owner names it, so there is one spelling.
+    blob_mod.pool_object.PREFIX,
+};
+
+/// `{key_prefix_base}{family}` — the prefix a cluster-scoped family lives
+/// under. Caller frees.
+pub fn sharedPrefix(
+    a: std.mem.Allocator,
+    key_prefix_base: []const u8,
+    family: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(a, "{s}{s}", .{ key_prefix_base, family });
+}
+
 pub const SUBDIRS = [_][]const u8{
     "app-blobs",
     "file-blobs",
@@ -200,6 +226,19 @@ pub const TenantStorage = struct {
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "the cluster-scoped families keep the spellings their owners use" {
+    // `_pool/` is the pool's own constant, so it cannot drift. `_logs/` is a
+    // literal here because its owner (the log-server's indexer) sits above
+    // this module in the dependency order — so this is the assertion that
+    // would fail if the two ever disagreed, rather than a silent mirror.
+    try testing.expectEqualStrings(blob_mod.pool_object.PREFIX, SHARED_FAMILIES[1]);
+    try testing.expectEqualStrings("_logs/", SHARED_FAMILIES[0]);
+
+    const p = try sharedPrefix(testing.allocator, "prod/3/", SHARED_FAMILIES[0]);
+    defer testing.allocator.free(p);
+    try testing.expectEqualStrings("prod/3/_logs/", p);
+}
 
 test "Incarnation.fromMarker: empty is legacy, non-empty is a token" {
     try testing.expect(Incarnation.fromMarker("") == .legacy);
