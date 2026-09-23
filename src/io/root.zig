@@ -464,6 +464,10 @@ pub fn Io(comptime opts: Options) type {
         buf_size: u32,
         buf_count: u16,
         listen_fd: posix.socket_t,
+        /// Set by `stopAccepting` (rove#547). The listener is closed at the
+        /// START of a graceful drain, so `destroy` must not close it twice
+        /// and the multishot accept must not be re-armed on a dead fd.
+        accept_stopped: bool = false,
         max_connections: u32,
 
         /// Admission-control telemetry. Friendly back-pressure when
@@ -698,13 +702,47 @@ pub fn Io(comptime opts: Options) type {
             _ = self.ring.submit() catch {};
         }
 
+        /// Leave LISTEN: this process stops taking NEW connections while it
+        /// finishes the ones it has (rove#547). Idempotent; live connections
+        /// are untouched.
+        ///
+        /// This is the half a GOAWAY cannot do, and leaving it out makes a
+        /// graceful stop worse than a crash. Measured on a 3-node cluster
+        /// with writes in flight: SIGKILL costs 3 failed requests, because
+        /// the socket dies at once and the front re-aims off a dead leg in
+        /// milliseconds. A drain that GOAWAYs but keeps ACCEPTING cost 557,
+        /// for four full seconds — every new connection was accepted by a
+        /// node that had already refused to serve, and a client cannot tell
+        /// one of those from a healthy node.
+        ///
+        /// `shutdown` is what does it, and `close` alone is NOT enough: a
+        /// multishot accept armed in the kernel holds its own reference to
+        /// the listening socket, so closing the descriptor drops the
+        /// userspace handle while the socket stays in LISTEN and keeps
+        /// completing handshakes. Measured the same way: a SIGTERM'd worker
+        /// that only closed its descriptor accepted 160 of 160 probe
+        /// connections across the whole drain. `shutdown` resets the backlog
+        /// and refuses further connects, so a pooled client fails over at
+        /// once instead of writing a request head into a socket that will
+        /// die; it also retires the in-flight multishot accept, whose
+        /// completion `handleAccept` then declines to re-arm.
+        pub fn stopAccepting(self: *Self) void {
+            if (self.accept_stopped) return;
+            self.accept_stopped = true;
+            // ENOTCONN on a listening socket is the documented outcome on
+            // some kernels and means the same thing: nothing left to shut
+            // down. The close below is the backstop either way.
+            posix.shutdown(self.listen_fd, .both) catch {};
+            posix.close(self.listen_fd);
+        }
+
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
             self.shutdownAllConns();
             if (has_connect) allocator.free(self.connect_addrs);
             linux.IoUring.free_buf_ring(self.ring.fd, self.buf_ring, self.buf_count, BUF_GROUP_ID);
             allocator.free(self.buf_base);
-            posix.close(self.listen_fd);
+            if (!self.accept_stopped) posix.close(self.listen_fd);
             self.ring.deinit();
             allocator.destroy(self);
         }
@@ -1151,12 +1189,19 @@ pub fn Io(comptime opts: Options) type {
 
         fn handleAccept(self: *Self, cqe: linux.io_uring_cqe) !void {
             if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
+                // A multishot accept that ended because the listener was
+                // closed is the expected end of `stopAccepting`, not a fault
+                // to re-arm into.
+                if (self.accept_stopped) return;
                 const sqe = try getSqeOrSubmit(&self.ring);
                 sqe.prep_multishot_accept_direct(self.listen_fd, null, null, 0);
                 sqe.user_data = ACCEPT_SENTINEL;
             }
 
-            if (cqe.res < 0) return error.AcceptFailed;
+            if (cqe.res < 0) {
+                if (self.accept_stopped) return;
+                return error.AcceptFailed;
+            }
 
             const file_slot: u32 = @intCast(cqe.res);
             if (file_slot >= self.max_connections) return error.FileSlotOutOfRange;

@@ -507,7 +507,82 @@ fn workerMain(args: *WorkerCtx) !void {
     // app once, then publishes the full admin + customers THROUGH it. The same
     // endpoint is break-glass (re-run to recover a bricked control tenant). No
     // auto-deploy-on-boot magic.
-    while (!stop_flag.load(.acquire)) {
+    // Graceful drain (rove#547). On SIGTERM the loop does NOT exit: it
+    // GOAWAYs every live server connection and keeps ticking until the
+    // in-flight work finishes or this budget fires.
+    //
+    // The point is a rolling restart that costs no requests. The front's
+    // retry rule is that a request may be re-sent only when its head
+    // provably never reached the peer, so a worker killed mid-activation
+    // hands the client a 502 the front is right to refuse to retry
+    // (docs/architecture/routing-and-ingress.md — the ambiguity rule;
+    // relaxing it is what produced double commits). A GOAWAY converts that
+    // ambiguity into proof: RFC 9113 §8.7 says streams above
+    // `last_stream_id` were NOT processed, and the h2 layer already treats
+    // `REFUSED_STREAM` as exactly that, so the front re-aims them at another
+    // node invisibly.
+    //
+    // 0 disables the wait (the pre-#547 behaviour). Keep it below the
+    // supervisor's stop timeout — `TimeoutStopSec` is 30s for the worker
+    // unit — or systemd's SIGKILL lands mid-drain and undoes the point.
+    const drain_ms: i64 = blk: {
+        const v = std.posix.getenv("REWIND_WORKER_DRAIN_TIMEOUT_MS") orelse break :blk 10_000;
+        break :blk std.fmt.parseInt(i64, std.mem.trim(u8, v, " \t"), 10) catch 10_000;
+    };
+    var drain_deadline_ns: ?i128 = null;
+    // Exiting the instant the in-flight count reaches zero is too early. The
+    // front may have just written a head into a pooled connection that this
+    // process has not read yet: still running, nghttp2 refuses that stream
+    // (it is above the GOAWAY's `last_stream_id`) and the front re-aims it
+    // invisibly; exited, the socket simply dies and the same request is
+    // write-ambiguous — a 502 the front is right not to retry. So zero has to
+    // HOLD for a quiet window before this loop leaves.
+    const DRAIN_QUIET_NS: i128 = 300 * std.time.ns_per_ms;
+    var quiet_since_ns: ?i128 = null;
+
+    while (true) {
+        if (stop_flag.load(.acquire)) {
+            if (drain_ms == 0) break;
+            const now_ns = std.time.nanoTimestamp();
+            const deadline = drain_deadline_ns orelse blk: {
+                const d = now_ns + @as(i128, drain_ms) * std.time.ns_per_ms;
+                drain_deadline_ns = d;
+                // Stop accepting FIRST, then GOAWAY. A node that keeps
+                // accepting while refusing to serve is indistinguishable
+                // from a healthy one to the front, which keeps aiming
+                // writes at it; closing the listener gives the front the
+                // same fast-fail a crash does, which it already recovers
+                // from in milliseconds.
+                worker.h2.stopAccepting();
+                std.log.info("rewind worker {d}: draining ({d} in flight, budget {d}ms)", .{
+                    args.worker_idx, inFlightCount(worker), drain_ms,
+                });
+                break :blk d;
+            };
+            if (inFlightCount(worker) == 0) {
+                const since = quiet_since_ns orelse blk2: {
+                    quiet_since_ns = now_ns;
+                    break :blk2 now_ns;
+                };
+                if (now_ns - since >= DRAIN_QUIET_NS) {
+                    std.log.info("rewind worker {d}: drained", .{args.worker_idx});
+                    break;
+                }
+            } else {
+                // Work arrived during the quiet window — it was not quiet.
+                quiet_since_ns = null;
+            }
+            if (now_ns >= deadline) {
+                std.log.warn("rewind worker {d}: drain budget spent, {d} still in flight", .{
+                    args.worker_idx, inFlightCount(worker),
+                });
+                break;
+            }
+            // Re-run each pass: a connection accepted mid-drain is drained
+            // too. There is no stop-accept API, so the window is one GOAWAY
+            // round trip.
+            worker.h2.drainServerConns(2 * std.time.ns_per_s) catch break;
+        }
         worker.pollWithTimeout(1 * std.time.ns_per_ms) catch |err| switch (err) {
             error.SignalInterrupt => continue,
             else => return err,
@@ -574,6 +649,44 @@ fn workerMain(args: *WorkerCtx) !void {
             }
         }
     }
+}
+
+/// Work that must land before this worker may exit (rove#547).
+///
+/// Two things, and the split is the whole decision:
+///
+///   - the h2 request pipeline — a request received, dispatched, or with a
+///     response staged but not yet written;
+///   - the three `raft_pending` siblings — an activation that has proposed
+///     and is waiting on commit. Cutting one of those is exactly the case
+///     the front cannot retry, because the write may already have landed.
+///
+/// Deliberately NOT counted: `parked_continuations` and live WebSocket
+/// chains. Those wait on an external event that may never arrive during a
+/// drain — a held SSE stream or an idle socket would otherwise make every
+/// restart cost the full budget, which turns a graceful drain into a slow
+/// one and teaches operators to shorten it.
+/// What a drain waits for: requests this node has taken responsibility for
+/// and not yet answered (rove#547).
+///
+/// `server_open_streams` is the authority — a stream is open from the moment
+/// its HEADERS are read until its response's END_STREAM is sent, so every
+/// intermediate state counts itself and none can be forgotten. Summing the
+/// h2 hand-off collections instead misses whichever state a request happens
+/// to be sitting in (mid-body, mid-response-write), and the drain then
+/// declares quiet on top of live work and cuts it — which reaches the client
+/// as an ambiguous failure it may not retry.
+///
+/// The raft parks are added on top. A parked request normally still holds
+/// its stream, so this over-counts it; over-counting only makes the drain
+/// wait longer, which is the safe direction, while missing a propose whose
+/// client already hung up is not.
+fn inFlightCount(worker: anytype) usize {
+    const s = worker.h2.connStats();
+    return s.server_open_streams +
+        worker.raft_pending_response.entitySlice().len +
+        worker.raft_pending_cont.entitySlice().len +
+        worker.raft_pending_stream.entitySlice().len;
 }
 
 // ── Full-HA follower-apply store resolver (two-handle model) ──────────
@@ -1352,18 +1465,28 @@ pub fn main() !void {
     }
 
     while (!stop_flag.load(.acquire)) std.Thread.sleep(100 * std.time.ns_per_ms);
-    // Join ALL workers before the leadership handoff below — a group
-    // handed off while a worker is still dispatching for it would serve
-    // the tail of a batch it no longer leads.
-    for (threads) |th| th.join();
-    // Graceful leadership handoff: BEFORE tearing the pump down, hand every
-    // group this node leads to a caught-up follower so a rolling restart (the
-    // `/deploy` path) costs ~one heartbeat per group instead of a full
-    // election timeout. The pump still runs here (it lives in this scope and
-    // is stopped only by the `bridge.stopPump` below), so it drives the
-    // resulting MsgTimeoutNow → step-down readies and republishes `is_leader`.
-    // Wait a bounded window for the handoffs to land. Single-node returns 0
-    // and skips the wait.
+
+    // Graceful leadership handoff, BEFORE joining the workers (rove#547).
+    //
+    // The order used to be the other way round — join, then hand off — to
+    // avoid a worker "serving the tail of a batch for a group it no longer
+    // leads". What makes handing off first correct now is that the same
+    // SIGTERM puts every worker into its drain: it GOAWAYs its connections,
+    // so no NEW activation starts, and the only dispatch left is the
+    // in-flight tail this wait is for. Those activations proposed while this
+    // node still led; their entries are in the log and commit under the new
+    // leader, so the bridge's watermark still releases them.
+    //
+    // Doing it the old way with a drain in place is actively worse, and
+    // measurably so: the draining node keeps leadership while refusing new
+    // streams, the front re-aims a write off the GOAWAY, every other node
+    // 421s it back at the leader — this node — and the request burns its
+    // attempts and 502s. A burst across a graceful stop went from 2 failures
+    // to 559 in `front_graceful_restart_smoke` before this moved.
+    //
+    // The pump still runs here (stopped by `bridge.stopPump` below), so it
+    // drives the resulting MsgTimeoutNow → step-down readies and republishes
+    // `is_leader`. Single-node returns 0 and skips the wait.
     const handed_off = bridge.transferAllLeadership();
     if (handed_off > 0) {
         std.log.info("rewind: handed off leadership of {d} group(s); draining", .{handed_off});
@@ -1371,6 +1494,7 @@ pub fn main() !void {
         while (bridge.leadsAnyGroup() and spins < 200) : (spins += 1)
             std.Thread.sleep(10 * std.time.ns_per_ms); // up to ~2s grace
     }
+    for (threads) |th| th.join();
     // Teardown order: the pump fires the deploy apply observer into
     // `node_state` (`setApplyObserver` above), but `node_state`'s defer —
     // declared after the bridge — deinits BEFORE `bridge.deinit` joins the

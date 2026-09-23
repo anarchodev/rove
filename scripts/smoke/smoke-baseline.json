@@ -244,6 +244,11 @@
     "seconds": 2.3,
     "status": "pass"
   },
+  "front_graceful_restart_smoke.py": {
+    "rc": 0,
+    "seconds": 16.9,
+    "status": "pass"
+  },
   "front_handshake_reap_smoke.py": {
     "rc": 0,
     "seconds": 2.2,

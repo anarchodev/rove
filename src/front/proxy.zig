@@ -1703,33 +1703,52 @@ pub fn Proxy(comptime FrontH2: type) type {
                 // reset after reading the head. Without these fields a 502 here
                 // is unattributable (rove#353).
                 std.log.warn(
-                    "front: forward {s} → {s} failed (conn_died={}, replayable={}, saw_421={}, body={d}B)",
+                    "front: forward {s} → {s} failed (conn_died={}, replayable={}, saw_421={}, body={d}B, head_written={}, head_refused={}, up_sid={d}, h2_err={d})",
                     .{
-                        flow.host,    flow.nodes[flow.node_idx],
-                        conn_died,    flow.replayable,
-                        flow.saw_421, flow.body_total,
+                        flow.host,           flow.nodes[flow.node_idx],
+                        conn_died,           flow.replayable,
+                        flow.saw_421,        flow.body_total,
+                        io_res.head_written, io_res.head_refused,
+                        flow.up_sid,         io_res.stream_error,
                     },
                 );
-                // Was anything actually PUT ON THE WIRE? The h2 layer
-                // answers on the terminal itself: `head_written` is true
-                // iff this attempt's HEADERS were serialized and not
-                // covered by a FAILED socket write (rove#532). That is the
-                // delivery question, which neither of the earlier proxies
-                // could answer: `flow.up_sid` is learned a poll-pass after
-                // submit (a conn death inside the window made an executing
-                // request read as "never left" and replay — the second
-                // rove#532 duplicate source), while submit-time StreamId
-                // over-counts (a write onto a dead leg fails without
-                // queueing a byte, and 502ing that re-run-safe case is the
-                // regression `front_write_reaim_smoke` guards). `up_sid`
-                // stays OR'd in as a belt: it can only add conservatism.
+                // Was anything actually PUT ON THE WIRE? The h2 layer answers
+                // on the terminal itself. `head_written` is true iff this
+                // attempt's HEADERS were serialized and not covered by a
+                // FAILED socket write (rove#532); it is stamped on the request
+                // entity at serialization time, so it survives the connection
+                // that carried it — which is the case that matters here, since
+                // the connection dying IS the event being classified.
+                // `head_refused` is the stronger, opposite proof: the PEER
+                // attested it ran nothing (REFUSED_STREAM, how a draining
+                // server hands back the streams above its GOAWAY's
+                // `last_stream_id` — RFC 9113 §8.7), so those re-aim safely
+                // for every method.
+                //
+                // The asymmetry between the two is deliberate, and it is the
+                // whole retry rule in one line.
+                //
+                // `head_refused` is the PEER's word, so it DECIDES: nothing
+                // this process believes about its own send can outrank the
+                // far end saying it ran nothing.
+                //
+                // `head_written` is only this process's own reckoning, and
+                // `up_sid != 0` stays OR'd in beside it as a belt — a stream
+                // id is assigned at submit, so this over-states delivery for
+                // a head that never left. Over-stating costs a 502 on a
+                // request that could have been re-aimed; under-stating
+                // re-sends a request that may already have committed, and
+                // that is the failure this rule exists to prevent (rove#532).
+                // The two are not equal errors, so the belt stays.
                 //
                 // This is the line nginx draws: a connect-time failure is
                 // retried even for a POST; only a failure AFTER the request
                 // went out is treated as unsafe. Hardcoding "sent" here made
                 // a stale pooled leg — which delivered nothing — look
                 // identical to a worker that may have committed (rove#353).
-                self.attemptFailed(flow, conn_died, io_res.head_written or flow.up_sid != 0);
+                const head_sent = !io_res.head_refused and
+                    (io_res.head_written or flow.up_sid != 0);
+                self.attemptFailed(flow, conn_died, head_sent);
             }
         }
 
