@@ -688,6 +688,11 @@ pub fn build(b: *std.Build) void {
     log_server_mod.addImport("rove-reserved", reserved_mod);
     const keyring_tests = b.addTest(.{ .root_module = keyring_mod });
     test_step.dependOn(&b.addRunArtifact(keyring_tests).step);
+    // Named step for iterating on the keyring alone. The gate above still
+    // runs it; this just avoids paying for the whole tree to see one file's
+    // tests, the way `v2-test` does for the raft substrate.
+    const keyring_step = b.step("keyring-test", "Run the per-tenant keyring tests");
+    keyring_step.dependOn(&b.addRunArtifact(keyring_tests).step);
 
     // ── rove-sizing: the sizing chain, one derivation ──
     //

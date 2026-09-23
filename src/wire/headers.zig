@@ -67,6 +67,12 @@ pub const DEST = "x-rewind-dest";
 /// prefix it chose, and only the run knows what that set is called.
 pub const BACKUP_KEY = "x-rewind-backup-key";
 
+/// v2-keyring-restore: which part of a tenant's keyring the body carries —
+/// `secret`, or `shard-{8 hex}`. The sibling replication door reads the same
+/// facts out of its frame; a restore's sender is an object store, so they
+/// travel in the request instead.
+pub const KEYRING_PART = "x-rewind-keyring-part";
+
 // Streamed-snapshot baseline, carried in headers so the body stays the
 // pure pair stream.
 pub const SNAPSHOT_INDEX = "x-rewind-snapshot-index";

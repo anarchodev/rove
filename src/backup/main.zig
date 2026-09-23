@@ -28,21 +28,25 @@
 //! ## What a run contains
 //!
 //! ```
-//! {prefix}{run_id}/manifest.json       what this run covers, and from where
-//! {prefix}{run_id}/tenants/{id}.snap   one held-snapshot dump per tenant
+//! {prefix}{run_id}/manifest.json               what this run covers
+//! {prefix}{run_id}/tenants/{id}.snap           the held-snapshot dump
+//! {prefix}{run_id}/tenants/{id}.kr             the tenant's sealed keyring secret
+//! {prefix}{run_id}/tenants/{id}.shard-{8 hex}  one sealed shard per shard
 //! ```
+//!
+//! The keyring parts are what make a restored tenant able to READ what it
+//! restored: every value it sealed under `shredKey` is ciphertext in the
+//! dump, and the keys live outside raft. They move verbatim — nothing is
+//! decrypted to make the copy — so the whole backup stays inert without the
+//! cluster KEK, which lives in SOPS and never here. A restore lands the store
+//! FIRST and the keyring second, because the store carries the `_keys/dead/`
+//! tombstones that stop a restore from resurrecting a destroyed key.
 //!
 //! The manifest is written LAST: a run without one is an incomplete run, and
 //! `verify` says so rather than reporting a partial set as restorable.
 //!
 //! ## What it does not yet cover (rove#341's remaining leaves)
 //!
-//! - **Per-tenant keyring shards** (`{keyring_dir}/{tenant}/`), which are
-//!   node-local files, not raft state. Sealed values in a restored store stay
-//!   sealed without them. The shards are KEK-sealed, so backing them up keeps
-//!   the backup ciphertext-only — but it also means a restore can resurrect a
-//!   key a crypto-shred destroyed, which is a policy question (#592) before it
-//!   is a code one.
 //! - **The CP directory rows** (placement, incarnation, plan), which a restore
 //!   into a fresh cluster needs in order to re-attach a tenant with the
 //!   storage identity its blobs are keyed by.
@@ -96,11 +100,23 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(1);
 }
 
-/// A run's object keys. One place, because `run` writes them and `verify` /
+/// A run's object names. One place, because `run` writes them and `verify` /
 /// `restore` read them, and a second spelling would only be discovered by a
 /// restore that found nothing.
-fn tenantKey(a: std.mem.Allocator, run_id: []const u8, tenant: []const u8) []u8 {
-    return std.fmt.allocPrint(a, "{s}/tenants/{s}.snap", .{ run_id, tenant }) catch @panic("OOM");
+///
+/// The PREFIX is what the door is given; the worker names the parts under it
+/// (`.snap`, `.kr`, `.shard-{8 hex}`), because only the worker can see which
+/// parts a tenant has.
+fn tenantPrefix(a: std.mem.Allocator, run_id: []const u8, tenant: []const u8) []u8 {
+    return std.fmt.allocPrint(a, "{s}/tenants/{s}", .{ run_id, tenant }) catch @panic("OOM");
+}
+
+/// The object a named keyring part lands in. `secret` → `{prefix}.kr`;
+/// `shard-000000ab` → `{prefix}.shard-000000ab`.
+fn partKey(a: std.mem.Allocator, prefix: []const u8, part: []const u8) []u8 {
+    if (std.mem.eql(u8, part, "secret"))
+        return std.fmt.allocPrint(a, "{s}.kr", .{prefix}) catch @panic("OOM");
+    return std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, part }) catch @panic("OOM");
 }
 
 fn manifestKey(a: std.mem.Allocator, run_id: []const u8) []u8 {
@@ -205,6 +221,21 @@ fn moveSecret(a: std.mem.Allocator) []u8 {
 
 // ── run ───────────────────────────────────────────────────────────────
 
+const ObjectFacts = struct { bytes: u64, sha_hex: []u8 };
+
+/// Read an object back and describe what is actually there. A manifest that
+/// recorded what we *sent* would certify an upload that silently truncated.
+fn describeObject(a: std.mem.Allocator, store: *blob.S3BlobStore, key: []const u8) !ObjectFacts {
+    const got = try store.blobStore().get(key, a);
+    defer a.free(got);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(got, &digest, .{});
+    return .{
+        .bytes = got.len,
+        .sha_hex = std.fmt.allocPrint(a, "{x}", .{&digest}) catch @panic("OOM"),
+    };
+}
+
 /// Ask each node in turn to back `tenant` up to `key`. A node that does not
 /// lead the tenant answers 421, which is a redirect, not a failure — the
 /// leader is the only node whose snapshot has a knowable recency.
@@ -267,9 +298,9 @@ fn cmdRun(a: std.mem.Allocator, args: Args) !u8 {
 
     var failures: usize = 0;
     for (args.tenants, 0..) |tenant, i| {
-        const key = tenantKey(a, run_id, tenant);
-        defer a.free(key);
-        const identity = backupOne(a, args.nodes, secret, tenant, key) catch |e| {
+        const prefix = tenantPrefix(a, run_id, tenant);
+        defer a.free(prefix);
+        const identity = backupOne(a, args.nodes, secret, tenant, prefix) catch |e| {
             std.debug.print("  FAILED {s}: {s}\n", .{ tenant, @errorName(e) });
             failures += 1;
             continue;
@@ -288,23 +319,60 @@ fn cmdRun(a: std.mem.Allocator, args: Args) !u8 {
             failures += 1;
             continue;
         }
-        // Size comes from the store, not from what we asked for: the only
-        // honest record of an upload is the object that is now there.
-        const got = target.store.blobStore().get(key, a) catch |e| {
+        // Sizes and hashes come from the STORE, not from what we asked for:
+        // the only honest record of an upload is the object that is now
+        // there. Same for the keyring parts, which is also how `verify`
+        // later notices one that never landed.
+        const snap_key = std.fmt.allocPrint(a, "{s}.snap", .{prefix}) catch @panic("OOM");
+        defer a.free(snap_key);
+        const dump = describeObject(a, &target.store, snap_key) catch |e| {
             std.debug.print("  FAILED {s}: stored but unreadable: {s}\n", .{ tenant, @errorName(e) });
             failures += 1;
             continue;
         };
-        defer a.free(got);
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(got, &digest, .{});
+        defer a.free(dump.sha_hex);
+
+        // The keyring parts the node says it wrote. A tenant that has never
+        // sealed anything reports none, and that empty list is the record of
+        // what was there — not a gap to paper over at restore time.
+        var parts_json: std.ArrayListUnmanaged(u8) = .empty;
+        defer parts_json.deinit(a);
+        var parts_failed = false;
+        if (parsed_id.value.object.get("keyring_parts")) |kp| {
+            for (kp.array.items, 0..) |entry, pi| {
+                const part = entry.string;
+                const pkey = partKey(a, prefix, part);
+                defer a.free(pkey);
+                const obj = describeObject(a, &target.store, pkey) catch |e| {
+                    std.debug.print("  FAILED {s}: keyring part {s} unreadable: {s}\n", .{ tenant, part, @errorName(e) });
+                    parts_failed = true;
+                    break;
+                };
+                defer a.free(obj.sha_hex);
+                if (pi > 0) parts_json.appendSlice(a, ",") catch @panic("OOM");
+                parts_json.writer(a).print(
+                    "{{\"part\":\"{s}\",\"bytes\":{d},\"sha256\":\"{s}\"}}",
+                    .{ part, obj.bytes, obj.sha_hex },
+                ) catch @panic("OOM");
+            }
+        }
+        if (parts_failed) {
+            failures += 1;
+            continue;
+        }
+
         if (i > 0) try w.writeAll(",");
         try w.print(
-            "{{\"tenant\":\"{s}\",\"key\":\"{s}\",\"bytes\":{d},\"sha256\":\"{x}\"," ++
-                "\"store_id\":\"{s}\",\"incarnation\":\"{s}\"}}",
-            .{ tenant, key, got.len, &digest, store_id, incarnation },
+            "{{\"tenant\":\"{s}\",\"prefix\":\"{s}\",\"bytes\":{d},\"sha256\":\"{s}\"," ++
+                "\"store_id\":\"{s}\",\"incarnation\":\"{s}\",\"keyring_parts\":[{s}]}}",
+            .{ tenant, prefix, dump.bytes, dump.sha_hex, store_id, incarnation, parts_json.items },
         );
-        std.debug.print("  ok {s}: {d} bytes (incarnation {s})\n", .{ tenant, got.len, incarnation });
+        std.debug.print("  ok {s}: {d} bytes, {d} keyring part(s) (incarnation {s})\n", .{
+            tenant,
+            dump.bytes,
+            if (parsed_id.value.object.get("keyring_parts")) |kp| kp.array.items.len else 0,
+            incarnation,
+        });
     }
     try w.print("],\"failures\":{d}}}", .{failures});
 
@@ -345,7 +413,9 @@ fn cmdVerify(a: std.mem.Allocator, args: Args) !u8 {
     var bad: usize = 0;
     for (tenants.array.items) |entry| {
         const tenant = entry.object.get("tenant").?.string;
-        const key = entry.object.get("key").?.string;
+        const prefix = entry.object.get("prefix").?.string;
+        const key = std.fmt.allocPrint(a, "{s}.snap", .{prefix}) catch @panic("OOM");
+        defer a.free(key);
         const want_bytes: u64 = @intCast(entry.object.get("bytes").?.integer);
         const want_sha = entry.object.get("sha256").?.string;
 
@@ -373,6 +443,33 @@ fn cmdVerify(a: std.mem.Allocator, args: Args) !u8 {
             bad += 1;
         } else {
             std.debug.print("  ok {s}: {d} bytes\n", .{ tenant, got.len });
+        }
+
+        // The keyring is the half that decides whether a restored tenant can
+        // READ what it restored. An unverified part is the failure that only
+        // shows up as "every sealed value is gone", long after the restore
+        // reported success.
+        const parts = entry.object.get("keyring_parts") orelse continue;
+        for (parts.array.items) |pe| {
+            const part = pe.object.get("part").?.string;
+            const p_bytes: u64 = @intCast(pe.object.get("bytes").?.integer);
+            const p_sha = pe.object.get("sha256").?.string;
+            const pkey = partKey(a, prefix, part);
+            defer a.free(pkey);
+            const obj = describeObject(a, &target.store, pkey) catch |e| {
+                std.debug.print("  FAIL {s} keyring {s}: unreadable: {s}\n", .{ tenant, part, @errorName(e) });
+                bad += 1;
+                continue;
+            };
+            defer a.free(obj.sha_hex);
+            if (obj.bytes != p_bytes or !std.mem.eql(u8, obj.sha_hex, p_sha)) {
+                std.debug.print("  FAIL {s} keyring {s}: {d}b/{s} vs manifest {d}b/{s}\n", .{
+                    tenant, part, obj.bytes, obj.sha_hex, p_bytes, p_sha,
+                });
+                bad += 1;
+            } else {
+                std.debug.print("  ok {s} keyring {s}: {d} bytes\n", .{ tenant, part, obj.bytes });
+            }
         }
     }
     if (bad > 0) {
@@ -414,12 +511,31 @@ fn cmdRestore(a: std.mem.Allocator, args: Args) !u8 {
     defer target.store.deinit();
     const secret = moveSecret(a);
 
-    const key = tenantKey(a, run_id, tenant);
+    // The manifest names the parts; it is also what says which incarnation
+    // the destination must be attached under.
+    const mkey = manifestKey(a, run_id);
+    defer a.free(mkey);
+    const manifest = target.store.blobStore().get(mkey, a) catch |e|
+        fatal("run {s} has no manifest: {s}", .{ run_id, @errorName(e) });
+    defer a.free(manifest);
+    const parsed = std.json.parseFromSlice(std.json.Value, a, manifest, .{}) catch |e|
+        fatal("run {s}: manifest is not JSON: {s}", .{ run_id, @errorName(e) });
+    defer parsed.deinit();
+    var entry: ?std.json.Value = null;
+    for ((parsed.value.object.get("tenants") orelse fatal("run {s}: no tenants", .{run_id})).array.items) |e| {
+        if (std.mem.eql(u8, e.object.get("tenant").?.string, tenant)) entry = e;
+    }
+    const ent = entry orelse fatal("run {s} does not cover {s}", .{ run_id, tenant });
+    const prefix = ent.object.get("prefix").?.string;
+
+    const key = std.fmt.allocPrint(a, "{s}.snap", .{prefix}) catch @panic("OOM");
     defer a.free(key);
     const bytes = target.store.blobStore().get(key, a) catch |e|
         fatal("no backup for {s} in run {s}: {s}", .{ tenant, run_id, @errorName(e) });
     defer a.free(bytes);
-    std.debug.print("restoring {s} from {s} ({d} bytes)\n", .{ tenant, key, bytes.len });
+    std.debug.print("restoring {s} from {s} ({d} bytes, incarnation {s})\n", .{
+        tenant, key, bytes.len, ent.object.get("incarnation").?.string,
+    });
 
     // `merge` — insert-if-absent, no baseline. The group this lands in was
     // attached empty, so merge and replace mean the same thing here, and
@@ -444,13 +560,72 @@ fn cmdRestore(a: std.mem.Allocator, args: Args) !u8 {
         defer resp.deinit(a);
         last = resp.status;
         if (resp.status == 200 or resp.status == 204) {
-            std.debug.print("restored {s} into {s}\n", .{ tenant, base });
-            return 0;
+            std.debug.print("  store restored into {s}\n", .{base});
+            // The keyring goes in AFTER the store, and the order is the
+            // point: the store carries this tenant's `_keys/dead/`
+            // tombstones, and `TenantKeys.open` reconciles against them. Land
+            // the keys first and a destroyed key could come back — an erasure
+            // undone by a restore, which is the one thing a backup must not
+            // do (rove#592).
+            return restoreKeyring(a, &target.store, base, secret, tenant, prefix, ent);
         }
         std.debug.print("  {s}: {d} {s}\n", .{ base, resp.status, std.mem.trim(u8, resp.body orelse "", "\n") });
     }
     std.debug.print("restore of {s} FAILED (last status {d})\n", .{ tenant, last });
     return 1;
+}
+
+/// Land every keyring part the manifest names, on the node that just took the
+/// store. Any part failing fails the restore: a tenant missing one shard reads
+/// its own live data as erased, and the absence is authoritative — there is no
+/// later repair that notices.
+fn restoreKeyring(
+    a: std.mem.Allocator,
+    store: *blob.S3BlobStore,
+    base: []const u8,
+    secret: []const u8,
+    tenant: []const u8,
+    prefix: []const u8,
+    entry: std.json.Value,
+) !u8 {
+    const parts = entry.object.get("keyring_parts") orelse {
+        std.debug.print("restored {s} into {s} (no keyring in this backup)\n", .{ tenant, base });
+        return 0;
+    };
+    const url = try std.fmt.allocPrint(a, "{s}/_system/v2-keyring-restore", .{base});
+    defer a.free(url);
+
+    for (parts.array.items) |pe| {
+        const part = pe.object.get("part").?.string;
+        const pkey = partKey(a, prefix, part);
+        defer a.free(pkey);
+        const sealed = store.blobStore().get(pkey, a) catch |e| {
+            std.debug.print("  keyring {s}: unreadable in the backup store: {s}\n", .{ part, @errorName(e) });
+            return 1;
+        };
+        defer a.free(sealed);
+        var resp = curl.cpRequest(a, .POST, url, sealed, .{
+            .headers = &.{
+                .{ .name = wire.MOVE_SECRET, .value = secret },
+                .{ .name = wire.TENANT, .value = tenant },
+                .{ .name = wire.KEYRING_PART, .value = part },
+                .{ .name = "Content-Type", .value = "application/octet-stream" },
+            },
+        }) catch |e| {
+            std.debug.print("  keyring {s}: {s}\n", .{ part, @errorName(e) });
+            return 1;
+        };
+        defer resp.deinit(a);
+        if (resp.status != 204) {
+            std.debug.print("  keyring {s}: {d} {s}\n", .{ part, resp.status, std.mem.trim(u8, resp.body orelse "", "\n") });
+            if (resp.status == 409)
+                std.debug.print("  (409 = sealed under a different cluster KEK than this cluster opens with)\n", .{});
+            return 1;
+        }
+        std.debug.print("  keyring {s}: installed ({d} bytes)\n", .{ part, sealed.len });
+    }
+    std.debug.print("restored {s} into {s} — store + {d} keyring part(s)\n", .{ tenant, base, parts.array.items.len });
+    return 0;
 }
 
 // ── list ──────────────────────────────────────────────────────────────

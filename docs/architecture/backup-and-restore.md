@@ -78,17 +78,55 @@ Two things enforce that rather than trusting it:
 Run ids are `YYYYMMDDTHHMMSSZ` by default, so they sort lexically — which is
 what makes listing and a retention sweep simple.
 
+## The keyring travels with the dump
+
+Every value a tenant sealed under `shredKey` is ciphertext in the store dump,
+and the keys that open it are **not raft state**: they are node-local files
+under `{data_dir}/keyrings/{hash(tenant)}/` — a secret plus one file per shard
+— rewritten whole and sealed under the cluster KEK. A backup that copied only
+the store would restore a tenant whose rows are all present and all
+unreadable, and report success doing it.
+
+So a run copies them too, verbatim: `{prefix}.kr` for the secret,
+`{prefix}.shard-{8 hex}` for each shard, named in the manifest. A restore
+POSTs each to `/_system/v2-keyring-restore`, the sibling of the
+`v2-keyring-shard` door that replicates a freshly minted shard between peers.
+Both verify under the destination's KEK before anything lands — an unverified
+install poisons a node silently and surfaces at a failover, which is exactly
+when that copy becomes the only copy.
+
+**Nothing is ever decrypted to make the copy.** The bytes that leave are the
+bytes on disk, which is what keeps the backup ciphertext-only: it is inert
+without `REWIND_KEYRING_KEK`, and that lives in SOPS, never in the backup
+store. Two factors, separated by construction — which is the property that
+makes shipping this off-provider defensible at all.
+
+### Why a restore cannot undo an erasure
+
+Holding keys in a backup raises the obvious question: an old backup's shard
+still contains a key the tenant has since destroyed, so does restoring it
+bring the key back? No — and the reason is the split crypto-shredding already
+makes. A destroy carries no key material, so it rides the tenant's **raft
+log** as `_keys/dead/{slot}`; the key itself never does. The tombstone is
+therefore part of the store dump, and `TenantKeys.open` reconciles against it
+before anything can reach the keyring: any slot with a tombstone is evicted
+and its shard rewritten without it.
+
+That makes the restore **order** load-bearing rather than stylistic:
+
+    store dump first  →  the tombstones are present
+    keyring second    →  the first open reconciles against them
+
+`rewind-backup restore` does both in that order in one command. Reversing them
+would leave a window where the keyring is open and the tombstones are not yet
+there, and reconciliation does not re-run on its own. The interlock is pinned
+by a test in `tenant_keys.zig` that fails if reconciliation is skipped.
+
 ## What is not covered yet
 
 Stated plainly, because a backup whose coverage is assumed rather than known
 is the failure this document exists to prevent. Each is a leaf of rove#341:
 
-- **Per-tenant keyring shards** (`{keyring_dir}/{tenant}/`) are node-local
-  files, not raft state. Values sealed under a tenant key stay sealed in a
-  restored store without them. They are KEK-sealed, so backing them up keeps
-  the backup ciphertext-only — but it also means a restore could resurrect a
-  key that a crypto-shred destroyed, which is a policy question (the erasure
-  claim in rove#592) before it is a code one.
 - **The CP directory rows** — placement, incarnation, plan. The incarnation in
   particular is what a restore must attach under, so today it survives only
   because the backup manifest copies it.

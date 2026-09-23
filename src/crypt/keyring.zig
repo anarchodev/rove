@@ -975,6 +975,111 @@ pub fn installSealedShard(
     try kr.writeRaw(path, sealed);
 }
 
+/// Every shard this tenant has on this node, ascending. The directory
+/// listing IS the shard set (an absent shard is an empty one), so this is a
+/// listing, not a probe of a slot space that grows with the tenant.
+///
+/// A backup needs it for the same reason replication does not: replication
+/// pushes the shard it just wrote, while a backup has to enumerate what is
+/// already there (rove#963).
+pub fn listShards(
+    allocator: std.mem.Allocator,
+    base_dir: []const u8,
+    tenant_id: []const u8,
+) Error![]u32 {
+    var kr = try Keyring.init(allocator, base_dir, tenant_id, &[_]u8{0} ** crypt.KEY_LEN);
+    defer kr.deinit();
+
+    var d = std.fs.cwd().openDir(kr.tenant_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return allocator.alloc(u32, 0) catch Error.OutOfMemory,
+        else => return Error.Io,
+    };
+    defer d.close();
+
+    var out: std.ArrayListUnmanaged(u32) = .empty;
+    errdefer out.deinit(allocator);
+    var it = d.iterate();
+    while (it.next() catch return Error.Io) |ent| {
+        if (ent.kind != .file) continue;
+        const shard = Keyring.parseShardName(ent.name) orelse continue;
+        out.append(allocator, shard) catch return Error.OutOfMemory;
+    }
+    std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+    return out.toOwnedSlice(allocator) catch Error.OutOfMemory;
+}
+
+/// The tenant's sealed secret file, verbatim, or null when this node has no
+/// keyring for the tenant. Caller frees.
+///
+/// The SEALED bytes, never the secret itself: it is the HKDF root for the
+/// tenant's pseudonyms, so a backup that carried it in the clear would hand
+/// whoever holds the backup what the KEK is supposed to gate. Sealed, the
+/// copy is inert without `REWIND_KEYRING_KEK` — which lives in SOPS, not in
+/// the backup store (rove#963).
+pub fn readSealedSecret(
+    allocator: std.mem.Allocator,
+    base_dir: []const u8,
+    tenant_id: []const u8,
+    kek: []const u8,
+) Error!?[]u8 {
+    var kr = try Keyring.init(allocator, base_dir, tenant_id, kek);
+    defer kr.deinit();
+
+    const path = try kr.secretPath();
+    defer allocator.free(path);
+
+    return std.fs.cwd().readFileAlloc(
+        allocator,
+        path,
+        crypt.OVERHEAD + SECRET_FILE_LEN,
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => Error.Io,
+    };
+}
+
+/// Install a tenant's secret file from `sealed`, verifying it opens under
+/// THIS node's KEK before it lands — the same discipline as
+/// `installSealedShard`, for the same reason: an unverified install poisons
+/// the node silently and surfaces at the worst possible moment.
+///
+/// Refuses when the tenant already holds shards. Replacing the secret of a
+/// keyring that has minted keys strands every pseudonym derived from the old
+/// one, which reads later as data that cannot be found rather than as a
+/// mistake made here. A restore lands on a tenant that has none.
+pub fn installSealedSecret(
+    allocator: std.mem.Allocator,
+    base_dir: []const u8,
+    tenant_id: []const u8,
+    kek: []const u8,
+    sealed: []const u8,
+) Error!void {
+    const shards = try listShards(allocator, base_dir, tenant_id);
+    defer allocator.free(shards);
+    if (shards.len > 0) return Error.Corrupt;
+
+    var kr = try Keyring.init(allocator, base_dir, tenant_id, kek);
+    defer kr.deinit();
+    try sweepStaleTemps(allocator, kr.tenant_dir);
+
+    const plain = crypt.openAlloc(allocator, sealed, kr.file_key) catch |err| switch (err) {
+        crypt.Error.AuthFailed => return Error.AuthFailed,
+        crypt.Error.OutOfMemory => return Error.OutOfMemory,
+        else => return Error.Corrupt,
+    };
+    defer {
+        std.crypto.secureZero(u8, plain);
+        allocator.free(plain);
+    }
+    if (plain.len != SECRET_FILE_LEN) return Error.Corrupt;
+    if (std.mem.readInt(u32, plain[0..4], .big) != SECRET_MAGIC) return Error.Corrupt;
+    if (std.mem.readInt(u16, plain[4..6], .little) != FORMAT_VERSION) return Error.Corrupt;
+
+    const path = try kr.secretPath();
+    defer allocator.free(path);
+    try kr.writeRaw(path, sealed);
+}
+
 /// Read a shard's sealed bytes for sending to a peer, or null when the
 /// shard is empty. Caller frees.
 ///
@@ -1831,6 +1936,86 @@ test "replication: a shard sent from one node opens on another" {
     defer b.deinit();
     try testing.expectEqual(@as(usize, 3), b.count());
     try testing.expectEqualSlices(u8, &minted, &b.keyAt(2).?);
+}
+
+test "backup: a tenant's keyring moves to a fresh node as sealed bytes" {
+    // The restore path of rove#963: a node that never had this tenant gets
+    // the secret and the shards as ciphertext, and ends up holding the same
+    // keys. Nothing is decrypted to make the copy, and the copy is inert
+    // without the KEK — which is what makes it safe to store off-provider.
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const node_a = tmpDirPath(&buf_a);
+    defer cleanup(node_a);
+    const node_b = tmpDirPath(&buf_b);
+    defer cleanup(node_b);
+
+    {
+        var a = try Keyring.create(testing.allocator, node_a, "acme", TEST_KEK, TEST_SECRET);
+        defer a.deinit();
+        try a.mintRange(1, 3, 1);
+        // A second shard, so the listing is not trivially one entry.
+        try a.mintRange(shardBase(1), 1, 1);
+    }
+
+    const shards = try listShards(testing.allocator, node_a, "acme");
+    defer testing.allocator.free(shards);
+    try testing.expectEqual(@as(usize, 2), shards.len);
+    try testing.expectEqual(@as(u32, 0), shards[0]);
+    try testing.expectEqual(@as(u32, 1), shards[1]);
+
+    const sealed_secret = (try readSealedSecret(testing.allocator, node_a, "acme", TEST_KEK)).?;
+    defer testing.allocator.free(sealed_secret);
+    try installSealedSecret(testing.allocator, node_b, "acme", TEST_KEK, sealed_secret);
+    for (shards) |sh| {
+        const sealed = (try readSealedShard(testing.allocator, node_a, "acme", TEST_KEK, sh)).?;
+        defer testing.allocator.free(sealed);
+        try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, sh, sealed);
+    }
+
+    var a = try Keyring.open(testing.allocator, node_a, "acme", TEST_KEK);
+    defer a.deinit();
+    var b = try Keyring.open(testing.allocator, node_b, "acme", TEST_KEK);
+    defer b.deinit();
+    try testing.expectEqualSlices(u8, a.tenantSecret(), b.tenantSecret());
+    for ([_]u64{ 1, 2, 3, shardBase(1) }) |slot| {
+        const want = a.keyAt(slot).?;
+        const got = b.keyAt(slot).?;
+        try testing.expectEqualSlices(u8, &want, &got);
+    }
+}
+
+test "backup: a restored secret is refused under a different KEK, and on a keyring that has minted" {
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const node_a = tmpDirPath(&buf_a);
+    defer cleanup(node_a);
+    const node_b = tmpDirPath(&buf_b);
+    defer cleanup(node_b);
+
+    {
+        var a = try Keyring.create(testing.allocator, node_a, "acme", "kek-one", TEST_SECRET);
+        defer a.deinit();
+    }
+    const sealed = (try readSealedSecret(testing.allocator, node_a, "acme", "kek-one")).?;
+    defer testing.allocator.free(sealed);
+
+    // Wrong KEK: caught on receipt, like a shard.
+    try testing.expectError(Error.AuthFailed, installSealedSecret(
+        testing.allocator, node_b, "acme", "kek-two", sealed,
+    ));
+
+    // A keyring that has already minted: replacing its secret would strand
+    // every pseudonym derived from the old one, which surfaces later as data
+    // that cannot be found rather than as a mistake made here.
+    {
+        var b = try Keyring.create(testing.allocator, node_b, "acme", "kek-one", [_]u8{0x11} ** SECRET_LEN);
+        defer b.deinit();
+        try b.mintRange(1, 1, 1);
+    }
+    try testing.expectError(Error.Corrupt, installSealedSecret(
+        testing.allocator, node_b, "acme", "kek-one", sealed,
+    ));
 }
 
 test "replication: an empty install removes the shard, propagating a destroy" {
