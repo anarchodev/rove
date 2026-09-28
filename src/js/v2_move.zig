@@ -163,6 +163,10 @@ pub fn tryHandleV2(
         try handleForwardEnd(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, keyring_shard.ROUTE)) {
         try keyring_shard.handlePush(server, allocator, worker, ent, sid, sess, method, body);
+    } else if (std.mem.eql(u8, sys_rest, keyring_shard.STATUS_ROUTE)) {
+        try keyring_shard.handleStatus(server, allocator, worker, ent, sid, sess, method, queryParam(path, "tenant"));
+    } else if (std.mem.eql(u8, sys_rest, keyring_shard.PULL_ROUTE)) {
+        try keyring_shard.handlePull(server, allocator, worker, ent, sid, sess, method, queryParam(path, "tenant"));
     } else if (std.mem.eql(u8, sys_rest, "v2-snapshot-push")) {
         try armSnapshotPush(server, allocator, worker, ent, sid, sess, method, rh);
     } else if (std.mem.eql(u8, sys_rest, "v2-backup")) {

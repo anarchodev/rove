@@ -180,6 +180,115 @@ pub const Quorum = struct {
     }
 };
 
+// ── pull ─────────────────────────────────────────────────────────────
+//
+// A push offers one shard to peers that are up. A node that was down, or
+// was added after the tenant was born, receives nothing from it — so it
+// asks: one request, and the answer is everything the peer holds for the
+// tenant, as the same portable ciphertext a push carries.
+
+/// `RKP1` — distinct from the push frame and from every keyring file.
+const PULL_MAGIC: u32 = 0x524B5031;
+pub const PULL_WIRE_VERSION: u16 = 1;
+
+/// `[4B magic][2B version][2B tenant_len][tenant][4B secret_len][secret][4B count]`
+/// then `count` × `[4B shard][4B sealed_len][sealed]`.
+const PULL_HEADER_LEN: usize = 4 + 2 + 2;
+
+/// Ceiling on shards in one answer, so a malformed count cannot make a
+/// receiver walk without bound.
+pub const MAX_PULL_SHARDS: u32 = 1 << 20;
+
+/// Everything one node holds for a tenant. Slices borrow.
+pub const Bundle = struct {
+    tenant_id: []const u8,
+    /// The sealed secret file, verbatim.
+    secret: []const u8,
+    /// `(shard, sealed)` pairs, verbatim from disk.
+    shards: []const ShardPart,
+};
+
+pub const ShardPart = struct { shard: u32, sealed: []const u8 };
+
+pub fn encodeBundle(allocator: std.mem.Allocator, b: Bundle) Error![]u8 {
+    if (b.tenant_id.len > keyring.MAX_TENANT_ID_LEN) return Error.TooLarge;
+    if (b.shards.len > MAX_PULL_SHARDS) return Error.TooLarge;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = struct {
+        fn int(o: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, comptime T: type, v: T, endian: std.builtin.Endian) Error!void {
+            var buf: [@sizeOf(T)]u8 = undefined;
+            std.mem.writeInt(T, &buf, v, endian);
+            o.appendSlice(a, &buf) catch return Error.OutOfMemory;
+        }
+        fn bytes(o: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, v: []const u8) Error!void {
+            o.appendSlice(a, v) catch return Error.OutOfMemory;
+        }
+    };
+    try w.int(&out, allocator, u32, PULL_MAGIC, .big);
+    try w.int(&out, allocator, u16, PULL_WIRE_VERSION, .little);
+    try w.int(&out, allocator, u16, @intCast(b.tenant_id.len), .little);
+    try w.bytes(&out, allocator, b.tenant_id);
+    try w.int(&out, allocator, u32, @intCast(b.secret.len), .little);
+    try w.bytes(&out, allocator, b.secret);
+    try w.int(&out, allocator, u32, @intCast(b.shards.len), .little);
+    for (b.shards) |part| {
+        if (part.sealed.len > MAX_SEALED_LEN) return Error.TooLarge;
+        try w.int(&out, allocator, u32, part.shard, .little);
+        try w.int(&out, allocator, u32, @intCast(part.sealed.len), .little);
+        try w.bytes(&out, allocator, part.sealed);
+    }
+    return out.toOwnedSlice(allocator) catch Error.OutOfMemory;
+}
+
+/// Decode a pull answer. The shard list is allocated (caller frees
+/// `shards`); every byte slice borrows from `bytes`.
+///
+/// Exact, as the push frame is: a trailing remainder or a length that
+/// runs past the end refuses, because a half-understood keyring transfer
+/// installs wrong key material.
+pub fn decodeBundle(allocator: std.mem.Allocator, bytes: []const u8) Error!Bundle {
+    var pos: usize = 0;
+    const r = struct {
+        fn take(b: []const u8, p: *usize, n: usize) Error![]const u8 {
+            if (b.len - p.* < n) return Error.Truncated;
+            defer p.* += n;
+            return b[p.*..][0..n];
+        }
+        fn int(b: []const u8, p: *usize, comptime T: type, endian: std.builtin.Endian) Error!T {
+            const s = try take(b, p, @sizeOf(T));
+            return std.mem.readInt(T, s[0..@sizeOf(T)], endian);
+        }
+    };
+    if (try r.int(bytes, &pos, u32, .big) != PULL_MAGIC) return Error.BadMagic;
+    if (try r.int(bytes, &pos, u16, .little) != PULL_WIRE_VERSION) return Error.UnsupportedVersion;
+    const id_len = try r.int(bytes, &pos, u16, .little);
+    if (id_len > keyring.MAX_TENANT_ID_LEN) return Error.TooLarge;
+    const tenant_id = try r.take(bytes, &pos, id_len);
+    const secret_len = try r.int(bytes, &pos, u32, .little);
+    if (secret_len > MAX_SEALED_LEN) return Error.TooLarge;
+    const secret = try r.take(bytes, &pos, secret_len);
+    const count = try r.int(bytes, &pos, u32, .little);
+    if (count > MAX_PULL_SHARDS) return Error.TooLarge;
+
+    var shards: std.ArrayListUnmanaged(ShardPart) = .empty;
+    errdefer shards.deinit(allocator);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const shard = try r.int(bytes, &pos, u32, .little);
+        const len = try r.int(bytes, &pos, u32, .little);
+        if (len > MAX_SEALED_LEN) return Error.TooLarge;
+        const sealed = try r.take(bytes, &pos, len);
+        shards.append(allocator, .{ .shard = shard, .sealed = sealed }) catch return Error.OutOfMemory;
+    }
+    if (pos != bytes.len) return Error.Truncated;
+    return .{
+        .tenant_id = tenant_id,
+        .secret = secret,
+        .shards = shards.toOwnedSlice(allocator) catch return Error.OutOfMemory,
+    };
+}
+
 // ── tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -307,4 +416,31 @@ test "quorum is sized against the replica set, not who is reachable" {
     minority_side.fail();
     minority_side.fail();
     try testing.expectEqual(State.impossible, minority_side.state());
+}
+
+
+test "pull: a bundle round-trips, and anything short or long refuses" {
+    const a = std.testing.allocator;
+    const parts = [_]ShardPart{
+        .{ .shard = 0, .sealed = "shard-zero-bytes" },
+        .{ .shard = 7, .sealed = "shard-seven" },
+    };
+    const enc = try encodeBundle(a, .{ .tenant_id = "acme", .secret = "sealed-secret", .shards = &parts });
+    defer a.free(enc);
+    const dec = try decodeBundle(a, enc);
+    defer a.free(dec.shards);
+    try std.testing.expectEqualStrings("acme", dec.tenant_id);
+    try std.testing.expectEqualStrings("sealed-secret", dec.secret);
+    try std.testing.expectEqual(@as(usize, 2), dec.shards.len);
+    try std.testing.expectEqual(@as(u32, 7), dec.shards[1].shard);
+    try std.testing.expectEqualStrings("shard-seven", dec.shards[1].sealed);
+
+    try std.testing.expectError(Error.Truncated, decodeBundle(a, enc[0 .. enc.len - 1]));
+    const long = try std.mem.concat(a, u8, &.{ enc, "x" });
+    defer a.free(long);
+    try std.testing.expectError(Error.Truncated, decodeBundle(a, long));
+    // A push frame is never read as a pull answer.
+    const push = try encode(a, .{ .tenant_id = "acme", .shard = 0, .sealed = "x" });
+    defer a.free(push);
+    try std.testing.expectError(Error.BadMagic, decodeBundle(a, push));
 }

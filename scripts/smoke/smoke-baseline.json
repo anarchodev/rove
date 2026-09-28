@@ -349,6 +349,16 @@
     "seconds": 8.3,
     "status": "pass"
   },
+  "keyring_failover_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.8,
+    "status": "pass"
+  },
+  "keyring_repair_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 8.5,
+    "status": "pass"
+  },
   "keyring_shard_smoke_v2.py": {
     "rc": 0,
     "seconds": 0.9,

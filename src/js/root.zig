@@ -71,6 +71,8 @@ pub const durable_wake = @import("durable_wake.zig");
 /// Per-tenant slot pools and the shared refill driver that keeps them
 /// warm ahead of demand (`keyring_pool.zig`).
 pub const keyring_pool = @import("keyring_pool.zig");
+/// The keyring shard transport: push to a quorum, and pull for repair.
+pub const keyring_shard = @import("keyring_shard.zig");
 /// One tenant's key state and the `_keys/` keyspace (`rove-keyring`).
 pub const keyring = @import("rove-keyring");
 /// Per-tenant slot state, including the keyring (`deployment_cache.zig`).
