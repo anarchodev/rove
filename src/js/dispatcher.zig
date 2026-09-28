@@ -702,25 +702,6 @@ pub const Dispatcher = struct {
 /// Free a per-dispatch tag accumulator: the owned key/value bytes of
 /// each entry, then the buffer. Used on the drop paths (probe miss,
 /// stream, error) where the tags don't move onto a Response/Continuation.
-/// Move every pool-body wrap this activation's readset carries onto
-/// `key_slot`. The two channels below are the only ones whose entries can
-/// name a pool object; an entry with no wrap names none (inline bytes, a
-/// content-addressed chunk, a terminal-only event) and is skipped.
-///
-/// Rewritten in place: a live readset's entries are built by `append*`,
-/// which dups every slice into tape-owned memory, and a wrap is fixed
-/// length, so the move never reallocates.
-fn bindBodyWraps(keys: anytype, rs: *tape_mod.Readset, key_slot: u64) !void {
-    for (rs.trigger_payload.entries.items) |*e| {
-        const wrap = e.trigger_payload.body_key;
-        if (wrap.len > 0) try keys.bindBodyWrap(@constCast(wrap), key_slot);
-    }
-    for (rs.fetch_responses.entries.items) |*e| {
-        const wrap = e.fetch_responses.body_key;
-        if (wrap.len > 0) try keys.bindBodyWrap(@constCast(wrap), key_slot);
-    }
-}
-
 fn freeTagsBuf(allocator: std.mem.Allocator, tags_buf: *std.ArrayList(log_mod.Tag)) void {
     for (tags_buf.items) |t| {
         allocator.free(t.key);
@@ -812,14 +793,11 @@ fn finishResponse(
                         // per-identity erasure and cannot have it.
                         state.pending_kv_error = err;
                     };
-                    // The bodies this activation spilled to the pool were
-                    // sealed at submit, before any identity existed, under
-                    // a data key wrapped for the tenant. Their wraps move
-                    // to the identity now, on the tape entries that carry
-                    // them — the pool bytes themselves never change.
-                    if (state.readset) |rs| bindBodyWraps(keys, rs, key_slot) catch |err| {
-                        state.pending_kv_error = err;
-                    };
+                    // The activation's payloads seal under this identity at
+                    // capture (`pool_seal.sealReadsetPayloads`), which is
+                    // after the last of them is appended — several capture
+                    // paths append theirs once the handler has returned.
+                    if (state.readset) |rs| rs.shred_slot = key_slot;
                 }
             }
         }

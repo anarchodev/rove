@@ -303,36 +303,19 @@ pub const TapePayloads = struct {
     /// `tape.Channel.request_reads`. Empty for activations with no
     /// recorded reads or non-handler producers.
     request_reads_tape_bytes: []const u8 = &.{},
-    /// Captured request body, iff the handler read `request.body`
-    /// AND it fit the inline cap (16 KB, `REQUEST_BODY_CAP` — larger
-    /// read bodies live in BlobBackend via the trigger_payload
-    /// BodyRef). Empty when the request had no body, the handler
-    /// never read it, or the worker chose not to capture (no tenant
-    /// log open).
-    request_body_bytes: []const u8 = &.{},
-    /// True iff `request_body_bytes` is a truncated prefix. Replay
-    /// still feeds the captured bytes — the handler's view is what
-    /// was captured, even if that's less than the original.
-    request_body_truncated: bool = false,
-    /// The activation's Msg bytes, for the kinds whose Msg is bytes the
-    /// handler reads: `fetch_chunk` (the upstream chunk payload,
-    /// surfaced as `request.activation.bytes`), `wake_batch` (the
-    /// drained fired-watch bag, `request.activation.wakes`), and
-    /// `ws_message` (the frame, `[opcode:u8][data]`). Empty for every
-    /// other activation source, and for a payload over the inline cap
-    /// that nothing retained — the readset's `activation` /
-    /// `fetch_responses` entry keeps that one's LENGTH, so absence here
-    /// is never silently an empty payload. L3
-    /// (`docs/effect-algebra.md`): every Msg is recorded, including its
-    /// bytes.
+    /// The readset's `activation` channel: the resolved export and, for the
+    /// kinds whose Msg lives there (a `wake_batch`'s drained fired-watch bag,
+    /// a `ws_message`'s `[opcode:u8][data]` frame), the Msg itself. Empty for
+    /// every other activation source.
     ///
-    /// Rebuilt from the raft entry's `activation` channel on a
-    /// walker-recovered record (`src/js/worker_upload_walker.zig`),
-    /// which is why that channel exists at all: this field never
-    /// reaches raft on its own.
-    activation_bytes: []const u8 = &.{},
-    /// True iff `activation_bytes` is a truncated prefix.
-    activation_bytes_truncated: bool = false,
+    /// Every payload a record carries rides a TAPE, never a raw side field:
+    /// that is what lets payload sealing (`keyring.body_seal`) cover it
+    /// uniformly, and what the logs door opens on the way out. The request
+    /// body is `trigger_payload`'s, a fetch chunk's is `fetch_responses`'.
+    /// L3 (`docs/effect-algebra.md`): every Msg is recorded, including its
+    /// bytes — over the inline cap the entry keeps the LENGTH, so absence
+    /// is never silently an empty payload.
+    activation_tape_bytes: []const u8 = &.{},
     /// The **resolved export** the activation dispatched to (a callback's
     /// `{on}` override / `onFetchResult`/`Chunk`/`Done`), when it isn't
     /// derivable from the activation kind alone. Lets replay invoke the SAME
@@ -365,8 +348,7 @@ pub const TapePayloads = struct {
         if (self.fetch_responses_tape_bytes.len != 0) allocator.free(self.fetch_responses_tape_bytes);
         if (self.trigger_payload_tape_bytes.len != 0) allocator.free(self.trigger_payload_tape_bytes);
         if (self.request_reads_tape_bytes.len != 0) allocator.free(self.request_reads_tape_bytes);
-        if (self.request_body_bytes.len != 0) allocator.free(self.request_body_bytes);
-        if (self.activation_bytes.len != 0) allocator.free(self.activation_bytes);
+        if (self.activation_tape_bytes.len != 0) allocator.free(self.activation_tape_bytes);
         if (self.kv_write_keys_bytes.len != 0) allocator.free(self.kv_write_keys_bytes);
         self.* = .{};
     }
@@ -1019,8 +1001,9 @@ fn estimateRecordBytes(r: *const LogRecord) usize {
     n += r.tapes.kv_tape_bytes.len;
     n += r.tapes.module_tree_bytes.len;
     n += r.tapes.request_reads_tape_bytes.len;
-    n += r.tapes.request_body_bytes.len;
-    n += r.tapes.activation_bytes.len;
+    n += r.tapes.fetch_responses_tape_bytes.len;
+    n += r.tapes.trigger_payload_tape_bytes.len;
+    n += r.tapes.activation_tape_bytes.len;
     return n;
 }
 

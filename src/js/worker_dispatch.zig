@@ -2812,7 +2812,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // failure mode (e.g. step through the same kv reads to see
             // why the handler hit the CPU budget).
             worker_mod.dropPartialDigest(&readset);
-            const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
+            const tape_payloads = worker_mod.captureTapes(worker, &readset, scope_inst.id);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, tape_payloads, saga_id, &.{}, .inbound, 0, exec_seq);
             processed += 1;
             continue;
@@ -2960,7 +2960,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                         .{ scope_inst.id, @errorName(re) },
                     );
                     try respb.setSimpleResponse(server, ent, sid, sess, 500, worker_mod.NEXT_FN_UNSUPPORTED_BODY, allocator);
-                    worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, body), saga_id, &.{}, .inbound, 0, exec_seq);
+                    worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, scope_inst.id), saga_id, &.{}, .inbound, 0, exec_seq);
                     processed += 1;
                     continue;
                 }
@@ -3109,7 +3109,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // any tape-consuming expression baked into the throw
             // message (e.g. `Date.now()`) resolves to the same value
             // it did originally.
-            const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
+            const tape_payloads = worker_mod.captureTapes(worker, &readset, scope_inst.id);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, console_owned, exception_owned, tape_payloads, saga_id, &.{}, .inbound, 0, exec_seq);
             processed += 1;
             continue;
@@ -3129,7 +3129,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // point with the same prior reads. The digest does not
             // survive: this activation never reached its result.
             worker_mod.dropPartialDigest(&readset);
-            const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
+            const tape_payloads = worker_mod.captureTapes(worker, &readset, scope_inst.id);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, tape_payloads, saga_id, &.{}, .inbound, 0, exec_seq);
             processed += 1;
             continue;
@@ -3173,7 +3173,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     .{ scope_inst.id, @errorName(re) },
                 );
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, worker_mod.HELD_NO_WAKE_SOURCE_BODY, allocator);
-                worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, body), saga_id, &.{}, .inbound, 0, exec_seq);
+                worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, scope_inst.id), saga_id, &.{}, .inbound, 0, exec_seq);
                 processed += 1;
                 continue;
             }
@@ -3231,7 +3231,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // ride inline in the next ndjson flush. Inbound `body` is
         // included for replay; the outbound response is NOT — replay
         // re-produces it deterministically from (body, tapes, source).
-        const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
+        const tape_payloads = worker_mod.captureTapes(worker, &readset, scope_inst.id);
 
         // Serialize this request's readset and append to
         // the batch's list. finalizeBatch wraps the collected blobs

@@ -88,7 +88,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .site = "stream-disconnect",
         .on_cont = .warn,
         .on_stream = .warn,
-    }, path, chain_ctx.saga_id, chain_ctx.tenant_id, "");
+    }, path, chain_ctx.saga_id, chain_ctx.tenant_id);
 }
 
 /// Fire a subscription handler as a fresh chain
@@ -204,7 +204,7 @@ pub fn fireSubscriptionActivation(
         .on_cont = .warn,
         .on_stream = .warn,
         .always_propose = true,
-    }, module_path, corr_full, subscription_name, "");
+    }, module_path, corr_full, subscription_name);
 }
 
 /// §2.6 durable-wake: fire the baked `__system/scheduler_tick`
@@ -259,7 +259,7 @@ pub fn fireSchedulerTick(worker: anytype, tenant_id: []const u8) void {
         .site = "scheduler_tick",
         .on_cont = .rollback_silent,
         .on_stream = .rollback_silent,
-    }, module_path, corr_full, tenant_id, "");
+    }, module_path, corr_full, tenant_id);
 }
 
 // ── blob compose door (`docs/architecture/blob-write-recipes.md` §4) ─────────────
@@ -322,7 +322,7 @@ pub fn fireBlobCompose(worker: anytype, pf_in: globals.PendingFetch) void {
         .site = "blob_compose",
         .on_cont = .rollback_silent,
         .on_stream = .rollback_silent,
-    }, module_path, corr_full, pf.tenant_id, "");
+    }, module_path, corr_full, pf.tenant_id);
 }
 
 /// §2.6 durable-wake: dispatch one due `_sched/by_time` entry's
@@ -477,7 +477,7 @@ pub fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWak
         .on_cont = .warn,
         .on_stream = .warn,
         .always_propose = true,
-    }, module_path, corr_full, label, "");
+    }, module_path, corr_full, label);
 }
 
 /// Dispatch a chained handler activation produced by
@@ -558,7 +558,7 @@ pub fn fireChainedActivation(
         .on_stream = .warn,
         .readonly_cont_commits = true,
         .tape = .callback,
-    }, module_path, corr_full, module_path, "");
+    }, module_path, corr_full, module_path);
 }
 
 /// Dispatch a platform action in `pd.tenant_id`'s scope (rove#691).
@@ -647,7 +647,7 @@ pub fn fireDispatchActivation(
         .readonly_cont_commits = true,
         .tape = .callback,
         .capture_terminal = true,
-    }, module_path, corr_full, module_path, "");
+    }, module_path, corr_full, module_path);
 
     // The return path. The target cannot write into the origin's store —
     // that cross-tenant write is what this arc removes — so completion comes
@@ -970,16 +970,12 @@ pub fn fireFetchEventActivation(
         );
     };
 
-    // The activation's input bytes (the upstream chunk
-    // payload) get taped on `TapePayloads.activation_bytes` —
-    // `runFire` captures them on every log record (`spec.tape = .activation`) so
-    // replay reconstitutes the same handler invocation from the same
-    // captured bytes.
-    // `activation_bytes` is the SECOND copy of a chunk's payload — the
-    // `fetch_responses` entry above is the first — so an engine static chunk
-    // has to skip both, or the 1:1 growth this fixes just moves channels.
-    // `spec.tape` is comptime, so the choice is two specialised calls rather
-    // than a runtime flag.
+    // The chunk's bytes ride its `fetch_responses` entry above, which
+    // `runFire` captures on the log record (`spec.tape = .activation`) so
+    // replay reconstitutes the same handler invocation from the same bytes.
+    // An engine static chunk records none of it — the append above already
+    // skipped — so it captures nothing either. `spec.tape` is comptime, so
+    // the choice is two specialised calls rather than a runtime flag.
     if (event.static_serve) {
         runFire(worker, &p, req, .{
             .act = .fetch_chunk,
@@ -988,7 +984,7 @@ pub fn fireFetchEventActivation(
             .on_stream = .warn,
             .readonly_cont_commits = true,
             .tape = .none,
-        }, module_path, corr_full, module_path, "");
+        }, module_path, corr_full, module_path);
     } else {
         runFire(worker, &p, req, .{
             .act = .fetch_chunk,
@@ -997,6 +993,6 @@ pub fn fireFetchEventActivation(
             .on_stream = .warn,
             .readonly_cont_commits = true,
             .tape = .activation,
-        }, module_path, corr_full, module_path, event.bytes);
+        }, module_path, corr_full, module_path);
     }
 }

@@ -1438,8 +1438,8 @@ fn handleBody(
     };
     defer resolved.deinit(allocator);
 
-    // Base64-in-JSON, like every other byte field a record carries
-    // (`request_body_b64`, `activation_bytes_b64`, the tape blobs). The
+    // Base64-in-JSON, like every other byte field a record carries (the
+    // tape blobs). The
     // dashboard reaches this door through a same-origin chokepoint that
     // relays door results as TEXT, so raw octets would be UTF-8 mangled
     // in transit; and the caller needs the verdict alongside the bytes to

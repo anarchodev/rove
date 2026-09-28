@@ -1637,12 +1637,12 @@ inline fn contTapes(worker: anytype, comptime tape: ContTape, ctx: *const ContFi
         // the whole `{"ctx":…}` body envelope. Both tape
         // readset + ctx + the resolved export so the hop is replayable.
         .cont => switch (ctx.act) {
-            .wake_batch => worker_mod.captureWakeBatchTapes(worker, ctx.readset, ctx.tape_body, ctx.wakes, ctx.resume_export),
-            .send_callback => worker_mod.captureSendCallbackTapes(worker, ctx.readset, ctx.tape_body, ctx.resume_export),
+            .wake_batch => worker_mod.captureWakeBatchTapes(worker, ctx.readset, ctx.tenant_id, ctx.tape_body, ctx.wakes, ctx.resume_export),
+            .send_callback => worker_mod.captureSendCallbackTapes(worker, ctx.readset, ctx.tenant_id, ctx.tape_body, ctx.resume_export),
             else => .{},
         },
-        .chunk => worker_mod.captureTapes(worker, ctx.readset, ctx.tape_bytes),
-        .fetch => worker_mod.captureFetchChunkTapes(worker, ctx.readset, ctx.tape_body, ctx.tape_ev.?),
+        .chunk => worker_mod.captureTapes(worker, ctx.readset, ctx.tenant_id),
+        .fetch => worker_mod.captureFetchChunkTapes(worker, ctx.readset, ctx.tenant_id, ctx.tape_ev.?),
     };
 }
 
@@ -2549,7 +2549,7 @@ pub fn resumeBoundFetchChain(
         txn.rollback() catch {};
         txn_done = true;
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "bound-fetch handler error\n") catch {};
-        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), saga_id, &.{}, .fetch_chunk, 0, exec_seq);
+        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, tenant_id, fetch_ev), saga_id, &.{}, .fetch_chunk, 0, exec_seq);
         return;
     };
 
@@ -3551,7 +3551,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         txn.rollback() catch {};
         txn_done = true;
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "inbound-chunk handler error\n") catch {};
-        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), saga_id, &.{}, .inbound_chunk, 0, exec_seq);
+        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, tenant_id), saga_id, &.{}, .inbound_chunk, 0, exec_seq);
         return true;
     };
 

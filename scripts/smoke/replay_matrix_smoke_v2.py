@@ -28,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX  # noqa: E402
+from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, DOOR_PROBE_FILES, DOOR_PROBE_ROUTE  # noqa: E402
 from ws_worker_smoke_v2 import ws_connect, send_frame, recv_frame  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -36,8 +36,8 @@ REWIND_BIN = REPO_ROOT / "zig-out" / "bin" / "rewind"
 
 _REMAP = [
     ("kv_tape_b64", "kv_b64"), ("request_reads_tape_b64", "request_reads_b64"),
-    ("request_body_b64", "request_body_b64"), ("fetch_responses_tape_b64", "fetch_responses_b64"),
-    ("trigger_payload_tape_b64", "trigger_payload_b64"), ("activation_bytes_b64", "activation_bytes_b64"),
+    ("fetch_responses_tape_b64", "fetch_responses_b64"),
+    ("trigger_payload_tape_b64", "trigger_payload_b64"), ("activation_tape_b64", "activation_b64"),
 ]
 
 INBOUND_SRC = 'export default function ({ after, next }) { return "inbound-ok:" + (request.query || ""); }'
@@ -127,7 +127,17 @@ def find_record(c, tenant, activation, tries=60):
             rid = x.get("request_id")
             if not rid:
                 continue
-            sr = c.log_get(f"{tenant}/show/{rid}")
+            # The door probe's own reads are records too — its inbound GET and
+            # the fetch hop its `after.fetch` resumes (logged under the module
+            # path) — and never the one wanted.
+            if DOOR_PROBE_ROUTE in (x.get("path") or ""):
+                continue
+            # The listing already names the kind, so only a candidate costs a
+            # door read — each of which is itself an activation.
+            if x.get("activation") not in (None, activation):
+                continue
+            # Through the door: a record's payloads are sealed at rest.
+            sr = c.door_log_get(f"{tenant}/show/{rid}")
             if sr.status != 200:
                 continue
             try:
@@ -198,7 +208,7 @@ def main() -> int:
             ("up", {"index.mjs": BULK_SRC}),
         ):
             c.provision(t)
-            c.deploy_handlers(t, files)
+            c.deploy_handlers(t, {**files, **DOOR_PROBE_FILES})
         c.wait_for_handler("up", "/", want_status=200, want_body=EXPECTED_BODY, timeout_s=25.0)
 
         # ── inbound ──
@@ -257,8 +267,8 @@ def main() -> int:
         check("[wake_batch] live after.kv resume", live.status == 200 and live.body == live_body,
               f"{live.status} {live.body!r}")
         rec = find_record(c, "wak", "wake_batch")
-        check("[wake_batch] recorded (activation_bytes + export on the tape)",
-              bool(rec and rec.get("tapes", {}).get("activation_bytes_b64") and rec.get("tapes", {}).get("export") == "onFired"),
+        check("[wake_batch] recorded (activation tape + export on the record)",
+              bool(rec and rec.get("tapes", {}).get("activation_tape_b64") and rec.get("tapes", {}).get("export") == "onFired"),
               f"tapes keys={sorted((rec or {}).get('tapes', {}).keys())}")
         art = replay(rec, "wak", "wake_batch", WAKE_SRC) if rec else None
         writes = [e for e in ((art.get("effects") if art else None) or []) if e.get("kind") == "write"]

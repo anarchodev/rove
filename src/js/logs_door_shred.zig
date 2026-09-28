@@ -149,7 +149,12 @@ const FieldValue = union(enum) {
 };
 
 fn fieldValue(body: []const u8, name_at: usize) FieldValue {
-    var i = name_at + FIELD.len;
+    return fieldValueAfter(body, name_at + FIELD.len);
+}
+
+/// `fieldValue` for any field: `after` is the offset just past the name.
+fn fieldValueAfter(body: []const u8, after: usize) FieldValue {
+    var i = after;
     while (i < body.len and isJsonSpace(body[i])) i += 1;
     if (i >= body.len) return .malformed;
     if (body[i] != ':') return .absent;
@@ -260,6 +265,141 @@ fn openInPlace(
         // false positive, which is exactly the unverifiable case.
         .unverified, .plaintext => return Error.KeyMaterialUnverified,
     }
+}
+
+// ── sealed payloads on the record's tapes ────────────────────────────
+//
+// A payload small enough to ride a tape inline is sealed in place the same
+// way a pool body is — under a data key of its own, wrapped for the tenant
+// or the identity the activation named — with the wrap on the entry beside
+// it (`body_key`). So the three payload-carrying tapes a record carries are
+// opened here on the way out, exactly as the kv tape is.
+
+/// The record fields whose tapes carry payloads. Written by
+/// `src/log_server/flush_writer.zig`.
+const PAYLOAD_FIELDS = [_][]const u8{
+    "\"trigger_payload_tape_b64\"",
+    "\"fetch_responses_tape_b64\"",
+    "\"activation_tape_b64\"",
+};
+
+/// Open every sealed inline payload in a logs-door response, and strip
+/// every wrap — an opened entry's, and a pool entry's too, whose bytes the
+/// body route opens on its own. The wrap never leaves this door.
+///
+/// Per entry:
+/// - **opened** — the plaintext replaces the ciphertext.
+/// - **shredded** — the bytes are DROPPED, leaving the entry's recorded
+///   length and no payload: the unretained shape every reader already
+///   reports as a payload that was not kept, rather than serving ciphertext
+///   as if it were the body.
+/// - **unverified** — the whole response is refused, as for a kv value.
+///
+/// Null when nothing changed.
+pub fn openPayloadTapes(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    resolver: BodyResolver,
+) (Error || std.mem.Allocator.Error)!?[]u8 {
+    // Edits in document order, whichever field they belong to.
+    const Edit = struct { start: usize, end: usize, b64: []u8 };
+    var edits: std.ArrayListUnmanaged(Edit) = .empty;
+    defer {
+        for (edits.items) |e| allocator.free(e.b64);
+        edits.deinit(allocator);
+    }
+    for (PAYLOAD_FIELDS) |name| {
+        var search: usize = 0;
+        while (std.mem.indexOfPos(u8, body, search, name)) |at| {
+            const span = switch (fieldValueAfter(body, at + name.len)) {
+                .span => |sp| sp,
+                .absent => {
+                    search = at + name.len;
+                    continue;
+                },
+                .malformed => return Error.KeyMaterialUnverified,
+            };
+            search = span.end;
+            const rewritten = try openPayloadField(allocator, body[span.start..span.end], resolver);
+            const b64 = rewritten orelse continue;
+            errdefer allocator.free(b64);
+            try edits.append(allocator, .{ .start = span.start, .end = span.end, .b64 = b64 });
+        }
+    }
+    if (edits.items.len == 0) return null;
+    std.mem.sort(Edit, edits.items, {}, struct {
+        fn lt(_: void, x: Edit, y: Edit) bool {
+            return x.start < y.start;
+        }
+    }.lt);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var copied: usize = 0;
+    for (edits.items) |e| {
+        try out.appendSlice(allocator, body[copied..e.start]);
+        try out.appendSlice(allocator, e.b64);
+        copied = e.end;
+    }
+    try out.appendSlice(allocator, body[copied..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// One payload tape: decode, open or strip every wrapped entry, re-encode.
+/// Null when no entry carries a wrap.
+fn openPayloadField(
+    allocator: std.mem.Allocator,
+    b64: []const u8,
+    resolver: BodyResolver,
+) (Error || std.mem.Allocator.Error)!?[]u8 {
+    const dec = std.base64.standard.Decoder;
+    // A tape this cannot inspect might carry a sealed payload a reader would
+    // then take for the real one. Refuse, as for the kv tape.
+    const raw_len = dec.calcSizeForSlice(b64) catch return Error.KeyMaterialUnverified;
+    const raw = try allocator.alloc(u8, raw_len);
+    defer allocator.free(raw);
+    dec.decode(raw, b64) catch return Error.KeyMaterialUnverified;
+    var parsed = tape_mod.parse(allocator, raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return Error.KeyMaterialUnverified,
+    };
+    defer parsed.deinit();
+
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
+    var changed = false;
+    for (parsed.entries) |*e| {
+        const slots: struct { bytes: *[]const u8, key: *[]const u8 } = switch (e.*) {
+            .trigger_payload => |*t| .{ .bytes = &t.inline_bytes, .key = &t.body_key },
+            .fetch_responses => |*f| .{ .bytes = &f.inline_bytes, .key = &f.body_key },
+            .activation => |*a| .{ .bytes = &a.inline_bytes, .key = &a.body_key },
+            else => continue,
+        };
+        if (slots.key.len == 0) continue;
+        changed = true;
+        if (slots.bytes.len > 0) {
+            const res = resolver.open(resolver.ctx, sa, slots.bytes.*, slots.key.*) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return Error.KeyMaterialUnverified,
+            };
+            slots.bytes.* = switch (res) {
+                .opened => |p| p,
+                .shredded => "",
+                .unverified, .plaintext => return Error.KeyMaterialUnverified,
+            };
+        }
+        slots.key.* = "";
+    }
+    if (!changed) return null;
+
+    const bytes = try tape_mod.serializeEntries(allocator, parsed.channel, parsed.entries);
+    defer allocator.free(bytes);
+    const enc = std.base64.standard.Encoder;
+    const out = try allocator.alloc(u8, enc.calcSize(bytes.len));
+    _ = enc.encode(out, bytes);
+    return out;
 }
 
 // ── pool bodies ──────────────────────────────────────────────────────
@@ -794,4 +934,113 @@ test "a wrapped response this cannot parse is refused, not passed through" {
         Error.KeyMaterialUnverified,
         openBodyResponse(testing.allocator, truncated, keys.resolver()),
     );
+}
+
+// ── payload-tape tests ───────────────────────────────────────────────
+
+/// A record whose trigger_payload tape carries one entry, as the flush
+/// writes it.
+fn recordWithTrigger(a: std.mem.Allocator, body_ref: @import("rove-bodies").BodyRef, inline_bytes: []const u8, wrap: []const u8) ![]u8 {
+    var t = tape_mod.Tape.init(a, .trigger_payload);
+    defer t.deinit();
+    try t.appendTriggerPayload(body_ref, inline_bytes, wrap);
+    const raw = try t.serialize(a);
+    defer a.free(raw);
+    const enc = std.base64.standard.Encoder;
+    const b64 = try a.alloc(u8, enc.calcSize(raw.len));
+    defer a.free(b64);
+    _ = enc.encode(b64, raw);
+    return std.fmt.allocPrint(a, "{{\"record\":{{\"tapes\":{{\"trigger_payload_tape_b64\":\"{s}\"}}}}}}", .{b64});
+}
+
+fn triggerOf(a: std.mem.Allocator, body: []const u8) !tape_mod.ParsedTape {
+    const name = PAYLOAD_FIELDS[0];
+    const at = std.mem.indexOf(u8, body, name).?;
+    const span = fieldValueAfter(body, at + name.len).span;
+    const b64 = body[span.start..span.end];
+    const dec = std.base64.standard.Decoder;
+    const raw = try a.alloc(u8, try dec.calcSizeForSlice(b64));
+    defer a.free(raw);
+    try dec.decode(raw, b64);
+    return tape_mod.parse(a, raw);
+}
+
+test "a sealed inline body is opened on the record's tape, and its wrap stripped" {
+    const a = testing.allocator;
+    var keys: FakeBodyKeys = .{};
+    var s = try body_seal.seal(a, "the small body", keys.key, crypt.TENANT_REF, 1);
+    defer s.deinit(a);
+    const bodies = @import("rove-bodies");
+    const rec = try recordWithTrigger(a, bodies.BodyRef.carried(14), s.body, &s.wrapped_key);
+    defer a.free(rec);
+
+    const out = (try openPayloadTapes(a, rec, keys.resolver())).?;
+    defer a.free(out);
+    var parsed = try triggerOf(a, out);
+    defer parsed.deinit();
+    const e = parsed.entries[0].trigger_payload;
+    try testing.expectEqualStrings("the small body", e.inline_bytes);
+    try testing.expectEqualStrings("", e.body_key);
+}
+
+test "an erased inline body leaves as its length and no bytes, never as ciphertext" {
+    const a = testing.allocator;
+    var keys: FakeBodyKeys = .{ .answer = .shredded };
+    var s = try body_seal.seal(a, "secret", keys.key, crypt.refForSlot(9), 1);
+    defer s.deinit(a);
+    const bodies = @import("rove-bodies");
+    const rec = try recordWithTrigger(a, bodies.BodyRef.carried(6), s.body, &s.wrapped_key);
+    defer a.free(rec);
+
+    const out = (try openPayloadTapes(a, rec, keys.resolver())).?;
+    defer a.free(out);
+    var parsed = try triggerOf(a, out);
+    defer parsed.deinit();
+    const e = parsed.entries[0].trigger_payload;
+    // The unretained shape: every reader reports it as a payload not kept.
+    try testing.expectEqual(@as(usize, 0), e.inline_bytes.len);
+    try testing.expectEqual(@as(u32, 6), e.body_ref.len);
+    try testing.expectEqualStrings("", e.body_key);
+}
+
+test "a node short of key material refuses a record with a sealed payload" {
+    const a = testing.allocator;
+    var keys: FakeBodyKeys = .{ .answer = .unverified };
+    var s = try body_seal.seal(a, "secret", keys.key, crypt.TENANT_REF, 1);
+    defer s.deinit(a);
+    const bodies = @import("rove-bodies");
+    const rec = try recordWithTrigger(a, bodies.BodyRef.carried(6), s.body, &s.wrapped_key);
+    defer a.free(rec);
+    try testing.expectError(Error.KeyMaterialUnverified, openPayloadTapes(a, rec, keys.resolver()));
+}
+
+test "a pool entry's wrap is stripped without opening anything" {
+    // Its bytes are in the pool, reached through the body route, which opens
+    // them there. The record's copy of the wrap is key material all the same.
+    const a = testing.allocator;
+    var keys: FakeBodyKeys = .{ .answer = .unverified }; // would refuse if asked
+    const bodies = @import("rove-bodies");
+    const ref: bodies.BodyRef = .{
+        .written_unix_ms = 1_700_000_000_000,
+        .digest = [_]u8{7} ** bodies.pool_object.DIGEST_LEN,
+        .offset = 0,
+        .len = 70_000,
+    };
+    const rec = try recordWithTrigger(a, ref, "", "a-wrap");
+    defer a.free(rec);
+    const out = (try openPayloadTapes(a, rec, keys.resolver())).?;
+    defer a.free(out);
+    var parsed = try triggerOf(a, out);
+    defer parsed.deinit();
+    try testing.expectEqualStrings("", parsed.entries[0].trigger_payload.body_key);
+    try testing.expectEqual(@as(u32, 70_000), parsed.entries[0].trigger_payload.body_ref.len);
+}
+
+test "a record with no wrapped payload passes through untouched" {
+    const a = testing.allocator;
+    var keys: FakeBodyKeys = .{};
+    const bodies = @import("rove-bodies");
+    const rec = try recordWithTrigger(a, bodies.BodyRef.carried(2), "hi", "");
+    defer a.free(rec);
+    try testing.expect((try openPayloadTapes(a, rec, keys.resolver())) == null);
 }

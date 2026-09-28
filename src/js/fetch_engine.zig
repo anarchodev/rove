@@ -2097,37 +2097,54 @@ const BODY_ERASED_BODY =
     "{\"error\":\"erased\"," ++
     "\"message\":\"this payload was sealed under a key that has been destroyed\"}";
 
-/// Both serve-side gates over one buffered logs-door response: a pool
-/// body is opened with its wrap, then any kv tapes are opened. A route
-/// answers one shape or the other, so at most one of them rewrites.
+/// Every serve-side gate over one buffered logs-door response: a pool
+/// body is opened with its wrap; otherwise the records' kv tapes are
+/// opened, then their payload tapes (`logs_door_shred.openPayloadTapes`).
 fn gateLogsResponse(s: *FetchCtx, tenant: []const u8) !?[]u8 {
     if (try openLogsBody(s, tenant)) |r| return r;
-    return openLogsRecords(s, tenant);
+    const kv_opened = try openLogsRecords(s, tenant);
+    errdefer if (kv_opened) |k| s.allocator.free(k);
+    const after_kv: []const u8 = kv_opened orelse s.body_buf.items;
+    const payloads_opened = try openLogsPayloads(s, tenant, after_kv);
+    if (payloads_opened) |p| {
+        if (kv_opened) |k| s.allocator.free(k);
+        return p;
+    }
+    return kv_opened;
 }
+
+/// Open the sealed payloads on a response's record tapes.
+fn openLogsPayloads(s: *FetchCtx, tenant: []const u8, body: []const u8) !?[]u8 {
+    var bound: BodyBound = .{ .ctx = s, .tenant = tenant };
+    return logs_door_shred.openPayloadTapes(s.allocator, body, bound.resolver());
+}
+
+/// A body resolver bound to this transfer's tenant — one open path for
+/// the body route and the record tapes alike.
+const BodyBound = struct {
+    ctx: *FetchCtx,
+    tenant: []const u8,
+
+    fn open(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        sealed_body: []const u8,
+        wrap: []const u8,
+    ) anyerror!logs_door_shred.Opened {
+        const b: *@This() = @ptrCast(@alignCast(ptr));
+        return b.ctx.engine.node.deploy.openPoolBody(allocator, b.tenant, sealed_body, wrap);
+    }
+
+    fn resolver(self: *BodyBound) logs_door_shred.BodyResolver {
+        return .{ .ctx = self, .open = &open };
+    }
+};
 
 /// Open a body-route response's sealed pool body
 /// (`logs_door_shred.openBodyResponse`). Null when it carries no wrap.
 fn openLogsBody(s: *FetchCtx, tenant: []const u8) !?[]u8 {
-    const Bound = struct {
-        ctx: *FetchCtx,
-        tenant: []const u8,
-
-        fn open(
-            ptr: *anyopaque,
-            allocator: std.mem.Allocator,
-            sealed_body: []const u8,
-            wrap: []const u8,
-        ) anyerror!logs_door_shred.Opened {
-            const b: *@This() = @ptrCast(@alignCast(ptr));
-            return b.ctx.engine.node.deploy.openPoolBody(allocator, b.tenant, sealed_body, wrap);
-        }
-    };
-    var bound: Bound = .{ .ctx = s, .tenant = tenant };
-    return logs_door_shred.openBodyResponse(
-        s.allocator,
-        s.body_buf.items,
-        .{ .ctx = &bound, .open = &Bound.open },
-    );
+    var bound: BodyBound = .{ .ctx = s, .tenant = tenant };
+    return logs_door_shred.openBodyResponse(s.allocator, s.body_buf.items, bound.resolver());
 }
 
 /// Run the serve-side shred gate over a buffered logs-door response.

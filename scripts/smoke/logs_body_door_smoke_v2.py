@@ -14,18 +14,17 @@ This drives the whole chain against real S3:
     log-server indexes → `/v1/{t}/body/{req}/trigger_payload/0` range-GETs
     the pool object at (offset, len) and hands the bytes back.
 
-The pool holds CIPHERTEXT (`src/keyring/body_seal.zig`): the log-server
-holds no keys, so straight off it the large body comes back sealed with its
-wrap beside it, and only the worker's `rewind-logs.internal` door hands back
-plaintext. The large body is therefore read BOTH ways — the direct read is
-the control that proves there was something to open.
+Every recorded payload is CIPHERTEXT at rest (`src/keyring/body_seal.zig`):
+a spilled body in the pool, and a small body on the tape entry itself. The
+log-server holds no keys, so straight off it either body comes back sealed
+with its wrap beside it, and only the worker's `rewind-logs.internal` door
+hands back plaintext. Both bodies are therefore read BOTH ways — the direct
+read is the control that proves there was something to open.
 
-The assertions that matter are the NEGATIVE ones: the record must NOT carry
-`request_body_b64` (over the cap, so it was never inlined) while the door
-still returns the exact bytes. A door that passed only because the body
-rode inline would prove nothing, so the small-body control asserts
-`source == "carried"` and the large one asserts `source == "pool"` —
-different resolution paths through one interface.
+The small body asserts `source == "carried"` and the large one
+`source == "pool"` — different resolution paths through one interface, so a
+door that passed only because a body rode inline proves nothing about the
+pool.
 
 ASCII bodies: `request.text` is a JS string, and the smoke harness decodes
 response bodies as text. Byte-exactness for arbitrary octets is the
@@ -168,16 +167,15 @@ def main() -> int:
         small_id = posts[0]["request_id"]
         big_id = posts[1]["request_id"]
 
-        # The record for the large body must NOT carry the bytes: over the
-        # cap they were never inlined. This is what makes the door's answer
-        # meaningful rather than a re-read of something already present.
+        # The record reaches the body only through its trigger_payload tape —
+        # it carries no other copy.
         show = c.log_get(f"acme/show/{big_id}", timeout=15.0)
         tapes = {}
         if show.status == 200:
             tapes = json.loads(show.body).get("record", {}).get("tapes", {}) or {}
-        check("large record does NOT inline request_body_b64",
-              show.status == 200 and not tapes.get("request_body_b64"),
-              f"status={show.status} present={bool(tapes.get('request_body_b64'))}")
+        check("the record carries no side copy of the body",
+              show.status == 200 and "request_body_b64" not in tapes,
+              f"status={show.status} keys={sorted(tapes.keys())}")
         check("large record DOES carry a trigger_payload tape",
               bool(tapes.get("trigger_payload_tape_b64")),
               f"keys={sorted(tapes.keys())}")
@@ -220,15 +218,18 @@ def main() -> int:
 
         # The small body takes the other resolution path through the same
         # interface — one address shape whatever the payload's fate.
-        d2 = c.log_get(f"acme/body/{small_id}/trigger_payload/0", timeout=30.0)
-        got2 = {}
-        if d2.status == 200:
-            try:
-                got2 = json.loads(d2.body)
-            except json.JSONDecodeError:
-                got2 = {}
-        check("door resolves the inline body → 200", d2.status == 200,
-              f"status={d2.status} body={d2.body[:200]!r}")
+        # CONTROL: the small body is sealed on the tape entry itself.
+        raw2 = c.log_get(f"acme/body/{small_id}/trigger_payload/0", timeout=30.0)
+        raw2j = json.loads(raw2.body) if raw2.status == 200 else {}
+        check("CONTROL: the inline body carries a wrap beside it",
+              bool(raw2j.get("body_key_b64")), f"status={raw2.status} keys={sorted(raw2j.keys())}")
+        check("CONTROL: the inline bytes are NOT the plaintext",
+              small.encode()[:64] not in base64.b64decode(raw2j.get("bytes_b64") or ""),
+              "the small body is on the tape unsealed")
+
+        d2_status, got2 = door_body(c, small_id, "trigger_payload/0")
+        check("door resolves the inline body → 200", d2_status == 200,
+              f"status={d2_status}")
         check("door reports the inline body rode along",
               got2.get("source") == "carried",
               f"source={got2.get('source')!r}")

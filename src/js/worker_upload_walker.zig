@@ -198,24 +198,18 @@ fn buildLogRecord(
     tapes.trigger_payload_tape_bytes = try allocator.dupe(u8, channel_blobs[trigger_idx]);
     tapes.request_reads_tape_bytes = try allocator.dupe(u8, channel_blobs[request_reads_idx]);
     // The activation channel is the reason a rebuilt resume hop replays as the
-    // same run: the record's `activation_bytes` (a `wake_batch`'s drained wakes
-    // bag, a `ws_message`'s frame) and `export_name` (the resolved `{on}`
-    // target) are raw fields with no tape blob behind them, so they reach a
-    // follower only through this channel. Decoded rather than copied through:
-    // the record's fields are the values themselves, not a serialized tape.
-    //
-    // An entry with no inline bytes is an over-the-cap frame nothing retained.
-    // It rebuilds with an empty `activation_bytes` — the same thing the leader
-    // flushed — and the entry's length is what says a Msg existed.
+    // same run: it carries the Msg of a `wake_batch` (the drained wakes bag) or
+    // a `ws_message` (the frame), and the resolved `{on}` target. The tape is
+    // copied through verbatim, exactly as the leader flushed it — sealed
+    // payloads stay sealed — and `export_name`, a raw record field, is decoded
+    // out of it.
     const activation_idx: usize = @intFromEnum(tape_mod.Channel.activation);
+    tapes.activation_tape_bytes = try allocator.dupe(u8, channel_blobs[activation_idx]);
     if (tape_mod.parse(allocator, channel_blobs[activation_idx])) |parsed_act| {
         var pa = parsed_act;
         defer pa.deinit();
         if (pa.entries.len > 0) {
             const act = pa.entries[0].activation;
-            if (act.inline_bytes.len > 0) {
-                tapes.activation_bytes = try allocator.dupe(u8, act.inline_bytes);
-            }
             if (act.export_name.len > 0) {
                 tapes.export_name = try allocator.dupe(u8, act.export_name);
             }
@@ -352,7 +346,9 @@ test "hydrate: a wake hop's Msg + resolved export survive the rebuild (rove#199)
 
     try testing.expectEqual(@as(usize, 1), records.len);
     try testing.expectEqual(log_mod.ActivationSource.wake_batch, records[0].activation);
-    try testing.expectEqualStrings(wakes, records[0].tapes.activation_bytes);
+    var pa = try tape_mod.parse(a, records[0].tapes.activation_tape_bytes);
+    defer pa.deinit();
+    try testing.expectEqualStrings(wakes, pa.entries[0].activation.inline_bytes);
     try testing.expectEqualStrings("onFired", records[0].tapes.export_name);
 }
 
@@ -378,7 +374,10 @@ test "hydrate: an unretained activation Msg rebuilds empty, not fabricated" {
     defer freeRecords(a, records);
 
     try testing.expectEqual(@as(usize, 1), records.len);
-    try testing.expectEqual(@as(usize, 0), records[0].tapes.activation_bytes.len);
+    var pa = try tape_mod.parse(a, records[0].tapes.activation_tape_bytes);
+    defer pa.deinit();
+    try testing.expectEqual(@as(usize, 0), pa.entries[0].activation.inline_bytes.len);
+    try testing.expectEqual(@as(u32, 4_000_000), pa.entries[0].activation.body_ref.len);
     try testing.expectEqual(@as(usize, 0), records[0].tapes.export_name.len);
 }
 

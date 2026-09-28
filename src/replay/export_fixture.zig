@@ -107,11 +107,6 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         if (b64) |s| break :blk try decode.decodeRequestReads(a, try b64decode(a, s));
         break :blk &.{};
     };
-    const body_bytes: ?[]const u8 = blk: {
-        const b64 = if (tapes) |t| jStr(t, "request_body_b64") else null;
-        if (b64) |s| break :blk try b64decode(a, s);
-        break :blk null;
-    };
     // A corrupt or version-mismatched channel is a decode ERROR, not zero
     // entries: swallowing it turns an unreadable recording into a world that
     // asserts the activation had no fetch result and no trigger payload — a
@@ -130,10 +125,13 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     // body door, keyed by channel then RAW entry ordinal.
     const resolved_fetch = resolvedChannel(obj, "fetch_responses");
     const resolved_trigger = resolvedChannel(obj, "trigger_payload");
+    // The activation's Msg (a WS frame, a wake bag) — its tape's one entry.
     const activation_bytes: ?[]const u8 = blk: {
-        const b64 = if (tapes) |t| jStr(t, "activation_bytes_b64") else null;
-        if (b64) |s| break :blk try b64decode(a, s);
-        break :blk null;
+        const b64 = if (tapes) |t| jStr(t, "activation_b64") else null;
+        const s = b64 orelse break :blk null;
+        const entries = try decode.decodeActivation(a, try b64decode(a, s));
+        if (entries.len == 0 or entries[0].inline_bytes.len == 0) break :blk null;
+        break :blk entries[0].inline_bytes;
     };
     const seed = jStr(obj, "seed");
     const ts_ns = jStr(obj, "timestamp_ns");
@@ -262,7 +260,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     // declare it. The bearer is not on the tape and never was
     // (`src/js/reserved_headers.zig` PLATFORM_CREDENTIAL_HEADERS).
     var is_root: ?bool = null;
-    var body_read = body_bytes != null;
+    var body_read = false;
     for (reads) |r| switch (r.kind) {
         .header_value => try headers.append(a, r),
         .body_read => body_read = true,
@@ -318,11 +316,10 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     // serving `""` as if the handler had really read nothing.
     const eff_body: ?[]const u8 = blk: {
         if (fetch_resp.len != 0) break :blk fetch_body;
-        if (body_bytes) |b| break :blk b;
-        // A body over the inline cap is absent from `request_body_b64` and
-        // present only as the trigger entry's pointer, so THAT entry — not the
-        // missing inline field — decides between "empty" and "elsewhere".
-        if (trigger_is_body and trigger.len != 0) break :blk trigger_env;
+        // The trigger entry IS the request body — carried inline, or a pointer
+        // the puller resolved. A resume's `{"ctx":…}` envelope is its body too
+        // when the handler read it.
+        if (trigger.len != 0 and (trigger_is_body or body_read)) break :blk trigger_env;
         // Nothing out of line: a read body with no recorded bytes was empty.
         break :blk if (body_read) "" else null;
     };
@@ -852,20 +849,19 @@ test "transcode: kv reads → closed-world map; not-found is omitted" {
     try testing.expectEqual(@as(i64, 1700000000000), wo.get("now_ms").?.integer);
 }
 
-test "transcode: wake_batch activation_bytes -> request.activation.wakes (issue #62)" {
+test "transcode: a wake_batch's activation tape -> request.activation.wakes (issue #62)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const wakes_json = "[{\"kind\":\"kv\",\"prefix\":\"feed/\",\"firedAt\":1700000000123},{\"kind\":\"timer\",\"firedAt\":1700000000456}]";
-    var ab_b64_buf: [256]u8 = undefined;
-    const ab_b64 = std.base64.standard.Encoder.encode(&ab_b64_buf, wakes_json);
+    const ab_b64 = try b64ActivationTape(a, "feed.onFeed", wakes_json);
 
     const fixture = try std.fmt.allocPrint(a,
         \\{{ "entry":"index.mjs", "activation":"wake_batch", "export":"feed.onFeed",
         \\   "request": {{ "method":"POST", "path":"/feed", "host":"h" }},
         \\   "seed":"7", "timestamp_ns":"1700000000000000000",
-        \\   "tapes": {{ "activation_bytes_b64":"{s}" }}, "sources":[] }}
+        \\   "tapes": {{ "activation_b64":"{s}" }}, "sources":[] }}
     , .{ab_b64});
 
     var out = std.ArrayList(u8){};
@@ -954,6 +950,33 @@ fn b64TriggerTapeRecs(a: std.mem.Allocator, recs: []const TriggerRec) ![]const u
         try buf.appendSlice(a, &b4);
         try buf.appendSlice(a, ent.items);
     }
+    const enc = std.base64.standard.Encoder;
+    const out = try a.alloc(u8, enc.calcSize(buf.items.len));
+    _ = enc.encode(out, buf.items);
+    return out;
+}
+
+/// A base64 `activation` tape with one entry — the export and the Msg — as
+/// the flush writes it (`src/tape/root.zig` `encodeEntry`, `.activation`).
+fn b64ActivationTape(a: std.mem.Allocator, export_name: []const u8, msg: []const u8) ![]const u8 {
+    var ent = std.ArrayList(u8){};
+    defer ent.deinit(a);
+    try putLen(&ent, a, export_name);
+    try putPoolRef(&ent, a, .{ .len = @intCast(msg.len) });
+    try putLen(&ent, a, msg);
+    try putLen(&ent, a, ""); // body_key: a pulled bundle arrives opened
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(a);
+    var hdr: [12]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], decode.MAGIC, .big);
+    std.mem.writeInt(u16, hdr[4..6], decode.VERSION, .big);
+    std.mem.writeInt(u16, hdr[6..8], @intFromEnum(decode.Channel.activation), .big);
+    std.mem.writeInt(u32, hdr[8..12], 1, .big);
+    try buf.appendSlice(a, &hdr);
+    var b4: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b4, @intCast(ent.items.len), .big);
+    try buf.appendSlice(a, &b4);
+    try buf.appendSlice(a, ent.items);
     const enc = std.base64.standard.Encoder;
     const out = try a.alloc(u8, enc.calcSize(buf.items.len));
     _ = enc.encode(out, buf.items);
@@ -1190,8 +1213,8 @@ test "transcode: a spilled inbound body REFUSES — it never becomes an empty bo
     const a = arena.allocator();
 
     // The recording says the handler READ a body; the body was over the inline
-    // cap, so the record carries no `request_body_b64` and the trigger entry
-    // holds a body-pool pointer instead of the bytes.
+    // cap, so the trigger entry holds a body-pool pointer instead of the
+    // bytes.
     const reads_b64 = try b64BodyReadTape(a);
     const tp_b64 = try b64TriggerTapeRecs(a, &.{.{ .pool_seed = 42, .ref_len = 65536 }});
     const fixture = try std.fmt.allocPrint(a,

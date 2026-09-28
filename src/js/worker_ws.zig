@@ -482,12 +482,12 @@ const WsMsgTape = union(enum) {
 
 /// Capture the readset + ctx + the kind-specific Msg for a WS resume. Called at
 /// exactly the one capture site that fires per `finishWsResume` invocation.
-fn wsResumeTapes(worker: anytype, readset: *tape_mod.Readset, ctx_body: []const u8, msg: WsMsgTape) log_mod.TapePayloads {
+fn wsResumeTapes(worker: anytype, readset: *tape_mod.Readset, tenant_id: []const u8, ctx_body: []const u8, msg: WsMsgTape) log_mod.TapePayloads {
     return switch (msg) {
-        .none => worker_mod.captureTapes(worker, readset, ctx_body),
-        .fetch => |fe| worker_mod.captureFetchChunkTapes(worker, readset, ctx_body, fe),
-        .frame => |f| worker_mod.captureWsFrameTapes(worker, readset, ctx_body, f.opcode, f.data),
-        .wakes => |wt| worker_mod.captureWakeBatchTapes(worker, readset, ctx_body, wt.batch, wt.export_name),
+        .none => worker_mod.captureTapes(worker, readset, tenant_id),
+        .fetch => |fe| worker_mod.captureFetchChunkTapes(worker, readset, tenant_id, fe),
+        .frame => |f| worker_mod.captureWsFrameTapes(worker, readset, tenant_id, f.opcode, f.data),
+        .wakes => |wt| worker_mod.captureWakeBatchTapes(worker, readset, tenant_id, ctx_body, wt.batch, wt.export_name),
     };
 }
 
@@ -515,7 +515,7 @@ fn finishWsResume(
     // Log records name the CONNECTION, not the module — see wsRootLine.
     const rl = wsRootLine(chain_ctx, path);
     // The `{"ctx":…}` envelope → trigger_payload (→ request.ctx). One capture
-    // site fires per call, via `wsResumeTapes(worker, &p.readset, ws_ctx_body, msg)`.
+    // site fires per call, via `wsResumeTapes(worker, &p.readset, chain_ctx.tenant_id, ws_ctx_body, msg)`.
     const ws_ctx_body: []const u8 = worker_streaming.synthCtxBody(allocator, chain_st.ctx_json) catch "";
     defer if (ws_ctx_body.len > 0) allocator.free(ws_ctx_body);
     switch (oc.*) {
@@ -524,7 +524,7 @@ fn finishWsResume(
             if (r.exception.len > 0) {
                 p.txn.rollback() catch {};
                 p.txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, r.console, r.exception, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.saga_id, &.{}, act, 0, p.exec_seq);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, r.console, r.exception, wsResumeTapes(worker, &p.readset, chain_ctx.tenant_id, ws_ctx_body, msg), chain_ctx.saga_id, &.{}, act, 0, p.exec_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
@@ -537,7 +537,7 @@ fn finishWsResume(
             // readset for the promotion walker
             // (`docs/architecture/deployment-and-logs.md`). Consumed by exactly
             // one capture below.
-            const tapes = wsResumeTapes(worker, &p.readset, ws_ctx_body, msg);
+            const tapes = wsResumeTapes(worker, &p.readset, chain_ctx.tenant_id, ws_ctx_body, msg);
             const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, true) catch |perr| {
                 std.log.warn("rove-js {s} (terminal+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
@@ -566,7 +566,7 @@ fn finishWsResume(
                 p.txn.rollback() catch {};
                 p.txn_done = true;
                 const errmsg = allocator.dupe(u8, "next({fn}) is not supported on a WebSocket chain — frames dispatch to onMessage; name a wake export via after.*(..., {on})") catch @constCast("");
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, errmsg, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.saga_id, &.{}, act, 0, p.exec_seq);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, errmsg, wsResumeTapes(worker, &p.readset, chain_ctx.tenant_id, ws_ctx_body, msg), chain_ctx.saga_id, &.{}, act, 0, p.exec_seq);
                 effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
                 tearDownWsChain(worker, conn_ent);
                 return;
@@ -577,7 +577,7 @@ fn finishWsResume(
             const read_version = p.txn.readVersion();
             // Tapes before shipWsFrames' propose — input channels ride the raft
             // readset for the promotion walker (see the terminal arm above).
-            const tapes = wsResumeTapes(worker, &p.readset, ws_ctx_body, msg);
+            const tapes = wsResumeTapes(worker, &p.readset, chain_ctx.tenant_id, ws_ctx_body, msg);
             const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, false) catch |perr| {
                 std.log.warn("rove-js {s} (next+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
@@ -642,7 +642,7 @@ fn finishWsResume(
         .no_onheaders, .no_onchunk => {
             p.txn.rollback() catch {};
             p.txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.saga_id, &.{}, act, 0, p.exec_seq);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, wsResumeTapes(worker, &p.readset, chain_ctx.tenant_id, ws_ctx_body, msg), chain_ctx.saga_id, &.{}, act, 0, p.exec_seq);
             effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
             tearDownWsChain(worker, conn_ent);
         },
@@ -950,7 +950,7 @@ pub fn resumeBoundFetchChainWs(
     const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &p.readset, body, fetch_ev), chain_ctx.saga_id, &.{}, .fetch_chunk, 0, p.exec_seq);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &p.readset, chain_ctx.tenant_id, fetch_ev), chain_ctx.saga_id, &.{}, .fetch_chunk, 0, p.exec_seq);
         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
         tearDownWsChain(worker, conn_ent);
         return;
@@ -1185,7 +1185,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
     const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.saga_id, &.{}, .disconnect, 0, p.exec_seq);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, chain_ctx.tenant_id), chain_ctx.saga_id, &.{}, .disconnect, 0, p.exec_seq);
         return;
     };
 
@@ -1205,12 +1205,12 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
             std.log.warn("rove-js ws-disconnect: propose failed: {s}", .{@errorName(perr)});
             p.txn_owned = false;
             p.txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.saga_id, &.{}, .disconnect, 0, p.exec_seq);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, chain_ctx.tenant_id), chain_ctx.saga_id, &.{}, .disconnect, 0, p.exec_seq);
             return;
         };
         p.txn_owned = false;
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.saga_id, &.{}, .disconnect, 0, p.exec_seq);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, chain_ctx.tenant_id), chain_ctx.saga_id, &.{}, .disconnect, 0, p.exec_seq);
         return;
     }
     p.txn.commit() catch |e| switch (e) {
@@ -1226,7 +1226,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         ),
     };
     p.txn_done = true;
-    captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.saga_id, &.{}, .disconnect, 0, p.exec_seq);
+    captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, rl.method, rl.path, rl.host, tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, chain_ctx.tenant_id), chain_ctx.saga_id, &.{}, .disconnect, 0, p.exec_seq);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

@@ -34,7 +34,7 @@ REWIND_BIN = REPO_ROOT / "zig-out" / "bin" / "rewind"
 
 _REMAP = [
     ("kv_tape_b64", "kv_b64"), ("request_reads_tape_b64", "request_reads_b64"),
-    ("request_body_b64", "request_body_b64"),
+    ("trigger_payload_tape_b64", "trigger_payload_b64"),
 ]
 
 SRC = """
