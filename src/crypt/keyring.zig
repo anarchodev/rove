@@ -191,6 +191,19 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// A lock around a keyring's in-memory key set, for a keyring other
+/// threads read (`TenantKeys` holds one; a single-threaded caller passes
+/// `none`). The keyring takes it for map access only, never across I/O.
+pub const MapLock = struct {
+    ctx: *anyopaque,
+    lock: *const fn (*anyopaque) void,
+    unlock: *const fn (*anyopaque) void,
+
+    fn noop(_: *anyopaque) void {}
+    var dummy: u8 = 0;
+    pub const none: MapLock = .{ .ctx = &dummy, .lock = noop, .unlock = noop };
+};
+
 const Entry = struct {
     key: crypt.Key,
     created_unix_ns: i64,
@@ -368,6 +381,21 @@ pub const Keyring = struct {
     /// They hold correctly-minted keys, so that is durable progress
     /// rather than damage, and the caller retries the whole range.
     pub fn mintRange(self: *Self, from_slot: u64, n: u64, now_unix_ns: i64) Error!void {
+        return self.mintRangeLocked(from_slot, n, now_unix_ns, MapLock.none);
+    }
+
+    /// `mintRange` for a keyring whose key set other threads read.
+    ///
+    /// `lk` guards the in-memory set, and is held only to insert the new
+    /// keys and snapshot the shard's plaintext — never across the seal and
+    /// the two fsyncs of the write. So a reader probing the map waits on a
+    /// copy, never on the disk, and never observes the map mid-growth.
+    ///
+    /// Keys are in memory before their shard is durable, which is safe:
+    /// a slot is handed out only after its block is quorum-durable, so no
+    /// value can be sealed under a key the write then fails to land — and
+    /// a failed write rolls exactly the keys it added back out.
+    pub fn mintRangeLocked(self: *Self, from_slot: u64, n: u64, now_unix_ns: i64, lk: MapLock) Error!void {
         if (self.destroyed) return Error.NoKeyring;
         if (n == 0) return;
         if (from_slot < crypt.FIRST_SLOT) return Error.SlotOutOfRange;
@@ -381,49 +409,73 @@ pub const Keyring = struct {
         while (shard <= last_shard) : (shard += 1) {
             const lo = @max(from_slot, shardBase(shard));
             const hi = @min(last, shardBase(shard) + SLOTS_PER_SHARD - 1);
-            try self.mintWithinShard(shard, lo, hi, now_unix_ns);
+            try self.mintWithinShard(shard, lo, hi, now_unix_ns, lk);
             if (shard == last_shard) break; // `shard + 1` could overflow u32
         }
     }
 
-    fn mintWithinShard(self: *Self, shard: u32, lo: u64, hi: u64, now_unix_ns: i64) Error!void {
-        var added: u32 = 0;
-        errdefer self.rollbackMint(shard, lo, hi, added);
-
-        var slot = lo;
-        while (slot <= hi) : (slot += 1) {
-            if (self.keys.contains(slot)) continue;
-            var key: crypt.Key = undefined;
-            std.crypto.random.bytes(&key);
-            self.keys.put(self.allocator, slot, .{
-                .key = key,
-                .created_unix_ns = now_unix_ns,
-            }) catch return Error.OutOfMemory;
-            added += 1;
+    fn mintWithinShard(self: *Self, shard: u32, lo: u64, hi: u64, now_unix_ns: i64, lk: MapLock) Error!void {
+        // Generated outside the lock: a shard's worth of random draws is
+        // no reason to hold a reader off.
+        const span: usize = @intCast(hi - lo + 1);
+        const fresh = self.allocator.alloc(crypt.Key, span) catch return Error.OutOfMemory;
+        defer {
+            std.crypto.secureZero(u8, std.mem.sliceAsBytes(fresh));
+            self.allocator.free(fresh);
         }
-        if (added == 0) return; // every slot already present; nothing to write
+        for (fresh) |*k| std.crypto.random.bytes(k);
+        // Exactly the slots this call inserted, so a rollback never takes
+        // out a key that was already there.
+        const added = self.allocator.alloc(u64, span) catch return Error.OutOfMemory;
+        defer self.allocator.free(added);
+        var n_added: usize = 0;
 
-        const gop = self.shard_counts.getOrPut(self.allocator, shard) catch
-            return Error.OutOfMemory;
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* += added;
+        const plain = blk: {
+            lk.lock(lk.ctx);
+            defer lk.unlock(lk.ctx);
+            errdefer self.rollbackMint(shard, added[0..n_added]);
+            self.keys.ensureUnusedCapacity(self.allocator, @intCast(span)) catch return Error.OutOfMemory;
+            const gop = self.shard_counts.getOrPut(self.allocator, shard) catch return Error.OutOfMemory;
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            var slot = lo;
+            while (slot <= hi) : (slot += 1) {
+                if (self.keys.contains(slot)) continue;
+                self.keys.putAssumeCapacity(slot, .{
+                    .key = fresh[@intCast(slot - lo)],
+                    .created_unix_ns = now_unix_ns,
+                });
+                added[n_added] = slot;
+                n_added += 1;
+                gop.value_ptr.* += 1;
+            }
+            if (n_added == 0) return; // every slot already present; nothing to write
+            break :blk (try self.shardPlain(shard)).?;
+        };
+        defer {
+            std.crypto.secureZero(u8, plain);
+            self.allocator.free(plain);
+        }
 
         // Roll memory back if the rewrite does not land, so no caller
         // ever receives a key the disk will not have after a restart.
-        self.flushShard(shard) catch |err| {
-            gop.value_ptr.* -= added;
+        self.writeShardPlain(shard, plain) catch |err| {
+            lk.lock(lk.ctx);
+            defer lk.unlock(lk.ctx);
+            self.rollbackMint(shard, added[0..n_added]);
             return err;
         };
     }
 
-    fn rollbackMint(self: *Self, shard: u32, lo: u64, hi: u64, added: u32) void {
-        _ = shard;
-        if (added == 0) return;
-        var slot = lo;
+    fn rollbackMint(self: *Self, shard: u32, slots: []const u64) void {
         var removed: u32 = 0;
-        while (slot <= hi and removed < added) : (slot += 1) {
-            if (self.keys.remove(slot)) removed += 1;
+        for (slots) |slot| {
+            if (self.keys.fetchRemove(slot)) |kv| {
+                var e = kv;
+                std.crypto.secureZero(u8, &e.value.key);
+                removed += 1;
+            }
         }
+        if (self.shard_counts.getPtr(shard)) |c| c.* -= @min(c.*, removed);
     }
 
     /// Destroy one key. Returns whether it existed, so a caller can
@@ -773,21 +825,34 @@ pub const Keyring = struct {
     /// An emptied shard is removed rather than written as a zero-entry
     /// file, so a fully-shredded tenant leaves no shard behind.
     fn flushShard(self: *Self, shard: u32) Error!void {
-        const path = try self.shardPath(shard);
-        defer self.allocator.free(path);
-
-        const n: u32 = if (self.shard_counts.get(shard)) |c| c else 0;
-        if (n == 0) {
+        const plain = (try self.shardPlain(shard)) orelse {
+            const path = try self.shardPath(shard);
+            defer self.allocator.free(path);
             std.fs.cwd().deleteFile(path) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => return Error.Io,
             };
             return syncPath(self.tenant_dir);
+        };
+        defer {
+            std.crypto.secureZero(u8, plain);
+            self.allocator.free(plain);
         }
+        try self.writeShardPlain(shard, plain);
+    }
+
+    /// One shard's plaintext as the in-memory set holds it now, or null
+    /// when the shard is empty. Reads the map — so a keyring shared with
+    /// other threads calls this under its map lock — and does no I/O, so
+    /// that lock is held for a copy, never for a write. Caller zeroes and
+    /// frees.
+    fn shardPlain(self: *Self, shard: u32) Error!?[]u8 {
+        const n: u32 = if (self.shard_counts.get(shard)) |c| c else 0;
+        if (n == 0) return null;
 
         const plain = self.allocator.alloc(u8, SHARD_HEADER_LEN + @as(usize, n) * ENTRY_LEN) catch
             return Error.OutOfMemory;
-        defer {
+        errdefer {
             std.crypto.secureZero(u8, plain);
             self.allocator.free(plain);
         }
@@ -817,7 +882,13 @@ pub const Keyring = struct {
         // the map actually holds would truncate or leave a tail of
         // uninitialised bytes — either way, keys silently lost.
         if (pos != plain.len) return Error.Corrupt;
+        return plain;
+    }
 
+    /// Seal a shard's plaintext and land it. No map access.
+    fn writeShardPlain(self: *Self, shard: u32, plain: []const u8) Error!void {
+        const path = try self.shardPath(shard);
+        defer self.allocator.free(path);
         try self.writeSealed(path, plain);
     }
 
@@ -2455,4 +2526,75 @@ test "a holder picks up shards that landed behind it, in one swap" {
     fresh.deinit();
     try testing.expectEqual(@as(usize, 3), b.count());
     try testing.expect(b.keyAt(2) != null);
+}
+
+test "a locked mint holds the map lock for the copy, never for the write" {
+    // Readers probe the map on the poll loop. Holding their lock across a
+    // shard's seal and two fsyncs would make every sealed read wait on the
+    // disk; not holding it for the insert lets them probe a map mid-growth.
+    var buf: [64]u8 = undefined;
+    const base = tmpDirPath(&buf);
+    defer cleanup(base);
+    var kr = try Keyring.create(testing.allocator, base, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+
+    const Probe = struct {
+        kr: *Keyring,
+        held: bool = false,
+        locks: u32 = 0,
+        written_while_held: bool = false,
+
+        fn shardOnDisk(self: *@This()) bool {
+            const path = self.kr.shardPath(0) catch return false;
+            defer self.kr.allocator.free(path);
+            std.fs.cwd().access(path, .{}) catch return false;
+            return true;
+        }
+        fn lock(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.held = true;
+            self.locks += 1;
+        }
+        fn unlock(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // The shard is new, so if it is on disk by the time the lock is
+            // released, the write happened under the lock.
+            if (self.shardOnDisk()) self.written_while_held = true;
+            self.held = false;
+        }
+    };
+    var p: Probe = .{ .kr = &kr };
+    try kr.mintRangeLocked(1, 8, 1, .{ .ctx = &p, .lock = Probe.lock, .unlock = Probe.unlock });
+
+    try testing.expect(p.locks >= 1);
+    try testing.expect(!p.held);
+    try testing.expect(!p.written_while_held);
+    try testing.expect(p.shardOnDisk());
+    try testing.expectEqual(@as(usize, 8), kr.count());
+}
+
+test "a mint whose write fails takes out only the keys it added" {
+    var buf: [64]u8 = undefined;
+    const base = tmpDirPath(&buf);
+    defer cleanup(base);
+    var kr = try Keyring.create(testing.allocator, base, "acme", TEST_KEK, TEST_SECRET);
+    defer kr.deinit();
+    try kr.mintRange(3, 2, 1); // slots 3 and 4 exist already
+    const kept = kr.keyAt(3).?;
+
+    // Make the shard write fail: the tenant directory stops taking files.
+    // `.iterate` for a real descriptor: the default is a path-only handle
+    // `fchmod` refuses.
+    var d = try std.fs.cwd().openDir(kr.tenant_dir, .{ .iterate = true });
+    defer d.close();
+    try d.chmod(0o500);
+    defer d.chmod(0o700) catch {};
+
+    // 1..6 overlaps the existing 3..4. A rollback that removed "the first
+    // `added` present slots" in the range would take out 3 and 4 too.
+    try testing.expectError(Error.Io, kr.mintRange(1, 6, 1));
+    try testing.expectEqual(@as(usize, 2), kr.count());
+    try testing.expectEqualSlices(u8, &kept, &kr.keyAt(3).?);
+    try testing.expect(kr.keyAt(4) != null);
+    try testing.expect(kr.keyAt(1) == null);
 }

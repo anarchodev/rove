@@ -100,6 +100,12 @@ fn defaultNow() i64 {
 
 pub const SlotPool = struct {
     keyring: *keyring_mod.Keyring = undefined,
+    /// Guards `keyring`'s in-memory key set against the readers that share
+    /// it: minting runs on the refill thread while lookups run on the poll
+    /// loop, and a map growing under a probe is a data race that can read
+    /// a present key as absent — which a complete keyring reports as
+    /// erased.
+    map_lock: keyring_mod.MapLock = keyring_mod.MapLock.none,
     deps: Deps = undefined,
     alloc: reserve.ReservationAllocator = .{},
 
@@ -119,11 +125,13 @@ pub const SlotPool = struct {
     pub fn start(
         self: *Self,
         kr: *keyring_mod.Keyring,
+        map_lock: keyring_mod.MapLock,
         deps: Deps,
         block_slots: u32,
         drive: reserve.Drive,
     ) !void {
         self.keyring = kr;
+        self.map_lock = map_lock;
         self.deps = deps;
         try self.alloc.start(.{
             .provider = .{ .ctx = self, .reserveFn = prepareBlock },
@@ -203,7 +211,7 @@ pub const SlotPool = struct {
         if (new_end < prev_end + count) return error.ReservationTooSmall;
         const base = new_end - count;
 
-        try self.keyring.mintRange(base, count, self.deps.now());
+        try self.keyring.mintRangeLocked(base, count, self.deps.now(), self.map_lock);
 
         // Push every shard the range touches. A block is normally one
         // shard's worth, but it can straddle a boundary since blocks are
@@ -332,7 +340,7 @@ test "no slot is published before the watermark that announces it" {
     defer kr.deinit();
 
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4, .owned_thread);
+    try pool.start(&kr, keyring_mod.MapLock.none, h.deps(), 4, .owned_thread);
     defer pool.deinit();
 
     const slot = try pool.acquire();
@@ -358,7 +366,7 @@ test "a watermark that will not commit withholds the block" {
     defer kr.deinit();
 
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4, .owned_thread);
+    try pool.start(&kr, keyring_mod.MapLock.none, h.deps(), 4, .owned_thread);
     defer pool.deinit();
 
     // Never satisfied while the watermark write keeps failing.
@@ -381,7 +389,7 @@ test "every slot handed out already has a durable key" {
     var h = Harness{};
     defer h.deinit();
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 8, .owned_thread);
+    try pool.start(&kr, keyring_mod.MapLock.none, h.deps(), 8, .owned_thread);
     defer pool.deinit();
 
     // The invariant, checked on every slot rather than at the end: by
@@ -410,7 +418,7 @@ test "slots start after the reserved tenant key" {
     var h = Harness{};
     defer h.deinit();
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4, .owned_thread);
+    try pool.start(&kr, keyring_mod.MapLock.none, h.deps(), 4, .owned_thread);
     defer pool.deinit();
 
     // Slot 0 is TENANT_REF. Handing it to an identity would make a
@@ -433,7 +441,7 @@ test "a slot is NOT handed out when replication cannot reach a quorum" {
     h.fail_replicate.store(true, .monotonic);
 
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4, .owned_thread);
+    try pool.start(&kr, keyring_mod.MapLock.none, h.deps(), 4, .owned_thread);
 
     // This is the property the whole ordering exists for. A leader that
     // sealed under a locally-minted but unreplicated key, committed the
@@ -472,7 +480,7 @@ test "tryAcquire returns null instead of waiting when the pool cannot fill" {
     h.fail_replicate.store(true, .monotonic);
 
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4, .owned_thread);
+    try pool.start(&kr, keyring_mod.MapLock.none, h.deps(), 4, .owned_thread);
     defer pool.deinit();
 
     // The whole point: this RETURNS. The worker is a poll loop, so a
@@ -498,7 +506,7 @@ test "tryAcquire yields durable slots on the fast path" {
     var h = Harness{};
     defer h.deinit();
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 8, .owned_thread);
+    try pool.start(&kr, keyring_mod.MapLock.none, h.deps(), 8, .owned_thread);
     defer pool.deinit();
 
     // The first block has to land; `tryAcquire` never waits for it.
@@ -537,7 +545,7 @@ test "a reservation failure is retried without surfacing to the caller" {
     h.fail_reserve.store(3, .monotonic);
 
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4, .owned_thread);
+    try pool.start(&kr, keyring_mod.MapLock.none, h.deps(), 4, .owned_thread);
     defer pool.deinit();
 
     const slot = try pool.acquire();
@@ -561,7 +569,7 @@ test "a block straddling a shard boundary replicates both shards" {
     h.committed_end.store(keyring_mod.SLOTS_PER_SHARD - 2, .monotonic);
 
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4, .owned_thread);
+    try pool.start(&kr, keyring_mod.MapLock.none, h.deps(), 4, .owned_thread);
     defer pool.deinit();
 
     const slot = try pool.acquire();
@@ -586,7 +594,7 @@ test "keys survive a restart, and slots are not reissued after one" {
         var kr = try keyring_mod.Keyring.create(testing.allocator, dir, "acme", TEST_KEK, TEST_SECRET);
         defer kr.deinit();
         var pool = SlotPool{};
-        try pool.start(&kr, h.deps(), 4, .owned_thread);
+        try pool.start(&kr, keyring_mod.MapLock.none, h.deps(), 4, .owned_thread);
         for (&first_slots, 0..) |*s, i| {
             s.* = try pool.acquire();
             first_keys[i] = pool.keyAt(s.*).?;
@@ -600,7 +608,7 @@ test "keys survive a restart, and slots are not reissued after one" {
     var kr = try keyring_mod.Keyring.open(testing.allocator, dir, "acme", TEST_KEK);
     defer kr.deinit();
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 4, .owned_thread);
+    try pool.start(&kr, keyring_mod.MapLock.none, h.deps(), 4, .owned_thread);
     defer pool.deinit();
 
     for (first_slots, first_keys) |slot, key| {
@@ -624,7 +632,7 @@ test "a shredded slot reads as absent without disturbing the pool" {
     var h = Harness{};
     defer h.deinit();
     var pool = SlotPool{};
-    try pool.start(&kr, h.deps(), 8, .owned_thread);
+    try pool.start(&kr, keyring_mod.MapLock.none, h.deps(), 8, .owned_thread);
     defer pool.deinit();
 
     const doomed = try pool.acquire();
