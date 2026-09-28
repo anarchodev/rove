@@ -117,6 +117,8 @@ const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
 const keyring_pool = @import("keyring_pool.zig");
 const keyring_mod = @import("rove-keyring");
+const crypt_mod = @import("rove-crypt");
+const pool_seal = @import("pool_seal.zig");
 // The per-tenant raft bridge is the worker's consensus seam.
 const bridge_mod = @import("bridge");
 const Bridge = bridge_mod.Bridge;
@@ -403,6 +405,11 @@ pub const BodyDurabilityWait = struct {
     /// Materialized BodyRef — meaningful only when `status == .resolved`.
     body_ref: bodies_mod.BodyRef = .none,
     tenant_id: []const u8 = "",
+    /// The body's wrapped data key, minted with the seal at submit and
+    /// recorded on the tape entry beside `body_ref`. Travels on the park
+    /// because the seal happens at submit and the tape entry is written
+    /// after the park resolves — nothing else spans both moments.
+    body_key: [pool_seal.WRAPPED_LEN]u8 = pool_seal.NO_WRAP,
 };
 
 /// Parked outbound-fetch chunk activation.
@@ -420,7 +427,7 @@ pub const BodyDurabilityWait = struct {
 /// polls `coord.durableSeq(queue_id) > worker_seq` each tick. On
 /// advance, it looks up `coord.bodyRef(queue_id, worker_seq)`,
 /// materializes the wire `BodyRef`, and re-fires
-/// `fireFetchEventActivation(_, _, body_ref)`.
+/// `fireFetchEventActivation(_, _, .{ body_ref, body_key })`.
 pub const ParkedFetchEvent = struct {
     event: components_mod.UpstreamFetchEvent,
     /// Coord durability key.
@@ -431,6 +438,9 @@ pub const ParkedFetchEvent = struct {
     /// process lifetime). Cached so drain doesn't have to dereference
     /// `event.tenant_id` again.
     tenant_id_view: []const u8,
+    /// The wrapped data key for the spilled bytes, minted with the seal
+    /// at submit and recorded on the tape entry beside the ref.
+    body_key: [pool_seal.WRAPPED_LEN]u8 = pool_seal.NO_WRAP,
 };
 
 /// The typed Cmd buffer a `ParkedUnit` carries — commit-gated
@@ -3517,9 +3527,15 @@ pub fn Worker(comptime opts: Options) type {
             stream_id: u32,
             cap: u64,
             tenant_hash: u64,
+            tenant_body_key: ?crypt_mod.Key,
         ) ?*inbound_chunk_mod.Job {
-            const job = inbound_chunk_mod.Job.create(self.allocator, cap, REQUEST_BODY_CAP, tenant_hash) catch
-                return null;
+            const job = inbound_chunk_mod.Job.create(
+                self.allocator,
+                cap,
+                REQUEST_BODY_CAP,
+                tenant_hash,
+                tenant_body_key,
+            ) catch return null;
             const s: h2.BodySink = .{
                 .ctx = job,
                 .push = &inbound_chunk_mod.Sink.push,

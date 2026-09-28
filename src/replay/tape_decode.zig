@@ -19,7 +19,7 @@
 const std = @import("std");
 
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
-pub const VERSION: u16 = 10; // lockstep-asserted against src/tape/root.zig
+pub const VERSION: u16 = 11; // lockstep-asserted against src/tape/root.zig
 /// The oldest layout this reader still understands.
 ///
 /// A range is only sound while every version in it can be told apart by
@@ -126,6 +126,12 @@ pub const FetchResponseEntry = struct {
     /// way in (#367). Empty when the bytes rode inline or spilled to the
     /// body pool, and always empty on a v5 tape.
     content_hash: []const u8 = "",
+    /// The pool body's data key, wrapped under key material a destroy can
+    /// reach (`rove-keyring`'s `body_seal`). Non-empty only beside a pool
+    /// ref. Decoded to keep the layout honest; this reader never opens
+    /// one — pool bytes reach an offline engine already opened by the
+    /// worker's logs door.
+    body_key: []const u8 = "",
 };
 
 /// One trigger-payload entry (`src/tape/root.zig` `TriggerPayloadEntry`). For an
@@ -135,6 +141,8 @@ pub const FetchResponseEntry = struct {
 pub const TriggerPayloadEntry = struct {
     pool_ref: PoolRef = .none,
     inline_bytes: []const u8,
+    /// The pool body's wrapped data key — see `FetchResponseEntry.body_key`.
+    body_key: []const u8 = "",
 };
 
 /// Where one entry's payload actually lives. The three pointer shapes a tape
@@ -418,6 +426,10 @@ pub fn decodeFetchResponses(a: std.mem.Allocator, bytes: []const u8) Error![]Fet
             try readLenPrefixed(e, &cur)
         else
             "";
+        const body_key: []const u8 = if (cur < e.len)
+            try readLenPrefixed(e, &cur)
+        else
+            "";
         try out.append(a, .{
             .fetch_id = fid,
             .seq = seq,
@@ -431,6 +443,7 @@ pub fn decodeFetchResponses(a: std.mem.Allocator, bytes: []const u8) Error![]Fet
             .inline_bytes = inline_bytes,
             .body_ref_len = pool_ref.len,
             .content_hash = content_hash,
+            .body_key = body_key,
         });
     }
     return out.toOwnedSlice(a);
@@ -446,7 +459,10 @@ pub fn decodeTriggerPayload(a: std.mem.Allocator, bytes: []const u8) Error![]Tri
         var cur: usize = 0;
         const pool_ref = try readPoolRef(e, &cur);
         const inline_bytes = try readLenPrefixed(e, &cur);
-        try out.append(a, .{ .pool_ref = pool_ref, .inline_bytes = inline_bytes });
+        // Tolerated-absent, like every trailing field, so a hand-built
+        // fixture that stops at the payload still reads.
+        const body_key: []const u8 = if (cur < e.len) try readLenPrefixed(e, &cur) else "";
+        try out.append(a, .{ .pool_ref = pool_ref, .inline_bytes = inline_bytes, .body_key = body_key });
     }
     return out.toOwnedSlice(a);
 }

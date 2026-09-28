@@ -29,6 +29,7 @@ const crypt = @import("rove-crypt");
 const kv_mod = @import("raft-kv");
 const keyspace = @import("keyspace.zig");
 const seal_mod = @import("seal.zig");
+const body_seal_mod = @import("body_seal.zig");
 const reserved = @import("rove-reserved");
 
 /// Reserve → mint → replicate → publish, supplied by whoever owns the
@@ -150,8 +151,41 @@ pub const TenantKeys = struct {
         };
     }
 
+    /// Open a pool body with the wrap its tape entry carries — the body
+    /// twin of `openValue`, with the same three-way answer so a reader
+    /// keeps "erased" and "this node cannot tell" apart. An empty wrap is
+    /// `.plaintext`: the entry names bytes that were never sealed.
+    pub fn openBody(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        sealed_body: []const u8,
+        wrap: []const u8,
+    ) !keyspace.Opened {
+        if (wrap.len == 0) return .plaintext;
+        const ref = try body_seal_mod.wrapRef(wrap);
+        return switch (self.keyForWrap(ref)) {
+            .key => |k| .{ .opened = try body_seal_mod.open(allocator, sealed_body, wrap, k) },
+            .shredded => .shredded,
+            .unverified => .unverified,
+        };
+    }
+
     pub fn tenantSecret(self: *Self) *const crypt.keyring.Secret {
         return self.keyring.tenantSecret();
+    }
+
+    /// The key that opens a body wrap, from the ref the wrap names.
+    ///
+    /// Two kinds of key material answer to a ref and a caller should not
+    /// have to know which: `crypt.TENANT_REF` is DERIVED from the
+    /// tenant's stored secret (slot 0 is reserved for it and never
+    /// minted, so a lookup would report it shredded), while every other
+    /// ref is a minted slot. One branch, here, where the key material
+    /// lives.
+    pub fn keyForWrap(self: *Self, ref: crypt.KeyRef) keyspace.Lookup {
+        if (std.mem.eql(u8, &ref, &crypt.TENANT_REF))
+            return .{ .key = body_seal_mod.tenantKey(self.tenantSecret()) };
+        return self.lookup(crypt.slotForRef(ref));
     }
 
     // ── completeness ─────────────────────────────────────────────────
@@ -342,6 +376,40 @@ pub const TenantKeys = struct {
         }
     }
 
+    /// Move a pool body's wrap from the tenant key onto `key_slot` — the
+    /// body half of late binding, run beside `sealWrites` for the same
+    /// reason: the identity in force when the handler returns is the one
+    /// its bytes answer to.
+    ///
+    /// It REPLACES the wrap (`body_seal.rewrap`): two wraps of one data
+    /// key would leave the tenant key able to read what destroying the
+    /// identity promised to erase. A wrap already naming `key_slot` is
+    /// left as is; one naming a DIFFERENT slot is refused, because two
+    /// identities claiming one body is a caller bug and picking either
+    /// silently breaks the other's erasure.
+    pub fn bindBodyWrap(self: *Self, wrap: []u8, key_slot: u64) !void {
+        if (wrap.len != body_seal_mod.WRAPPED_LEN) return body_seal_mod.Error.MalformedWrap;
+        const from_ref = try body_seal_mod.wrapRef(wrap);
+        if (!std.mem.eql(u8, &from_ref, &crypt.TENANT_REF)) {
+            if (crypt.slotForRef(from_ref) == key_slot) return;
+            return body_seal_mod.Error.MalformedWrap;
+        }
+        const to = switch (self.lookup(key_slot)) {
+            .key => |k| k,
+            // A wrap under a key that is gone, or one this node cannot
+            // vouch for, is one nobody can ever open.
+            .shredded, .unverified => return error.KeyDestroyed,
+        };
+        const moved = try body_seal_mod.rewrap(
+            wrap,
+            body_seal_mod.tenantKey(self.tenantSecret()),
+            to,
+            crypt.refForSlot(key_slot),
+            seal_mod.KEY_VERSION,
+        );
+        @memcpy(wrap, &moved);
+    }
+
     /// Erase `identity`'s key — permanently, and everywhere.
     ///
     /// The binding row is deleted and `_keys/dead/{slot}` written in the
@@ -516,6 +584,81 @@ test "a restored keyring does not resurrect a key the tenant destroyed" {
     defer reopened.deinit();
     try testing.expect(reopened.keyAt(destroyed_slot) == null);
     try testing.expect(reopened.keyAt(live_slot) != null);
+}
+
+test "a pool body's wrap moves to the identity, and only the identity then opens it" {
+    const a = testing.allocator;
+    var path_buf: [96]u8 = undefined;
+    const seed = std.crypto.random.int(u64);
+    const db_path = try std.fmt.bufPrintZ(&path_buf, "/tmp/rove-tk-body-{x}.kv", .{seed});
+    var lock_buf: [128]u8 = undefined;
+    const lock_path = try std.fmt.bufPrint(&lock_buf, "{s}-lock", .{db_path});
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        std.fs.cwd().deleteFile(lock_path) catch {};
+    }
+    var dir_buf: [96]u8 = undefined;
+    const kr_dir = try std.fmt.bufPrint(&dir_buf, "/tmp/rove-tk-body-keyring-{x}", .{seed});
+    defer std.fs.cwd().deleteTree(kr_dir) catch {};
+
+    const kek = "a cluster key-encryption key";
+    const dead_slot: u64 = 7;
+    const identity_slot: u64 = 8;
+    {
+        var kr = try crypt.keyring.Keyring.create(a, kr_dir, "acme", kek, [_]u8{0x5A} ** 32);
+        defer kr.deinit();
+        try kr.mintRange(dead_slot, 2, 1);
+    }
+    const store = try kv_mod.KvStore.open(a, db_path);
+    defer store.close();
+    const dead = try keyspace.deadKey(a, dead_slot);
+    defer a.free(dead);
+    try store.put(dead, &keyspace.encodeDead(1));
+    const keys = (try TenantKeys.open(a, kr_dir, "acme", kek, store)).?;
+    defer keys.deinit();
+
+    // Submitted before any handler ran: wrapped for the tenant.
+    const tenant_key = body_seal_mod.tenantKey(keys.tenantSecret());
+    var s = try body_seal_mod.seal(a, "the request body", tenant_key, crypt.TENANT_REF, 1);
+    defer s.deinit(a);
+    {
+        const res = try keys.openBody(a, s.body, &s.wrapped_key);
+        defer if (res == .opened) a.free(res.opened);
+        try testing.expectEqualStrings("the request body", res.opened);
+    }
+
+    // The handler named an identity: the wrap moves, the body does not.
+    try keys.bindBodyWrap(&s.wrapped_key, identity_slot);
+    try testing.expectEqual(identity_slot, crypt.slotForRef(try body_seal_mod.wrapRef(&s.wrapped_key)));
+    {
+        const res = try keys.openBody(a, s.body, &s.wrapped_key);
+        defer if (res == .opened) a.free(res.opened);
+        try testing.expectEqualStrings("the request body", res.opened);
+    }
+    // THE property: the tenant key no longer opens it, so destroying the
+    // identity leaves nothing that can.
+    try testing.expectError(
+        crypt.Error.AuthFailed,
+        body_seal_mod.open(a, s.body, &s.wrapped_key, tenant_key),
+    );
+
+    // Re-binding to the same identity is a no-op; to a different one is a
+    // caller bug, refused rather than resolved by picking one.
+    try keys.bindBodyWrap(&s.wrapped_key, identity_slot);
+    try testing.expectError(body_seal_mod.Error.MalformedWrap, keys.bindBodyWrap(&s.wrapped_key, 9));
+
+    // Binding to a destroyed identity would write a wrap nobody can open.
+    var t = try body_seal_mod.seal(a, "x", tenant_key, crypt.TENANT_REF, 1);
+    defer t.deinit(a);
+    try testing.expectError(error.KeyDestroyed, keys.bindBodyWrap(&t.wrapped_key, dead_slot));
+
+    // A body whose identity is destroyed reads as erased, not as an error.
+    var gone = try body_seal_mod.seal(a, "x", [_]u8{0x01} ** crypt.KEY_LEN, crypt.refForSlot(dead_slot), 1);
+    defer gone.deinit(a);
+    try testing.expect((try keys.openBody(a, gone.body, &gone.wrapped_key)) == .shredded);
+
+    // No wrap means a body that was never sealed.
+    try testing.expect((try keys.openBody(a, "plain", "")) == .plaintext);
 }
 
 test "the two locks have distinct jobs, and reads never take the slow one" {

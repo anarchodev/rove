@@ -32,6 +32,7 @@ const deployment_cache = @import("deployment_cache.zig");
 const kv_export_mod = @import("kv_export.zig");
 
 const kv_mod = @import("raft-kv");
+const pool_seal = @import("pool_seal.zig");
 const worker_mod = @import("worker.zig");
 const worker_ws = @import("worker_ws.zig");
 const dispatch = @import("worker_dispatch.zig");
@@ -731,10 +732,18 @@ pub fn fireDispatchActivation(
 /// append site, and the gate uses it directly instead of
 /// re-appending (which would mint a new batch + re-park).
 /// Fresh-arrival callers pass `null`.
+/// A spilled chunk's durable pool reference and the wrapped data key its
+/// bytes were sealed under — the two travel together from the submit to
+/// the tape entry, and neither means anything without the other.
+pub const ParkedBody = struct {
+    ref: bodies_mod.BodyRef,
+    key: [pool_seal.WRAPPED_LEN]u8,
+};
+
 pub fn fireFetchEventActivation(
     worker: anytype,
     event: *components_mod.UpstreamFetchEvent,
-    parked_body_ref: ?bodies_mod.BodyRef,
+    parked_body: ?ParkedBody,
 ) void {
     // Ownership handling: deinit the event on every exit path
     // except the park branch (which transfers to
@@ -826,17 +835,19 @@ pub fn fireFetchEventActivation(
     var body_ref: bodies_mod.BodyRef = bodies_mod.BodyRef.carried(@intCast(event.bytes.len));
     var inline_bytes_for_tape: []const u8 = "";
     var content_hash_for_tape: []const u8 = "";
+    var body_key_for_tape: []const u8 = "";
     // Only a chunk that actually carries bytes can be referenced; a
     // terminal-only event has nothing to name.
     const content_ref: ?[64]u8 = if (event.bytes.len > 0) event.content_hash else null;
     const content_slice: []const u8 = if (content_ref) |*h| h[0..] else "";
-    if (parked_body_ref) |saved| {
+    if (parked_body) |*saved| {
         // Resume from a previous park. The
         // body's batch was confirmed durable by
         // drainFetchPendingDurability before this re-fire; use
         // the saved ref directly + skip append. Re-appending
         // would mint a new batch and re-park.
-        body_ref = saved;
+        body_ref = saved.ref;
+        body_key_for_tape = &saved.key;
     } else switch (worker_mod.payloadFate(event.bytes.len, content_slice)) {
         // Terminal-only event: nothing to name, nothing to carry.
         .none => {},
@@ -862,32 +873,56 @@ pub fn fireFetchEventActivation(
         .spill => {
             if (worker.node.blob_coord.coordinator) |coord| {
                 const wid = worker.coord_queue_id;
-                const seq = coord.submit(
-                    wid,
-                    kv_mod.hashStoreId(p.dep.inst.id),
+                // Seal before submitting — the pool carries ciphertext,
+                // and the wrap rides the park to the tape entry. A
+                // missing keyring fails the spill rather than writing
+                // plaintext nothing can later reach (`pool_seal`).
+                const sealed_opt: ?pool_seal.Sealed = pool_seal.sealForPool(
+                    worker,
+                    worker.allocator,
+                    p.dep.inst.id,
                     event.bytes,
-                ) catch |err| blk: {
+                ) catch |serr| seal_blk: {
                     std.log.warn(
-                        "rove-js fetch-event: coord.submit tenant={s} bytes={d}: {s}",
-                        .{ tenant_id, event.bytes.len, @errorName(err) },
+                        "rove-js fetch-event: cannot seal {d}B for the pool tenant={s}: {s}",
+                        .{ event.bytes.len, tenant_id, @errorName(serr) },
                     );
-                    break :blk @as(?u64, null);
+                    // Fall through to the unretained-Msg path below: the
+                    // activation still runs, the entry keeps its length
+                    // and gains no pointer. Refusing to spill is the
+                    // point; losing the activation is not.
+                    break :seal_blk null;
                 };
-                if (seq) |s| {
-                    worker.fetch_pending_durability.append(worker.allocator, .{
-                        .event = event.*,
-                        .worker_seq = s,
-                        .queue_id = wid,
-                        .tenant_id_view = p.dep.inst.id,
-                    }) catch |err| {
+                if (sealed_opt) |sealed| {
+                    defer worker.allocator.free(sealed.body);
+                    const seq = coord.submit(
+                        wid,
+                        kv_mod.hashStoreId(p.dep.inst.id),
+                        sealed.body,
+                    ) catch |err| blk: {
                         std.log.warn(
-                            "rove-js fetch-event: fetch_pending_durability.append tenant={s}: {s}",
-                            .{ tenant_id, @errorName(err) },
+                            "rove-js fetch-event: coord.submit tenant={s} bytes={d}: {s}",
+                            .{ tenant_id, event.bytes.len, @errorName(err) },
                         );
-                        return;
+                        break :blk @as(?u64, null);
                     };
-                    parked_to_durability = true;
-                    return;
+                    if (seq) |s| {
+                        worker.fetch_pending_durability.append(worker.allocator, .{
+                            .event = event.*,
+                            .worker_seq = s,
+                            .queue_id = wid,
+                            .tenant_id_view = p.dep.inst.id,
+                            .body_key = sealed.wrapped_key,
+                        }) catch |err| {
+                            std.log.warn(
+                                "rove-js fetch-event: fetch_pending_durability.append tenant={s}: {s}",
+                                .{ tenant_id, @errorName(err) },
+                            );
+                            return;
+                        };
+                        parked_to_durability = true;
+                        return;
+                    }
                 }
             }
             // The spill did not happen — no coordinator, or a submit the
@@ -924,6 +959,7 @@ pub fn fireFetchEventActivation(
         event.fetch_headers orelse "",
         inline_bytes_for_tape,
         content_hash_for_tape,
+        body_key_for_tape,
     ) catch |err| {
         // Tape capture failures must never kill the request. Same
         // posture as `captureTapes`'s per-channel serialize

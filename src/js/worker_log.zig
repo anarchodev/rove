@@ -523,6 +523,7 @@ pub fn captureWakeBatchTapes(
         readset.trigger_payload.appendTriggerPayload(
             bodies_mod.BodyRef.carried(@intCast(ctx_body.len)),
             if (ctx_body.len <= REQUEST_BODY_CAP) ctx_body else "",
+            "",
         ) catch |err| {
             std.log.warn("rove-js wake-ctx capture failed: {s}", .{@errorName(err)});
         };
@@ -570,6 +571,7 @@ pub fn captureSendCallbackTapes(
         readset.trigger_payload.appendTriggerPayload(
             bodies_mod.BodyRef.carried(@intCast(envelope.len)),
             if (envelope.len <= REQUEST_BODY_CAP) envelope else "",
+            "",
         ) catch |err| {
             std.log.warn("rove-js send-callback envelope capture failed: {s}", .{@errorName(err)});
         };
@@ -666,6 +668,7 @@ pub fn captureFetchChunkTapes(
         ev.headers,
         if (fate == .carried) ev.bytes else "",
         if (fate == .referenced) ev.content_hash else "",
+        "",
     ) catch |err| {
         std.log.warn("rove-js fetch-event capture failed: {s}", .{@errorName(err)});
     };
@@ -1319,6 +1322,7 @@ test "captureFetchChunkTapes: an unretained chunk keeps its length, not a zero" 
         false,
         "",
         if (fate == .carried) big else "",
+        "",
         "",
     );
 

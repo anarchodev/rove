@@ -66,6 +66,7 @@ const ParkedUnit = worker_mod.ParkedUnit;
 const RaftWait = worker_mod.RaftWait;
 const ForwardWait = worker_mod.ForwardWait;
 const BodyDurabilityWait = worker_mod.BodyDurabilityWait;
+const pool_seal = @import("pool_seal.zig");
 const TenantFiles = worker_mod.TenantFiles;
 const captureLogWithId = worker_mod.captureLogWithId;
 const OWED_PREFIX = worker_mod.OWED_PREFIX;
@@ -2987,7 +2988,10 @@ pub fn drainFetchPendingDurability(worker: anytype) !void {
             // the released event (deinit fires via its own defer).
             .ready => |wire_ref| {
                 var released = worker.fetch_pending_durability.swapRemove(i);
-                worker_mod.fireFetchEventActivation(worker, &released.event, wire_ref);
+                worker_mod.fireFetchEventActivation(worker, &released.event, .{
+                    .ref = wire_ref,
+                    .key = released.body_key,
+                });
             },
         }
     }
@@ -3275,9 +3279,31 @@ fn advanceInboundChunkGate(worker: anytype, job: anytype) bool {
         switch (pf.coord) {
             .unsubmitted => {
                 const wid = worker.coord_queue_id;
-                if (coord.submit(wid, job.tenant_hash, pf.bytes)) |seq| {
+                // Seal before submitting — the pool carries ciphertext,
+                // and the wrap stays on the fire until the tape entry is
+                // written. No keyring means no spill: submitting
+                // plaintext here is unrecoverable (`pool_seal`).
+                const tkey = job.tenant_body_key orelse {
+                    std.log.warn(
+                        "rove-js inbound-chunk: no keyring for this tenant — refusing to spill {d}B as plaintext",
+                        .{pf.bytes.len},
+                    );
+                    pf.coord = .failed;
+                    continue;
+                };
+                const sealed = pool_seal.sealWithKey(worker.allocator, pf.bytes, tkey) catch |err| {
+                    std.log.warn(
+                        "rove-js inbound-chunk: cannot seal {d}B for the pool: {s}",
+                        .{ pf.bytes.len, @errorName(err) },
+                    );
+                    pf.coord = .failed;
+                    continue;
+                };
+                defer worker.allocator.free(sealed.body);
+                if (coord.submit(wid, job.tenant_hash, sealed.body)) |seq| {
                     pf.wid = wid;
                     pf.seq = seq;
+                    pf.body_key = sealed.wrapped_key;
                     pf.coord = .pending;
                 } else |err| {
                     std.log.warn("rove-js inbound-chunk: coord.submit bytes={d}: {s}", .{ pf.bytes.len, @errorName(err) });
@@ -3449,11 +3475,11 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     if (chunk_bytes.len > 0) readset.body_read = true;
     if (chunk_bytes.len > 0 and chunk_bytes.len <= worker_mod.REQUEST_BODY_CAP) {
         const inline_ref: bodies_mod.BodyRef = bodies_mod.BodyRef.carried(@intCast(chunk_bytes.len));
-        readset.trigger_payload.appendTriggerPayload(inline_ref, chunk_bytes) catch |err| {
+        readset.trigger_payload.appendTriggerPayload(inline_ref, chunk_bytes, "") catch |err| {
             std.log.warn("rove-js inbound-chunk: trigger_payload append (inline): {s}", .{@errorName(err)});
         };
     } else if (chunk_bytes.len > 0) {
-        readset.trigger_payload.appendTriggerPayload(head_fire.ref, "") catch |err| {
+        readset.trigger_payload.appendTriggerPayload(head_fire.ref, "", &head_fire.body_key) catch |err| {
             std.log.warn("rove-js inbound-chunk: trigger_payload append (ref): {s}", .{@errorName(err)});
         };
     }

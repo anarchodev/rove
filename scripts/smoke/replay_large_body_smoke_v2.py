@@ -55,6 +55,20 @@ export default function () {
   return crypto.sha256(data) + ":" + data.length;
 }
 """,
+    # The pool holds ciphertext, and only the worker's logs door opens it —
+    # the same path every real replay consumer takes. Self-tenant, so the
+    # engine pins the read to this handler's own id.
+    "door/index.mjs": r"""export default function ({ after, next }) {
+    const rid = new URLSearchParams(request.query || "").get("rid") || "";
+    after.fetch("http://rewind-logs.internal/v1/" + request.tenant + "/body/"
+                + rid + "/trigger_payload/0");
+    return next();
+}
+export function onFetchResult() {
+    response.status = 200;
+    return "status:" + (request.status || 0) + "\n" + (request.text || "");
+}
+""",
 }
 
 BIG_LEN = 64 * 1024
@@ -140,15 +154,17 @@ def main() -> int:
               f"request_body_b64 present={bool(tapes.get('request_body_b64'))}")
 
         # ── resolve through the door ───────────────────────────────────
-        d = c.log_get(f"acme/body/{rid}/trigger_payload/0", timeout=30.0)
+        dr = c.request("acme", "/door?rid=" + rid, timeout=30.0)
+        head, _, door_json = dr.body.partition("\n")
+        d_status = int(head.split(":", 1)[1]) if head.startswith("status:") else 0
         resolved = {}
-        if d.status == 200:
+        if d_status == 200:
             try:
-                resolved = json.loads(d.body)
+                resolved = json.loads(door_json)
             except json.JSONDecodeError:
                 resolved = {}
-        check("the door resolves the spilled body", d.status == 200 and resolved.get("source") == "pool",
-              f"status={d.status} source={resolved.get('source')!r}")
+        check("the door resolves the spilled body", d_status == 200 and resolved.get("source") == "pool",
+              f"status={d_status} source={resolved.get('source')!r}")
         resolved_b64 = resolved.get("bytes_b64")
         if resolved_b64:
             got_bytes = base64.b64decode(resolved_b64).decode("utf-8", "replace")
