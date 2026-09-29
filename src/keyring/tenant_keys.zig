@@ -123,8 +123,11 @@ pub const TenantKeys = struct {
 
     pub fn deinit(self: *Self) void {
         // Wait out any sweep in flight before freeing anything under it.
+        // Released by hand just before `self` is freed — a `defer` would
+        // run after the free and write to released memory. Nothing can
+        // claim it in between: the slot is already out of the map, and the
+        // driver only ever `tryLock`s.
         self.claim_lock.lock();
-        defer self.claim_lock.unlock();
         // Pool before keyring: the pool borrows the keyring it mints into
         // and may be mid-`mintRange`. The disk lock waits that out.
         self.disk_lock.lock();
@@ -138,6 +141,7 @@ pub const TenantKeys = struct {
 
         self.pending.deinit(self.allocator);
         self.keyring.deinit();
+        self.claim_lock.unlock();
         self.allocator.destroy(self);
     }
 
@@ -605,13 +609,28 @@ pub const TenantKeys = struct {
             return;
         }
         self.pool = .{};
-        self.pool.?.start(&self.keyring, deps, block_slots, drive) catch |err| {
+        self.pool.?.start(&self.keyring, self.mapLock(), deps, block_slots, drive) catch |err| {
             self.pool = null;
             ctx_free(self.allocator, ctx);
             return err;
         };
         self.pool_ctx = ctx;
         self.pool_ctx_free = ctx_free;
+    }
+
+    /// `map_lock` as the keyring's `MapLock`, for the pool's mints.
+    fn mapLock(self: *Self) crypt.keyring.MapLock {
+        const L = struct {
+            fn lock(ctx: *anyopaque) void {
+                const tk: *Self = @ptrCast(@alignCast(ctx));
+                tk.map_lock.lock();
+            }
+            fn unlock(ctx: *anyopaque) void {
+                const tk: *Self = @ptrCast(@alignCast(ctx));
+                tk.map_lock.unlock();
+            }
+        };
+        return .{ .ctx = self, .lock = L.lock, .unlock = L.unlock };
     }
 
     pub fn hasPool(self: *Self) bool {
