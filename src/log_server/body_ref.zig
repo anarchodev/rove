@@ -363,8 +363,9 @@ pub const Source = enum {
 pub const Resolved = struct {
     bytes: []u8,
     source: Source,
-    /// The wrapped data key the entry carried beside a pool ref, owned, or
-    /// empty. Non-empty means `bytes` is CIPHERTEXT. This process holds no
+    /// The wrapped data key the entry carried beside its payload (a pool
+    /// ref, or bytes carried inline), owned, or empty. Non-empty means
+    /// `bytes` is CIPHERTEXT. This process holds no
     /// keys, so it passes the wrap on and the worker's logs door opens the
     /// body (`src/js/logs_door_shred.zig`) — the one process holding both
     /// the tenant's keys and the completeness watermark that says whether
@@ -378,10 +379,11 @@ pub const Resolved = struct {
     }
 };
 
-/// The wrap an entry carries for its pool body, or empty. Only a pool ref
-/// has one: a carried or content-addressed payload was never sealed here.
+/// The wrap an entry carries for its payload, or empty. A pool body and a
+/// payload carried inline are both sealed with the wrap beside them; a
+/// content-addressed chunk is the tenant's own stored object and never is.
 fn bodyKeyOf(entry: tape_mod.Entry, ref: Ref) []const u8 {
-    if (ref != .pool) return "";
+    if (ref != .pool and ref != .carried) return "";
     return switch (entry) {
         .trigger_payload => |t| t.body_key,
         .fetch_responses => |f| f.body_key,

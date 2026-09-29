@@ -26,7 +26,6 @@ Build: `zig build rewind-worker rewind-cp rewind-front` + `zig build`
 
 from __future__ import annotations
 
-import base64
 import json
 import subprocess
 import sys
@@ -246,13 +245,9 @@ def main() -> int:
                                           handler_entries[0]["path"])
                         entry_source = next(m["source"] for m in modules
                                             if m["path"] == entry_path)
+                        # The handler reads no body; a record's body, when it
+                        # has one, rides its trigger_payload tape.
                         req_body = ""
-                        if tapes.get("request_body_b64"):
-                            try:
-                                req_body = base64.b64decode(
-                                    tapes["request_body_b64"]).decode("utf-8", "replace")
-                            except Exception:
-                                req_body = ""
                         bundle = {
                             "request_id": rid,
                             "deployment_id": rec["deployment_id"],

@@ -163,7 +163,13 @@ pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 /// sealed body would report live data as erased — the worst failure this
 /// design has (`keyring/seal.zig`'s discriminator note). Rejecting it loudly
 /// is the point.
-pub const VERSION: u16 = 11;
+/// v11 -> v12: payload sealing reaches the INLINE path. A `body_key` on an entry
+/// whose bytes ride `inline_bytes` means those bytes are sealed under it the same
+/// way a pool body is, and the `activation` entry gained a trailing `body_key`
+/// too — its Msg (a WS frame, a wake bag) is flushed on the record's
+/// `activation` tape instead of a plaintext side field. A v11 reader takes sealed
+/// inline bytes for the payload itself, so the bump is again a guard.
+pub const VERSION: u16 = 12;
 
 /// Wire width of a `BodyRef`: stamp(8) + digest(16) + offset(4) + len(4).
 /// Lockstep-asserted against the offline decoder above.
@@ -260,10 +266,9 @@ pub const Channel = enum(u16) {
     /// log blob.
     fetch_responses = 2,
     /// Readset replication (`docs/architecture/effects-and-handlers.md`). Zero or one entry
-    /// per inbound dispatch. Captures the request body's `BodyRef`
-    /// (the bytes streamed into the cross-tenant pool blob) so
-    /// replay can resolve `request.body` via `BlobStore.getRange`
-    /// instead of the inline `request_body_bytes` capture.
+    /// per inbound dispatch: the request body — inline under the cap, or
+    /// a `BodyRef` into the cross-tenant pool over it — or a resume's
+    /// `{"ctx": …}` envelope. The record's only copy of either.
     /// Zero entries when the request had no body.
     trigger_payload = 3,
     /// The lazily-recorded inbound request surface
@@ -645,6 +650,10 @@ pub const Entry = union(Channel) {
         export_name: []const u8,
         body_ref: bodies_mod.BodyRef,
         inline_bytes: []const u8,
+        /// The data key `inline_bytes` is sealed under, wrapped under key
+        /// material a destroy can reach (`keyring.body_seal`). Empty when
+        /// the bytes are plaintext. See `TriggerPayloadEntry.body_key`.
+        body_key: []const u8 = "",
     };
 };
 
@@ -1067,8 +1076,52 @@ pub const Tape = struct {
             .export_name = export_copy,
             .body_ref = body_ref,
             .inline_bytes = inline_copy,
+            // Plaintext until the seal replaces it; a zero-length free is a no-op.
+            .body_key = "",
         } });
         self.owned_bytes += export_copy.len + inline_copy.len;
+    }
+
+    /// Replace entry `i`'s inline payload with its sealed form and the
+    /// wrapped data key that opens it (`keyring.body_seal`). Only the three
+    /// payload-carrying channels have one; anything else is a caller bug.
+    /// Owned bytes are swapped, never aliased, so the entry stays freeable
+    /// by `freeEntry` whatever happened before.
+    pub fn sealInlinePayload(self: *Tape, i: usize, sealed: []const u8, wrap: []const u8) !void {
+        const sealed_copy = try self.allocator.dupe(u8, sealed);
+        errdefer self.allocator.free(sealed_copy);
+        const wrap_copy = try self.allocator.dupe(u8, wrap);
+        const e = &self.entries.items[i];
+        const slots: struct { bytes: *[]const u8, key: *[]const u8 } = switch (e.*) {
+            .trigger_payload => |*t| .{ .bytes = &t.inline_bytes, .key = &t.body_key },
+            .fetch_responses => |*f| .{ .bytes = &f.inline_bytes, .key = &f.body_key },
+            .activation => |*a| .{ .bytes = &a.inline_bytes, .key = &a.body_key },
+            else => unreachable,
+        };
+        self.owned_bytes -= slots.bytes.len + slots.key.len;
+        self.allocator.free(slots.bytes.*);
+        self.allocator.free(slots.key.*);
+        slots.bytes.* = sealed_copy;
+        slots.key.* = wrap_copy;
+        self.owned_bytes += sealed_copy.len + wrap_copy.len;
+    }
+
+    /// Drop entry `i`'s inline payload, keeping its recorded length: the
+    /// unretained shape. Never allocates, so it cannot fail — it is what a
+    /// caller that must not leave plaintext behind falls back to.
+    pub fn dropInlinePayload(self: *Tape, i: usize) void {
+        const e = &self.entries.items[i];
+        const slots: struct { bytes: *[]const u8, key: *[]const u8 } = switch (e.*) {
+            .trigger_payload => |*t| .{ .bytes = &t.inline_bytes, .key = &t.body_key },
+            .fetch_responses => |*f| .{ .bytes = &f.inline_bytes, .key = &f.body_key },
+            .activation => |*a| .{ .bytes = &a.inline_bytes, .key = &a.body_key },
+            else => unreachable,
+        };
+        self.owned_bytes -= slots.bytes.len + slots.key.len;
+        self.allocator.free(slots.bytes.*);
+        self.allocator.free(slots.key.*);
+        slots.bytes.* = "";
+        slots.key.* = "";
     }
 
     /// Record one request-surface read, once: if an entry with the
@@ -1167,11 +1220,9 @@ pub fn serializeEntries(
 /// 1:1 (rewind-apps repo `replay/replay-wasm-plan.md` §4) — same
 /// channels, same names, for the five that engine consumes. No
 /// translation layer between capture and replay. The sixth,
-/// `activation`, is raft-side only: the flushed record carries the same
-/// two values as `TapePayloads.activation_bytes` / `.export_name`,
-/// which every offline reader already resolves, so the channel exists
-/// to make the RAFT ENTRY self-sufficient, not to add a blob nobody
-/// reads.
+/// `activation`, carries the resolved export and the Msg of a wake or WS
+/// hop; it rides the raft entry so a rebuilt record is self-sufficient,
+/// and the flushed record alike.
 ///
 /// The readset is the single home for every per-request
 /// non-deterministic input the raft entry carries: the per-channel
@@ -1223,6 +1274,12 @@ pub const Readset = struct {
     /// wrongly verified. Zero means "not computed", which readers must treat
     /// as absent rather than as a digest of an empty run.
     interaction_digest: u64 = 0,
+    /// The identity slot the activation named (`shredKey`), set once the
+    /// handler returns. In memory only — never serialized. Capture seals
+    /// the activation's payloads under it (`src/js/pool_seal.zig`), since
+    /// several capture paths append their payloads after the handler's own
+    /// frame, where the dispatcher's copy of it is already gone.
+    shred_slot: ?u64 = null,
     kv: Tape,
     module: Tape,
     /// Readset replication (`docs/architecture/effects-and-handlers.md`): one entry per
@@ -1231,9 +1288,7 @@ pub const Readset = struct {
     /// the bytes via `BlobStore.getRange`.
     fetch_responses: Tape,
     /// Readset replication (`docs/architecture/effects-and-handlers.md`): zero-or-one
-    /// entry for the inbound request body's `BodyRef`. Replay
-    /// resolves `request.body` via `BlobStore.getRange` instead of
-    /// the inline `request_body_bytes` capture.
+    /// entry for the activation's body — see `Channel.trigger_payload`.
     trigger_payload: Tape,
     /// The activation's own record — resolved export, plus the Msg of a
     /// `wake_batch` / `ws_message` hop (see `Channel.activation`).
@@ -1247,8 +1302,7 @@ pub const Readset = struct {
     request_reads: Tape,
     /// Set by the `request.body` getter on first access. Consulted
     /// AFTER the handler ran (DispatchState is gone by then):
-    /// `elideUnreadBody` + the worker's `request_body_bytes` capture
-    /// gate on it. False ⇒ the body never influenced execution and
+    /// `elideUnreadBody` gates on it. False ⇒ the body never influenced execution and
     /// the log carries no reference to it.
     body_read: bool = false,
     /// True when the `trigger_payload` entry is a resume's threaded-ctx
@@ -1847,6 +1901,7 @@ fn freeEntry(allocator: std.mem.Allocator, e: *Entry) void {
         .activation => |*a| {
             allocator.free(a.export_name);
             allocator.free(a.inline_bytes);
+            allocator.free(a.body_key);
         },
     }
 }
@@ -1946,6 +2001,7 @@ fn encodeEntry(
             try appendLenPrefixed(allocator, buf, a.export_name);
             try appendBodyRef(allocator, buf, a.body_ref);
             try appendLenPrefixed(allocator, buf, a.inline_bytes);
+            try appendLenPrefixed(allocator, buf, a.body_key);
         },
     }
 }
@@ -2083,11 +2139,13 @@ fn decodeEntry(
             const export_name = try readLenPrefixed(bytes, &cur);
             const body_ref = try readBodyRef(bytes, &cur);
             const inline_bytes = try readLenPrefixed(bytes, &cur);
+            const body_key = try readLenPrefixed(bytes, &cur);
             if (cur != bytes.len) return ParseError.Truncated;
             return .{ .activation = .{
                 .export_name = export_name,
                 .body_ref = body_ref,
                 .inline_bytes = inline_bytes,
+                .body_key = body_key,
             } };
         },
     }
@@ -3032,6 +3090,31 @@ test "cross-decoder: fetch_responses channel reads back via tape_decode" {
     // The wrap rides beside the ref, and only there.
     try testing.expectEqualStrings("", out[0].body_key);
     try testing.expectEqualStrings("wrapped-data-key", out[1].body_key);
+}
+
+test "sealInlinePayload swaps the payload for its sealed form, on each payload channel" {
+    const a = testing.allocator;
+    var tp = Tape.init(a, .trigger_payload);
+    defer tp.deinit();
+    try tp.appendTriggerPayload(bodies_mod.BodyRef.carried(5), "hello", "");
+    try tp.sealInlinePayload(0, "CIPHERTEXT", "WRAP");
+    const t = tp.entries.items[0].trigger_payload;
+    try testing.expectEqualStrings("CIPHERTEXT", t.inline_bytes);
+    try testing.expectEqualStrings("WRAP", t.body_key);
+    // The carried length is the PLAINTEXT's: the ref describes what the
+    // handler saw, not how it is stored.
+    try testing.expectEqual(@as(u32, 5), t.body_ref.len);
+
+    var act = Tape.init(a, .activation);
+    defer act.deinit();
+    try act.appendActivation("onMessage", bodies_mod.BodyRef.carried(3), "\x01hi");
+    try act.sealInlinePayload(0, "SEALED", "W");
+    const bytes = try act.serialize(a);
+    defer a.free(bytes);
+    var parsed = try parse(a, bytes);
+    defer parsed.deinit();
+    try testing.expectEqualStrings("SEALED", parsed.entries[0].activation.inline_bytes);
+    try testing.expectEqualStrings("W", parsed.entries[0].activation.body_key);
 }
 
 test "cross-decoder: trigger_payload channel reads back via tape_decode" {

@@ -805,8 +805,8 @@ behavior, and what handler-shape.md promised). Three reasons:
   observed, nothing else.
 - **Body is reference-lazy, never storage-lazy**: the pre-dispatch durability
   gate (pool submit / raft-inline) is unconditional; if the handler never read
-  `request.body`, `Readset.elideUnreadBody` drops the trigger_payload entry +
-  `request_body_bytes`, so the replay record holds no pointer to the bytes.
+  `request.body`, `Readset.elideUnreadBody` drops the trigger_payload entry —
+  the record's only copy of the body — so it holds no pointer to the bytes.
   Unreferenced pool bytes age out with the pool lifecycle. **Chunk activations
   are exempt**: the chunk payload IS the activation's Msg (the gap-2.4
   chunk-tape record), `request.body` there is an eagerly-defined binary

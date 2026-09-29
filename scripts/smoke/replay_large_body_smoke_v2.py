@@ -138,6 +138,8 @@ def main() -> int:
             return 1
 
         rid = post["request_id"]
+        # Straight off the log-server: this record's one payload is the spilled
+        # body, which the smoke resolves through the door below.
         show = c.log_get(f"acme/show/{rid}", timeout=15.0)
         full = json.loads(show.body).get("record", {})
         tapes = full.get("tapes") or {}
@@ -145,15 +147,11 @@ def main() -> int:
 
         check("the record carries a digest", captured_digest is not None,
               f"got {captured_digest!r}")
-        # The premise of the whole smoke: the bytes are NOT in the record.
-        # If this ever fails, request_body_b64 is present and the body did NOT
-        # spill — the smoke would then be exercising the inline path and
-        # proving nothing about resolution.
-        check("the record does NOT inline the body (it spilled)",
-              not tapes.get("request_body_b64"),
-              f"request_body_b64 present={bool(tapes.get('request_body_b64'))}")
-
         # ── resolve through the door ───────────────────────────────────
+        # The premise of the whole smoke is the `source == "pool"` below: the
+        # body SPILLED, so the record holds only a pointer. Were it carried
+        # inline the smoke would be exercising the inline path and proving
+        # nothing about resolution.
         dr = c.request("acme", "/door?rid=" + rid, timeout=30.0)
         head, _, door_json = dr.body.partition("\n")
         d_status = int(head.split(":", 1)[1]) if head.startswith("status:") else 0
@@ -213,7 +211,7 @@ def main() -> int:
         # run exactly: same digest, same answer.
         if resolved_b64:
             healed = json.loads(json.dumps(full))
-            healed.setdefault("tapes", {})["request_body_b64"] = resolved_b64
+            healed["resolved_bodies"] = {"trigger_payload/0": resolved_b64}
             got = replay(healed)
             print(f"    resolved replay:   digest={got.get('replayed')} "
                   f"result={got.get('result')!r}")
