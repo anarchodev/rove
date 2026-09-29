@@ -2573,10 +2573,12 @@ bugs, minimizing change is the control, and a weekly worker release cannot
 provide it.
 
 That premise no longer holds. Backups carry each tenant's keyring
-(`architecture/backup-and-restore.md`), and a restore cannot resurrect a
-destroyed key because the store's `_keys/dead/{slot}` tombstones land before
-the shards and the keyring reconciles against them. A key-code bug now costs
-at most the keys minted since the last backup, not every key. The other
+(`architecture/backup-and-restore.md`), so a key-code bug now costs at most
+the keys minted since the last backup, not every key. The price is a bounded
+resurrection window rather than none: a run taken before a destroy holds the
+key and the data it sealed, so an erasure is complete only once every such
+run has aged out of retention. The store's `_keys/dead/{slot}` tombstones
+stop only an older keyring being paired with a newer store. The other
 arguments for a split had already failed: backfill cost does not exist once a
 peer hands over the tail, and confidentiality does not improve because every
 worker holds its tenants' complete key set in memory — moving the cluster KEK
