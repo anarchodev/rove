@@ -275,12 +275,21 @@ fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, op: bridge_mod.A
     // once so no lookup calls a not-yet-loaded key destroyed; the keyring
     // driver reloads from disk off this thread.
     if (std.mem.eql(u8, key, rjs.keyring.keyspace.MINTED_KEY)) {
+        node.deploy.tenant_files_lock.lock();
+        defer node.deploy.tenant_files_lock.unlock();
         if (node.deploy.tenant_files_map.get(id_str)) |slot| {
             if (slot.keyState()) |keys| keys.markStale();
         }
         return;
     }
     if (rjs.keyring.keyspace.parseDeadSlot(key)) |key_slot| {
+        // Under the slot lock, and counted: a keyring being opened while
+        // this applies is not reachable from the map yet, so its opener
+        // checks the count after publishing and reloads if it moved
+        // (`DeploymentCache.tombstones_applied`).
+        node.deploy.tenant_files_lock.lock();
+        defer node.deploy.tenant_files_lock.unlock();
+        _ = node.deploy.tombstones_applied.fetchAdd(1, .monotonic);
         if (node.deploy.tenant_files_map.get(id_str)) |slot| {
             if (slot.keyState()) |keys| keys.evictAndQueue(key_slot);
         }

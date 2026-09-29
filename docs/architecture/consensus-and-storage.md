@@ -627,6 +627,15 @@ nodes as **portable ciphertext** and nothing is decrypted in transit.
   only at a tenant's birth. Pulling on a key miss instead would make absence
   non-authoritative everywhere, reintroducing the invalidation class a
   complete cache removes.
+- **A destroy reaches a node that missed its entry.** The apply of a
+  `_keys/dead/{slot}` tombstone evicts the key from an open keyring. Two
+  ways around that apply are closed explicitly. A **streamed snapshot**
+  lands rows with no apply per entry, so its completion marks the tenant's
+  keyring stale, and the reload reconciles against the tombstones it
+  carried. A keyring **being opened** is not reachable from its slot until
+  published, so a tombstone applied between its open-time reconcile and its
+  publication is caught by a count of applied tombstones the publisher
+  re-checks once published (`DeploymentCache.tombstones_applied`).
 - `GET /_system/v2-keyring-status?tenant=T` reports a node's view: whether it
   holds a keyring, whether it can vouch for it, and how many keys it holds.
 

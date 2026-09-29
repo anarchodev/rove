@@ -1739,6 +1739,13 @@ pub fn drainSnapshotStreams(worker: anytype) !void {
         } else |_| {
             status = 500;
         }
+        // The stream landed rows in the tenant's store without an apply per
+        // entry, so a `_keys/dead/` tombstone it carried reached no keyring.
+        // An open keyring reloads and reconciles against the store now —
+        // else a node caught up by snapshot keeps a key destroyed while it
+        // was away. Whatever the status: a stream that failed part-way may
+        // still have committed some of its batches.
+        keyring_shard.markStale(&worker.node.deploy, box.tenant);
 
         // Stage the response + queue the move FIRST (fail-loud: a set/move on a
         // live in-collection entity only fails on OOM, which propagates). Detach

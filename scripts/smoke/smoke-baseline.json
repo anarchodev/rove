@@ -369,6 +369,11 @@
     "seconds": 0.0,
     "status": "pass"
   },
+  "keyring_snapshot_reconcile_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 40.0,
+    "status": "pass"
+  },
   "kv_cap_smoke_v2.py": {
     "rc": 0,
     "seconds": 4.9,

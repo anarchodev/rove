@@ -901,6 +901,14 @@ pub const DeploymentCache = struct {
     /// Values are where to pull from: the source cluster's node bases on a
     /// cross-cluster move, or null for this cluster's own peers.
     keyring_wanted: std.StringArrayHashMapUnmanaged(?[]u8) = .empty,
+    /// Count of `_keys/dead/` tombstones applied on this node, bumped under
+    /// `tenant_files_lock` by the apply observer. A keyring reconciles at
+    /// open, but it is published to its slot only afterwards; a tombstone
+    /// applied in between finds no keyring to evict from, and the open's
+    /// survey may have predated it. So whoever publishes a keyring reads
+    /// this before opening it and, holding the lock again once published,
+    /// marks the keyring stale if it moved — the reload reconciles.
+    tombstones_applied: std.atomic.Value(u64) = .init(0),
     keyring_wanted_lock: std.Thread.Mutex = .{},
 
 
@@ -1041,6 +1049,7 @@ pub const DeploymentCache = struct {
         // Slow path: open without holding the lock (libcurl + blob
         // backend init may do I/O). Re-check under the lock before
         // inserting — another worker may have raced ahead.
+        const tombstones_before = self.tombstones_applied.load(.monotonic);
         const opened = try openTenantSlotNode(self, inst);
         errdefer freeTenantSlot(self.allocator, opened);
 
@@ -1052,6 +1061,8 @@ pub const DeploymentCache = struct {
             return winner;
         }
         try self.tenant_files_map.put(self.allocator, opened.instance_id, opened);
+        if (self.tombstones_applied.load(.monotonic) != tombstones_before)
+            if (opened.keyState()) |keys| keys.markStale();
         return opened;
     }
 
