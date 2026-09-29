@@ -453,7 +453,10 @@ pub fn resolveSlot(
     // per-identity to per-tenant at exactly the moment a customer is under
     // load and least able to notice. An error the handler can see is the
     // only honest answer.
-    if (!try admitNewIdentity(worker, slot)) return error.NewIdentityRateLimited;
+    if (!try admitNewIdentity(worker, slot)) {
+        worker.identities_refused +%= 1;
+        return error.NewIdentityRateLimited;
+    }
 
     try ensurePool(worker, slot);
     // Never waits. The worker is a poll loop, so blocking here would
@@ -466,6 +469,7 @@ pub fn resolveSlot(
     // what every other node applies.
     try txn.put(bind_key, &value);
     try writeset.addPut(bind_key, &value);
+    worker.identities_new +%= 1;
     return got;
 }
 

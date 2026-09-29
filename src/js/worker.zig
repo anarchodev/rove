@@ -1885,6 +1885,12 @@ pub fn Worker(comptime opts: Options) type {
         /// throws a catchable JS Error{code:"rate_limited"} when
         /// exhausted.
         limiter: limiter_mod.RateLimiter,
+        /// New `shredKey` identities this worker bound, and refused at the
+        /// `new_identity` cap — node-wide, for the operator metrics. Which
+        /// tenant is in its own logs (the handler sees the refusal) and in
+        /// `v2-keyring-status`. Worker-thread only.
+        identities_new: u64 = 0,
+        identities_refused: u64 = 0,
         commit_wait_timeout_ns: u64,
         /// Borrowed from `WorkerConfig.plane`. Read by the publish door's
         /// credential gate; a listener's plane is fixed for the life of the

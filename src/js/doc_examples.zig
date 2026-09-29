@@ -3,7 +3,7 @@
 //! Executable-examples lint — the docs' teeth.
 //!
 //! Every code example a customer can copy — the ```js fences in
-//! `docs/handler-shape.md` and the `@example` blocks in the
+//! `docs/handler-shape.md` and `docs/guides/erasure.md`, and the `@example` blocks in the
 //! `globals/*.js` shim JSDoc — is checked in `zig build test`:
 //!
 //!   Gate A (all examples): compiles as a module. Syntax drift fails
@@ -43,6 +43,7 @@ const request_mod = @import("request.zig");
 const testing = std.testing;
 
 const HANDLER_SHAPE_MD = @embedFile("handler_shape_md");
+const ERASURE_GUIDE_MD = @embedFile("erasure_guide_md");
 
 // ── Gate B: retired spellings ───────────────────────────────────────
 //
@@ -99,7 +100,7 @@ const Example = struct {
 
 /// Collect ```js fenced blocks from markdown. Fences tagged
 /// ```js (doc-only) are collected with `doc_only = true`.
-fn collectMdFences(a: std.mem.Allocator, md: []const u8, out: *std.ArrayListUnmanaged(Example)) !void {
+fn collectMdFences(a: std.mem.Allocator, doc: []const u8, md: []const u8, out: *std.ArrayListUnmanaged(Example)) !void {
     var idx: usize = 0;
     var n: usize = 0;
     while (std.mem.indexOfPos(u8, md, idx, "```js")) |open| {
@@ -114,7 +115,7 @@ fn collectMdFences(a: std.mem.Allocator, md: []const u8, out: *std.ArrayListUnma
         const close = std.mem.indexOfPos(u8, md, line_end + 1, "\n```") orelse break;
         n += 1;
         try out.append(a, .{
-            .origin = try std.fmt.allocPrint(a, "handler-shape.md fence {d}", .{n}),
+            .origin = try std.fmt.allocPrint(a, "{s} fence {d}", .{ doc, n }),
             .src = md[line_end + 1 .. close + 1],
             .doc_only = doc_only,
         });
@@ -164,7 +165,8 @@ fn collectJsdocExamples(
 }
 
 fn collectAll(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(Example)) !void {
-    try collectMdFences(a, HANDLER_SHAPE_MD, out);
+    try collectMdFences(a, "handler-shape.md", HANDLER_SHAPE_MD, out);
+    try collectMdFences(a, "guides/erasure.md", ERASURE_GUIDE_MD, out);
     for (globals.GLOBALS_FILES) |g| {
         // schedule.js is the private `_system.sched` core; its @example blocks
         // show the customer verb, which is now the @rewind/schedule package

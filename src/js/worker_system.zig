@@ -382,6 +382,21 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
         worker.raft_pending_response.entitySlice().len + worker.raft_pending_cont.entitySlice().len + worker.raft_pending_stream.entitySlice().len,
     });
 
+    // ── shredKey identities (aggregate; no per-tenant labels) ─────────
+    //
+    // Every new identity is a key kept forever, so a climbing rate is a
+    // tenant using a per-request value as its shred key. The refusals are
+    // the cap doing its job; which tenant is in that tenant's own logs.
+    try w.print(
+        \\# HELP shred_identities_new_total new shredKey identities bound (each mints a key that is never reused).
+        \\# TYPE shred_identities_new_total counter
+        \\shred_identities_new_total {d}
+        \\# HELP shred_identities_refused_total new shredKey identities refused at the per-tenant new-identity cap.
+        \\# TYPE shred_identities_refused_total counter
+        \\shred_identities_refused_total {d}
+        \\
+    , .{ worker.identities_new, worker.identities_refused });
+
     // ── leader/follower role ──────────────────────────────────────────
     //
     // Helps an operator scraping a fleet tell which node is leader

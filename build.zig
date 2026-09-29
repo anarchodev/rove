@@ -918,6 +918,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "webhook_js", .path = "src/js/globals/webhook.js" },
         .{ .name = "textcodec_js", .path = "src/js/globals/textcodec.js" },
         .{ .name = "handler_shape_md", .path = "docs/handler-shape.md" },
+        .{ .name = "erasure_guide_md", .path = "docs/guides/erasure.md" },
         .{ .name = "request_js", .path = "src/js/globals/request.js" },
         .{ .name = "blob_js", .path = "src/js/globals/blob.js" },
         // THE factory invoker — one definition of the per-shim caps, shared
