@@ -2527,3 +2527,34 @@ The full argument, bench tables, and prior art:
   (§17.2). (Distinct from the JS engine's per-request arena regime, §4.12,
   which keeps its natural reset point — the request.)
 
+
+## 18. Crypto-shredding
+
+### 18.1 A tenant's raft WAL entries seal under a key derived from its keyring (2026-09-28)
+
+**Decision.** A tenant group's WAL entry data is sealed under
+`HKDF(tenant secret, "rove-crypt/wal/v1")`. A node that lacks the key
+**stalls** the group — it refuses the attach (503 `keyring pending`) and
+pulls the keyring — and never writes the entries in the clear. System groups
+(root, CP directory) stay plaintext. A cross-cluster move **transfers the
+keyring with the tenant**: the destination pulls it from the source nodes
+the CP names before it takes up the group. The only plaintext mode is a whole
+node with `REWIND_KEYRING_KEK` unset. Mechanism:
+`architecture/consensus-and-storage.md`, WAL sealing.
+
+**Rejected.**
+- *A stored per-tenant WAL key, or a key per segment.* A derived key is
+  shreddable exactly when its root is, and the root already exists, is
+  already replicated, and is already what deprovision destroys. A second
+  stored key is a second thing to replicate, back up, and forget to shred.
+- *Writing in the clear while the key is missing, or faulting the pump.*
+  The first makes the erasure claim hold only when nothing was in flight; the
+  second takes every tenant on the node down for one tenant's missing file.
+- *A per-tenant plaintext opt-out, for tests or otherwise.* A cluster whose
+  tenants differ on this has an erasure claim that depends on which tenant
+  you ask. Tests that want a plaintext WAL run a node with the keyring off.
+- *Sealing off the pump, to keep AES out of the append path.* Large sealed
+  appends under a Debug build lost their leader, but what that exposed was a
+  1 ms raft tick far tighter than production raft systems run; the fix was
+  the tick (10 ms, `architecture/raft-best-practices.md`), not moving the
+  seal.

@@ -249,6 +249,24 @@ pub const RefillDriver = struct {
 
     fn loop(self: *RefillDriver) void {
         while (!self.stopping.load(.acquire)) {
+            // A keyring this node must hold before it may take up a
+            // tenant's raft group comes first: the attach waiting on it is
+            // retried by the CP, and nothing else here can unblock it.
+            if (self.pull) |cfg| if (self.dc.takeWantedKeyring()) |want| {
+                defer want.deinit(self.allocator);
+                const tenant = want.tenant;
+                const got = if (want.from) |from|
+                    keyring_shard.pullFromUrls(self.allocator, cfg, tenant, from)
+                else
+                    keyring_shard.pullFromPeers(self.allocator, cfg, tenant);
+                if (got) |n| {
+                    std.log.info("keyring {s}: pulled from {d} peer(s) ahead of taking up its group", .{ tenant, n });
+                } else |err| std.log.warn(
+                    "keyring {s}: wanted before its group, and no peer supplied it: {s}",
+                    .{ tenant, @errorName(err) },
+                );
+                continue;
+            };
             const work = self.claim() orelse {
                 std.Thread.sleep(IDLE_SLEEP_NS);
                 continue;

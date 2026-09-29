@@ -55,8 +55,7 @@ A tenant's pairs are addressed by a store id derived from its **storage
 incarnation** — a random token minted at provision and recorded in the CP
 directory. A dump therefore only makes sense against a group attached under
 the same incarnation, which is why the manifest records it per tenant and why
-`restore` is a two-step operation: attach the tenant under the recorded
-incarnation, then stream.
+a restore streams into a group attached under the recorded incarnation.
 
 Two things enforce that rather than trusting it:
 
@@ -114,13 +113,24 @@ and its shard rewritten without it.
 
 That makes the restore **order** load-bearing rather than stylistic:
 
-    store dump first  →  the tombstones are present
-    keyring second    →  the first open reconciles against them
+    secret first      →  the node may attach the group (below)
+    store dump second →  the tombstones are present
+    shards third      →  the keyring reloads and reconciles against them
 
-`rewind-backup restore` does both in that order in one command. Reversing them
-would leave a window where the keyring is open and the tombstones are not yet
-there, and reconciliation does not re-run on its own. The interlock is pinned
-by a test in `tenant_keys.zig` that fails if reconciliation is skipped.
+`rewind-backup restore` does all three in that order in one command. Landing
+the shards before the store would leave a window where the keyring holds a
+key whose tombstone is not yet there. Each shard that lands marks an open
+keyring stale, so it reloads from disk and reconciles on its next use rather
+than trusting what it opened with. The interlock is pinned by a test in
+`tenant_keys.zig` that fails if reconciliation is skipped.
+
+The secret can go first because it names no identity key: it is destroyed
+only with the whole keyring, never by a tombstone. It has to go first because
+a node takes up a tenant's group only once it holds the keyring the group's
+WAL entries seal under (`consensus-and-storage.md`, WAL sealing) — so the
+attach a restore streams into is refused until the secret is there, and the
+restore waits for whoever places the tenant (the CP's reconciler, or the
+operator) to attach it.
 
 ## The directory says where a tenant belongs
 

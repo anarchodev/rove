@@ -1092,6 +1092,12 @@ fn cmdRestore(a: std.mem.Allocator, args: Args) !u8 {
         tenant, key, bytes.len, ent.object.get("incarnation").?.string,
     });
 
+    // The secret first, on every node: a node takes up a tenant's group only
+    // once it holds the keyring its WAL seals under, so the attach this
+    // restore streams into waits on it. The secret names no identity key,
+    // so landing it before the store's tombstones resurrects nothing.
+    if (try restoreSecret(a, &target.store, args.nodes, secret, tenant, prefix, ent) != 0) return 1;
+
     // `merge` — insert-if-absent, no baseline. The group this lands in was
     // attached empty, so merge and replace mean the same thing here, and
     // merge is the mode a push already carries: no baseline of ours can
@@ -1100,40 +1106,132 @@ fn cmdRestore(a: std.mem.Allocator, args: Args) !u8 {
     for (args.nodes) |base| {
         const url = try std.fmt.allocPrint(a, "{s}/_system/v2-snapshot-stream", .{base});
         defer a.free(url);
-        var resp = curl.cpRequest(a, .POST, url, bytes, .{
-            .headers = &.{
-                .{ .name = wire.MOVE_SECRET, .value = secret },
-                .{ .name = wire.TENANT, .value = tenant },
-                .{ .name = wire.SNAPSHOT_MODE, .value = "merge" },
-                .{ .name = "Content-Type", .value = "application/octet-stream" },
-            },
-            .timeout_ms = 20 * 60 * 1000,
-        }) catch |e| {
-            std.debug.print("  {s}: {s} — trying the next node\n", .{ base, @errorName(e) });
-            continue;
+        // The group is attached by whoever places the tenant — the CP's
+        // reconciler, or the operator — and that attach was refused until
+        // the secret above landed. Wait for it rather than fail.
+        const deadline = std.time.milliTimestamp() + ATTACH_WAIT_MS;
+        var waiting = false;
+        const status: u16 = while (true) {
+            var resp = curl.cpRequest(a, .POST, url, bytes, .{
+                .headers = &.{
+                    .{ .name = wire.MOVE_SECRET, .value = secret },
+                    .{ .name = wire.TENANT, .value = tenant },
+                    .{ .name = wire.SNAPSHOT_MODE, .value = "merge" },
+                    .{ .name = "Content-Type", .value = "application/octet-stream" },
+                },
+                .timeout_ms = 20 * 60 * 1000,
+            }) catch |e| {
+                std.debug.print("  {s}: {s} — trying the next node\n", .{ base, @errorName(e) });
+                break 0;
+            };
+            defer resp.deinit(a);
+            if (resp.status == 404 and std.time.milliTimestamp() < deadline and
+                std.mem.indexOf(u8, resp.body orelse "", "not attached") != null)
+            {
+                if (!waiting) std.debug.print("  {s}: waiting for {s}'s group to be attached\n", .{ base, tenant });
+                waiting = true;
+                std.Thread.sleep(ATTACH_POLL_MS * std.time.ns_per_ms);
+                continue;
+            }
+            if (resp.status != 200 and resp.status != 204)
+                std.debug.print("  {s}: {d} {s}\n", .{ base, resp.status, std.mem.trim(u8, resp.body orelse "", "\n") });
+            break resp.status;
         };
-        defer resp.deinit(a);
-        last = resp.status;
-        if (resp.status == 200 or resp.status == 204) {
+        if (status == 0) continue;
+        last = status;
+        if (status == 200 or status == 204) {
             std.debug.print("  store restored into {s}\n", .{base});
-            // The keyring goes in AFTER the store, and the order is the
-            // point: the store carries this tenant's `_keys/dead/`
-            // tombstones, and `TenantKeys.open` reconciles against them. Land
-            // the keys first and a destroyed key could come back — an erasure
-            // undone by a restore, which is the one thing a backup must not
-            // do (rove#592).
+            // The shards go in AFTER the store, and the order is the point:
+            // the store carries this tenant's `_keys/dead/` tombstones, and
+            // the keyring reconciles against them when it loads the shards.
+            // Land the shards first and a destroyed key could come back — an
+            // erasure undone by a restore, which is the one thing a backup
+            // must not do.
             return restoreKeyring(a, &target.store, base, secret, tenant, prefix, ent);
         }
-        std.debug.print("  {s}: {d} {s}\n", .{ base, resp.status, std.mem.trim(u8, resp.body orelse "", "\n") });
     }
     std.debug.print("restore of {s} FAILED (last status {d})\n", .{ tenant, last });
     return 1;
 }
 
-/// Land every keyring part the manifest names, on the node that just took the
-/// store. Any part failing fails the restore: a tenant missing one shard reads
-/// its own live data as erased, and the absence is authoritative — there is no
-/// later repair that notices.
+/// How long a restore waits for the tenant's group to be attached once its
+/// secret is in place: a reconciler retry or two, with room for an operator.
+const ATTACH_WAIT_MS: i64 = 120_000;
+const ATTACH_POLL_MS: u64 = 500;
+
+/// Land the tenant secret on every node the restore targets. A backup with
+/// no keyring restores nothing here; the attach then waits on a keyring that
+/// no one holds, which is the refusal it should be — a keyed cluster does
+/// not write a tenant's entries in the clear.
+fn restoreSecret(
+    a: std.mem.Allocator,
+    store: *blob.S3BlobStore,
+    nodes: []const []const u8,
+    secret: []const u8,
+    tenant: []const u8,
+    prefix: []const u8,
+    entry: std.json.Value,
+) !u8 {
+    const parts = entry.object.get("keyring_parts") orelse {
+        std.debug.print("  no keyring in this backup — a node with the keyring surface on will not attach {s}\n", .{tenant});
+        return 0;
+    };
+    for (parts.array.items) |pe| {
+        if (!std.mem.eql(u8, pe.object.get("part").?.string, "secret")) continue;
+        for (nodes) |base| {
+            if (try installPart(a, store, base, secret, tenant, prefix, "secret") != 0) return 1;
+        }
+        return 0;
+    }
+    std.debug.print("  keyring: the backup names shards but no secret\n", .{});
+    return 1;
+}
+
+/// POST one sealed keyring part from the backup store to `base`.
+fn installPart(
+    a: std.mem.Allocator,
+    store: *blob.S3BlobStore,
+    base: []const u8,
+    secret: []const u8,
+    tenant: []const u8,
+    prefix: []const u8,
+    part: []const u8,
+) !u8 {
+    const url = try std.fmt.allocPrint(a, "{s}/_system/v2-keyring-restore", .{base});
+    defer a.free(url);
+    const pkey = partKey(a, prefix, part);
+    defer a.free(pkey);
+    const sealed = store.blobStore().get(pkey, a) catch |e| {
+        std.debug.print("  keyring {s}: unreadable in the backup store: {s}\n", .{ part, @errorName(e) });
+        return 1;
+    };
+    defer a.free(sealed);
+    var resp = curl.cpRequest(a, .POST, url, sealed, .{
+        .headers = &.{
+            .{ .name = wire.MOVE_SECRET, .value = secret },
+            .{ .name = wire.TENANT, .value = tenant },
+            .{ .name = wire.KEYRING_PART, .value = part },
+            .{ .name = "Content-Type", .value = "application/octet-stream" },
+        },
+    }) catch |e| {
+        std.debug.print("  keyring {s} → {s}: {s}\n", .{ part, base, @errorName(e) });
+        return 1;
+    };
+    defer resp.deinit(a);
+    if (resp.status != 204) {
+        std.debug.print("  keyring {s} → {s}: {d} {s}\n", .{ part, base, resp.status, std.mem.trim(u8, resp.body orelse "", "\n") });
+        if (resp.status == 409)
+            std.debug.print("  (409 = sealed under a different cluster KEK than this cluster opens with)\n", .{});
+        return 1;
+    }
+    std.debug.print("  keyring {s} → {s}: installed ({d} bytes)\n", .{ part, base, sealed.len });
+    return 0;
+}
+
+/// Land every keyring shard the manifest names, on the node that just took
+/// the store (the secret is already on every node). Any shard failing fails
+/// the restore: a tenant missing one reads its own live data as erased, and
+/// the absence is authoritative — there is no later repair that notices.
 fn restoreKeyring(
     a: std.mem.Allocator,
     store: *blob.S3BlobStore,
@@ -1147,37 +1245,10 @@ fn restoreKeyring(
         std.debug.print("restored {s} into {s} (no keyring in this backup)\n", .{ tenant, base });
         return 0;
     };
-    const url = try std.fmt.allocPrint(a, "{s}/_system/v2-keyring-restore", .{base});
-    defer a.free(url);
-
     for (parts.array.items) |pe| {
         const part = pe.object.get("part").?.string;
-        const pkey = partKey(a, prefix, part);
-        defer a.free(pkey);
-        const sealed = store.blobStore().get(pkey, a) catch |e| {
-            std.debug.print("  keyring {s}: unreadable in the backup store: {s}\n", .{ part, @errorName(e) });
-            return 1;
-        };
-        defer a.free(sealed);
-        var resp = curl.cpRequest(a, .POST, url, sealed, .{
-            .headers = &.{
-                .{ .name = wire.MOVE_SECRET, .value = secret },
-                .{ .name = wire.TENANT, .value = tenant },
-                .{ .name = wire.KEYRING_PART, .value = part },
-                .{ .name = "Content-Type", .value = "application/octet-stream" },
-            },
-        }) catch |e| {
-            std.debug.print("  keyring {s}: {s}\n", .{ part, @errorName(e) });
-            return 1;
-        };
-        defer resp.deinit(a);
-        if (resp.status != 204) {
-            std.debug.print("  keyring {s}: {d} {s}\n", .{ part, resp.status, std.mem.trim(u8, resp.body orelse "", "\n") });
-            if (resp.status == 409)
-                std.debug.print("  (409 = sealed under a different cluster KEK than this cluster opens with)\n", .{});
-            return 1;
-        }
-        std.debug.print("  keyring {s}: installed ({d} bytes)\n", .{ part, sealed.len });
+        if (std.mem.eql(u8, part, "secret")) continue;
+        if (try installPart(a, store, base, secret, tenant, prefix, part) != 0) return 1;
     }
     std.debug.print("restored {s} into {s} — store + {d} keyring part(s)\n", .{ tenant, base, parts.array.items.len });
     return 0;

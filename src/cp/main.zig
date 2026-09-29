@@ -928,7 +928,7 @@ const Router = struct {
         defer std.crypto.secureZero(u8, &secret_raw);
         defer std.crypto.secureZero(u8, &secret_hex);
 
-        if (!move.attachToAll(self, birth_nodes, tenant, null, birth_voters, incarnation, &secret_hex)) {
+        if (!move.attachToAll(self, birth_nodes, tenant, null, birth_voters, incarnation, &secret_hex, null)) {
             move.evictAll(self, tenant, birth_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;
@@ -1736,7 +1736,15 @@ const Router = struct {
         // Minting a fresh one here would strand every byte the old key
         // sealed, which is data loss wearing the shape of a provisioning
         // step.
-        if (!move.attachToAll(self, dest_nodes, tenant, plan_blob, null, move_inc, null)) {
+        // The keyring rides alongside, node to node: the destination pulls
+        // it from the source cluster, whose nodes are the only ones holding
+        // it. The CP names them; it never carries key material.
+        const keyring_from = std.mem.join(a, ",", src_nodes) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        defer a.free(keyring_from);
+        if (!move.attachToAll(self, dest_nodes, tenant, plan_blob, null, move_inc, null, keyring_from)) {
             move.evictAll(self, tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;

@@ -50,7 +50,14 @@ pub fn clusterVoterIds(a: std.mem.Allocator, n: usize) ![]u64 {
 /// new home for an existing tenant, so its keyring arrives from a peer as
 /// KEK-sealed ciphertext rather than being re-minted (re-minting would
 /// strand every byte the old key sealed).
-pub fn attachToAll(router: anytype, dest_nodes: []const []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u64, incarnation: []const u8, secret: ?[]const u8) bool {
+///
+/// `keyring_from` names where that keyring is: on a CROSS-CLUSTER move, the
+/// source cluster's node bases, comma-separated (see
+/// `AttachEnvelope.keyring_from`). A destination that does not hold the
+/// keyring yet answers 503 "keyring pending" while it pulls one; that is
+/// retried here for `KEYRING_WAIT_MS`, since a node takes up a tenant's
+/// group only once it holds the keyring.
+pub fn attachToAll(router: anytype, dest_nodes: []const []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u64, incarnation: []const u8, secret: ?[]const u8, keyring_from: ?[]const u8) bool {
     const a = router.allocator;
     var enc = wire.encodeAttach(a, .{
         .tenant = tenant,
@@ -58,22 +65,37 @@ pub fn attachToAll(router: anytype, dest_nodes: []const []const u8, tenant: []co
         .plan = plan,
         .voters = birth_voters,
         .secret = secret,
+        .keyring_from = keyring_from,
     }) catch return false;
     defer enc.deinit();
     for (dest_nodes) |base| {
-        const resp = bc.call(router, base, "/_system/v2-attach", .POST, "", enc.headers) catch |err| {
-            std.log.warn("rewind-cp: v2-attach on {s} failed: {s}", .{ base, @errorName(err) });
-            return false;
-        };
-        var r = resp;
-        defer r.deinit(a);
-        if (r.status != 204) {
-            std.log.warn("rewind-cp: v2-attach on {s} → {d}", .{ base, r.status });
+        const deadline = std.time.milliTimestamp() + KEYRING_WAIT_MS;
+        while (true) {
+            const resp = bc.call(router, base, "/_system/v2-attach", .POST, "", enc.headers) catch |err| {
+                std.log.warn("rewind-cp: v2-attach on {s} failed: {s}", .{ base, @errorName(err) });
+                return false;
+            };
+            var r = resp;
+            defer r.deinit(a);
+            if (r.status == 204) break;
+            const pending = r.status == 503 and std.mem.startsWith(u8, r.body, "keyring pending");
+            if (pending and std.time.milliTimestamp() < deadline) {
+                std.Thread.sleep(KEYRING_POLL_MS * std.time.ns_per_ms);
+                continue;
+            }
+            std.log.warn("rewind-cp: v2-attach on {s} → {d}{s}", .{
+                base, r.status, if (pending) " (its keyring never arrived)" else "",
+            });
             return false;
         }
     }
     return true;
 }
+
+/// How long a destination may take to pull a keyring before its attach is
+/// given up on, and how often it is asked again meanwhile.
+const KEYRING_WAIT_MS: i64 = 60_000;
+const KEYRING_POLL_MS: u64 = 250;
 
 /// Poll every destination node's `/_system/v2-leader?tenant=…` until one
 /// reports 200 (the formed group elected a leader), bounded by a wall

@@ -426,6 +426,41 @@ tick → pass 1: processReady each ready group
 On a failed flush the persist acks are *retained, not sent*: no ack on the
 wire, commits stay locked, nothing claims durability for volatile bytes.
 
+### WAL sealing (a tenant's entries are ciphertext at rest)
+
+The WAL is one file per node with every tenant's entries interleaved, and it is
+the only place readsets live. A tenant keeps its last `snapshot_grace` entries
+uncompacted and a segment rolls only by size, so a quiet tenant's writes and
+reads would sit on disk in the clear with no time bound — and no file can be
+deleted for one tenant, because every file holds them all. So each tenant
+group's **entry data** is sealed (record tag 5, `sealed_entry`) under a subkey
+derived from that tenant's stored keyring secret
+(`HKDF(secret, "rove-crypt/wal/v1")`, `keyring/wal_seal.zig`). A derived key is
+shreddable exactly when its root is: destroying the keyring makes every entry
+the tenant ever wrote to any WAL unreadable at once, whichever segment holds
+it.
+
+- **What seals.** Only entry data. Framing, hard state and membership stay
+  plaintext, so a node never forgets its term or vote for want of a key. The
+  WAL itself (`raft-rs-zig`'s `SharedWal`) knows nothing about keys; the worker
+  installs a payload codec that resolves a group id to its owner.
+- **Which groups.** A tenant group seals. The root group and the CP's
+  directory group carry instance and domain rows, not customer data, and stay
+  plaintext. A group this node cannot attribute is neither: sealing refuses
+  rather than writing it in the clear.
+- **No key, no group.** A node takes up a tenant's group only once it holds
+  the tenant's keyring. A birth attach creates it from the CP's secret; any
+  other attach (a move destination, a voter added after birth, a restore)
+  answers **503 `keyring pending`**, asks the keyring driver to pull the
+  keyring (from the move's source nodes, named in `X-Rewind-Keyring-From`, or
+  else the tenant's voters), and the CP retries. At boot, a node pulls the
+  keyring of every group in its manifest whose keyring is missing before it
+  recovers them, because recovery must open what it sealed.
+- **The only plaintext mode is a whole node.** With `REWIND_KEYRING_KEK` unset
+  the keyring surface is off and nothing seals. There is no per-tenant opt-out:
+  a mixed cluster would be one whose erasure claim depends on which tenant you
+  ask.
+
 ## Durability, compaction & crash recovery
 
 Three mechanisms keep the WAL bounded and a restart correct:
@@ -520,7 +555,9 @@ SIGKILL escalation) fails loudly instead of vanishing into an unchecked
 A tenant is movable because it is a whole group. The DP-level mechanism (the
 zero-downtime move — the source serves throughout):
 
-- **attach** (destination, EMPTY): `clearTombstone` (migration is *intentional*
+- **attach** (destination, EMPTY — and only once the destination holds the
+  tenant's keyring, which the CP names the source nodes to pull from; see WAL
+  sealing above): `clearTombstone` (migration is *intentional*
   id reuse — raft-rs tombstones a destroyed id to block zombie messages, so an
   explicit lift is required), `createGroupEpoch` a fresh incarnation at the
   migration epoch on every destination node, drive to leader. No data rides

@@ -32,6 +32,10 @@ pub const INCARNATION = "x-rewind-incarnation";
 /// The tenant's keyring root secret, 64 lowercase hex, minted ONCE at
 /// birth. Present only on a birth attach; see `AttachEnvelope.secret`.
 pub const KEYRING_SECRET = "x-rewind-keyring-secret";
+/// Comma-separated HTTP bases of the nodes that hold a moving tenant's
+/// keyring (the source cluster's). Present only on a cross-cluster move
+/// attach; see `AttachEnvelope.keyring_from`.
+pub const KEYRING_FROM = "x-rewind-keyring-from";
 pub const PLAN = "x-rewind-plan";
 /// RETIRED (with the buffered bundle path + the atomic baseline attach): a
 /// joiner is born EMPTY and its state arrives raft-natively — log

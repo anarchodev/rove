@@ -210,17 +210,25 @@ def main() -> int:
         # Only if this passes does the assertion above mean sealing.
         r = c.get("acme", "/?fn=plain")
         check("control write → 200", r.status == 200, f"got {r.status} {r.body!r}")
+        # The raft WAL seals every tenant entry, so the only place an
+        # unsealed value lands in the clear is the tenant's store — and the
+        # store takes it when the overlay commits, not with the response.
+        # Poll, rather than read one instant's disk.
         control = b"pilchard-control-2b7e"
         found_control = []
-        for d in c.data_dirs:
-            for f in d.rglob("*"):
-                if not f.is_file():
-                    continue
-                try:
-                    if control in f.read_bytes():
-                        found_control.append(str(f))
-                except OSError:
-                    pass
+        deadline = time.time() + 20.0
+        while not found_control and time.time() < deadline:
+            for d in c.data_dirs:
+                for f in d.rglob("*"):
+                    if not f.is_file():
+                        continue
+                    try:
+                        if control in f.read_bytes():
+                            found_control.append(str(f))
+                    except OSError:
+                        pass
+            if not found_control:
+                time.sleep(1.0)
         check("CONTROL: an unsealed value IS findable on disk",
               bool(found_control),
               "the grep found nothing at all, so the check above proves nothing"

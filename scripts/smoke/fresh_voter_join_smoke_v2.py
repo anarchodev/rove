@@ -41,7 +41,7 @@ from pathlib import Path
 os.environ["REWIND_SNAPSHOT_GRACE"] = "20"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, attach_join  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET, attach_join, attach_retrying  # noqa: E402
 
 HANDLER_SRC = """\
 export function handler({ kv }) {
@@ -174,11 +174,14 @@ def main() -> int:
         # The reconciler's augmented ConfState: the leader's membership plus
         # this node as a learner.
         aug_learners = sorted(set(base.get("learners", [])) | {vnid})
+        # The wiped node lost the tenant's keyring with its data dir, so it
+        # refuses the group (503) until its keyring driver has pulled one
+        # from the peers — the CP's reconciler retries the same way.
         check("attach EMPTY → 204",
-              attach_join(url(victim, "v2-attach"), tenant="acme",
-                          epoch=base.get("epoch"), as_learner=True,
-                          voters=base.get("voters"), learners=aug_learners,
-                          incarnation=base.get("incarnation", "")) == "204")
+              attach_retrying(url(victim, "v2-attach"), tenant="acme",
+                              epoch=base.get("epoch"), as_learner=True,
+                              voters=base.get("voters"), learners=aug_learners,
+                              incarnation=base.get("incarnation", ""))() == "204")
         check("AddLearner → 204", confchange(lead, vnid, "add") == 204)
 
         print(f"step 5: ⭐ the auto-catchup streams the store onto the empty-born node {vnid}")

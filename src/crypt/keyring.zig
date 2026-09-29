@@ -1178,6 +1178,24 @@ pub fn installSealedSecret(
     try kr.writeRaw(path, sealed);
 }
 
+/// The tenant's secret, read from its sealed secret file alone — or null
+/// when this node holds no keyring for the tenant. Reads no shard, so it
+/// is cheap enough to call for every group a node recovers at boot.
+pub fn readTenantSecret(
+    allocator: std.mem.Allocator,
+    base_dir: []const u8,
+    tenant_id: []const u8,
+    kek: []const u8,
+) Error!?Secret {
+    var kr = try Keyring.init(allocator, base_dir, tenant_id, kek);
+    defer kr.deinit();
+    kr.readSecretFile() catch |err| switch (err) {
+        Error.NoKeyring => return null,
+        else => return err,
+    };
+    return kr.secret;
+}
+
 /// Read a shard's sealed bytes for sending to a peer, or null when the
 /// shard is empty. Caller frees.
 ///

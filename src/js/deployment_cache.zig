@@ -893,6 +893,17 @@ pub const DeploymentCache = struct {
     tenant_files_map: std.StringHashMapUnmanaged(*TenantSlot) = .empty,
     tenant_files_lock: std.Thread.Mutex = .{},
 
+    /// Tenants whose keyring this node needs before it may take up their
+    /// raft group — an attach refused for want of it (the WAL seals a
+    /// tenant's entries under a key derived from its keyring, and a group
+    /// with no key would have to write them in the clear). The keyring
+    /// driver drains it, pulling from every peer; the CP retries the attach.
+    /// Values are where to pull from: the source cluster's node bases on a
+    /// cross-cluster move, or null for this cluster's own peers.
+    keyring_wanted: std.StringArrayHashMapUnmanaged(?[]u8) = .empty,
+    keyring_wanted_lock: std.Thread.Mutex = .{},
+
+
     /// Content-addressed cache of bytecode blobs shared across every
     /// tenant snapshot on this node (deployment snapshots —
     /// `docs/architecture/deployment-and-logs.md`). Loader does `acquire(hash)` per
@@ -914,6 +925,42 @@ pub const DeploymentCache = struct {
     /// turned crypto-shredding on runs with.
     keyring_kek: ?[]const u8 = null,
     data_dir: ?[]const u8 = null,
+
+    /// Ask the keyring driver for `tenant`'s keyring — from `from` (the
+    /// source cluster's node bases, comma-separated) when given, else from
+    /// this cluster's peers. Idempotent per tenant.
+    pub fn wantKeyring(self: *DeploymentCache, tenant: []const u8, from: ?[]const u8) void {
+        self.keyring_wanted_lock.lock();
+        defer self.keyring_wanted_lock.unlock();
+        if (self.keyring_wanted.contains(tenant)) return;
+        const owned = self.allocator.dupe(u8, tenant) catch return;
+        const src: ?[]u8 = if (from) |f| (self.allocator.dupe(u8, f) catch {
+            self.allocator.free(owned);
+            return;
+        }) else null;
+        self.keyring_wanted.put(self.allocator, owned, src) catch {
+            self.allocator.free(owned);
+            if (src) |x| self.allocator.free(x);
+        };
+    }
+
+    pub const WantedKeyring = struct {
+        tenant: []u8,
+        from: ?[]u8,
+
+        pub fn deinit(self: WantedKeyring, allocator: std.mem.Allocator) void {
+            allocator.free(self.tenant);
+            if (self.from) |f| allocator.free(f);
+        }
+    };
+
+    /// Take one wanted keyring, owned by the caller, or null.
+    pub fn takeWantedKeyring(self: *DeploymentCache) ?WantedKeyring {
+        self.keyring_wanted_lock.lock();
+        defer self.keyring_wanted_lock.unlock();
+        const kv = self.keyring_wanted.pop() orelse return null;
+        return .{ .tenant = @constCast(kv.key), .from = kv.value };
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -946,6 +993,11 @@ pub const DeploymentCache = struct {
             while (it.next()) |entry| freeTenantSlot(self.allocator, entry.value_ptr.*);
             self.tenant_files_map.deinit(self.allocator);
         }
+        for (self.keyring_wanted.keys(), self.keyring_wanted.values()) |k, v| {
+            self.allocator.free(k);
+            if (v) |x| self.allocator.free(x);
+        }
+        self.keyring_wanted.deinit(self.allocator);
         // Bytecode cache must die AFTER every slot — slots release
         // their snapshots' leases through the cache on free. Once the
         // slots are freed above, every snapshot the node ever held has

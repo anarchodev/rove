@@ -120,6 +120,13 @@ pub fn pumpOnce(self: anytype) Error!bool {
             self.faultTenant(item.gid);
             continue;
         }
+        if (self.birth_gate) |gate| if (self.node.groups.get(item.gid) == null and !gate.allow(gate.ctx, item.id_str)) {
+            self.refused_birth_count +%= 1;
+            if (self.refused_birth_count == 1 or self.refused_birth_count % 1000 == 0)
+                std.log.warn("v2 bridge propose gid={d} ({s}): no keyring on this node — group not born, faulted ({d} total)", .{ item.gid, item.id_str, self.refused_birth_count });
+            self.faultTenant(item.gid);
+            continue;
+        };
         _ = self.node.ensureGroup(item.gid, item.id_str) catch |e| {
             std.log.warn("v2 bridge ensureGroup gid={d}: {s}", .{ item.gid, @errorName(e) });
             self.faultTenant(item.gid);

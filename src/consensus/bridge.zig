@@ -309,9 +309,14 @@ const ProposeItem = struct {
     payload: []u8,
 };
 
+pub const BirthGate = struct {
+    ctx: *anyopaque,
+    allow: *const fn (ctx: *anyopaque, id_str: []const u8) bool,
+};
+
 pub const Bridge = struct {
     /// Config surface the worker reads as `worker.raft.config.node_id` —
-    /// single-node default 1.
+    /// this node's raft id, taken from the node at `init` (single-node: 1).
     pub const Config = struct { node_id: u32 = 1 };
 
     allocator: std.mem.Allocator,
@@ -426,6 +431,15 @@ pub const Bridge = struct {
     /// a sustained climb means clients keep aiming writes at a non-member
     /// (a wiped voter mid-heal, or stale routing). Pump-thread only.
     unhosted_propose_count: u64 = 0,
+    /// Whether a single-node propose may birth its group on first sight.
+    /// Null: always. The worker installs one that refuses a tenant whose
+    /// keyring is not on this node, because the WAL seals that group's
+    /// entries under a key derived from it — a group born without it could
+    /// only fail every append, and an append failure faults the whole pump.
+    /// Pump thread only, and only for a group not yet hosted.
+    birth_gate: ?BirthGate = null,
+    /// Refused births, for a rate-limited warn.
+    refused_birth_count: u64 = 0,
     /// A tenant id whose group is pinned ALWAYS-active (`Node.pinActive`)
     /// on EVERY creation path — control-inbox create (birth, v2-attach)
     /// and `recoverGroups` alike. Set before `startPump`. The worker sets
@@ -490,7 +504,12 @@ pub const Bridge = struct {
         // re-draw on the (2^-64) collision.
         var origin: u64 = 0;
         while (origin == 0) origin = std.crypto.random.int(u64);
-        self.* = .{ .allocator = allocator, .node = node, .origin_id = origin };
+        self.* = .{
+            .allocator = allocator,
+            .node = node,
+            .origin_id = origin,
+            .config = .{ .node_id = @intCast(node.node_id) },
+        };
         // The worker-overlay commit hooks are one atomic config (apply_mode is
         // flipped later by setWorkerOverlay; apply_observer / store_resolver are
         // installed independently for the CP directory + follower serving store).
@@ -1576,6 +1595,50 @@ test "bridge: propose → pumpOnce commits → committedSeq advances, read sees 
     try testing.expectEqualStrings("hello-bridge", got);
 }
 
+test "bridge: a birth gate that refuses leaves the group unborn and faults the propose" {
+    // A single-node propose births its group on first sight — unless the
+    // gate says the group could not seal its entries here. Then the write
+    // faults (the worker answers 503) and no group exists to fail appends.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const bridge = try Bridge.initSingleNode(a, dir);
+    defer bridge.deinit();
+    const Refuse = struct {
+        fn allow(_: *anyopaque, id_str: []const u8) bool {
+            return !std.mem.eql(u8, id_str, "keyless");
+        }
+    };
+    var dummy: u8 = 0;
+    bridge.birth_gate = .{ .ctx = &dummy, .allow = Refuse.allow };
+
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "v");
+
+    const refused = try bridge.registerTenant("keyless");
+    const env_r = try encodeWs(a, "keyless", &ws);
+    defer a.free(env_r);
+    const seq_r = try bridge.propose(refused, env_r);
+
+    const allowed = try bridge.registerTenant("keyed");
+    const env_a = try encodeWs(a, "keyed", &ws);
+    defer a.free(env_a);
+    const seq_a = try bridge.propose(allowed, env_a);
+
+    var spins: u32 = 0;
+    while (spins < 200 and (bridge.faultedSeq(refused) < seq_r or bridge.committedSeq(allowed) < seq_a)) : (spins += 1) {
+        _ = try bridge.pumpOnce();
+    }
+    try testing.expectEqual(seq_r, bridge.faultedSeq(refused));
+    try testing.expect(bridge.node.groups.get(refused) == null);
+    // The pump is unharmed: a tenant the gate allows still commits.
+    try testing.expectEqual(seq_a, bridge.committedSeq(allowed));
+}
+
 test "bridge: exec stamps are term-fenced — refused before a published term, strictly increasing after" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -1898,6 +1961,9 @@ test "Phase 5c: 3-bridge cluster replicates via the leader; a follower propose i
         };
     }
     if (!(alive[0] and alive[1] and alive[2])) return error.SkipZigTest;
+    // Each bridge reports its own raft id: the keyring push and pull skip
+    // `config.node_id` as "self", so a default here drops a real peer.
+    for (0..3) |i| try std.testing.expectEqual(@as(u32, @intCast(i + 1)), bridges[i].config.node_id);
 
     // Every node derives the SAME gid for the tenant.
     const gid = try bridges[0].registerTenant("t");

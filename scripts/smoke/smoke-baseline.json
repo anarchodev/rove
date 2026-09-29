@@ -839,6 +839,11 @@
     "seconds": 10.3,
     "status": "pass"
   },
+  "wal_seal_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 17.0,
+    "status": "pass"
+  },
   "webhook_recovery_smoke_v2.py": {
     "rc": 0,
     "seconds": 8.9,

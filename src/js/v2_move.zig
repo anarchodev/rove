@@ -561,6 +561,26 @@ fn handleAttach(
         }
     }
 
+    // The WAL seals a tenant's entries under a key derived from its keyring,
+    // so a node takes up a tenant's group only once it holds that keyring:
+    // a group with no key could only write its entries in the clear, or
+    // refuse them and fault the pump. A birth attach created it just above;
+    // a move or repair attach waits for a peer's copy — ask the keyring
+    // driver for it and refuse, and the CP's reconciler retries.
+    if (!is_root) if (worker.keyring_kek) |kek| if (worker.data_dir) |dd| {
+        const kdir = try keyring_shard.keyringDir(allocator, dd);
+        defer allocator.free(kdir);
+        const present = crypt.keyring.readTenantSecret(allocator, kdir, tenant, kek) catch null;
+        if (present) |sec_bytes| {
+            var s = sec_bytes;
+            std.crypto.secureZero(u8, &s);
+        } else {
+            worker.node.deploy.wantKeyring(tenant, dec.keyring_from);
+            std.log.info("v2-attach {s}: keyring not on this node yet — pulling it; the attach will be retried", .{tenant});
+            return reply(server, allocator, ent, sid, sess, 503, "keyring pending\n");
+        }
+    };
+
     const gid = worker.raft.registerTenant(tenant) catch
         return reply(server, allocator, ent, sid, sess, 500, "register failed\n");
     // Every attach births the group EMPTY at the sender's epoch, carrying the
@@ -686,6 +706,9 @@ fn handleEvict(
         worker.raft.destroyGroup(gid) catch
             return reply(server, allocator, ent, sid, sess, 500, "group destroy failed\n");
     }
+    // The group is gone from this node, so its WAL key has nothing left to
+    // seal or open here — and must not outlive a shredded keyring in memory.
+    if (worker.wal_seal) |ws| ws.forget(tenant);
     // The tenant-level (C1) shred, and ONLY when this eviction ends the
     // tenant's lifetime. A move's source cleanup evicts the very same way
     // while the tenant carries on serving elsewhere, so destroying its
@@ -1854,11 +1877,15 @@ pub fn armBackup(
 /// under this node's KEK before anything lands: an unverified install poisons
 /// a node silently and surfaces at a failover.
 ///
-/// Restore ORDER matters and the tool enforces it: the store dump goes first,
-/// so the tenant's `_keys/dead/` tombstones are present before the keyring is
-/// opened. `TenantKeys.open` reconciles against them, which is what stops a
-/// restore from resurrecting a key a crypto-shred destroyed — the erasure
-/// claim in docs (rove#592) depends on that ordering holding.
+/// Restore ORDER matters and the tool enforces it: the secret first, since a
+/// node attaches a tenant's group only once it holds the keyring its WAL
+/// seals under; then the store dump, so the tenant's `_keys/dead/`
+/// tombstones are present; then the shards, whose landing marks an open
+/// keyring stale so it reloads and reconciles against those tombstones. That
+/// reconcile is what stops a restore from resurrecting a key a crypto-shred
+/// destroyed (`docs/architecture/backup-and-restore.md`, why a restore cannot
+/// undo an erasure). The secret carries no identity keys, so it can precede
+/// the tombstones.
 pub fn handleKeyringRestore(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -1918,6 +1945,9 @@ pub fn handleKeyringRestore(
         std.log.warn("v2-keyring-restore {s} part={s}: install failed: {s}", .{ tenant, part, @errorName(err) });
         return reply(server, allocator, ent, sid, sess, status, "keyring install failed\n");
     };
+    // An open keyring reloads from disk, and reconciles against the
+    // tombstones the store dump already landed.
+    keyring_shard.markStale(&worker.node.deploy, tenant);
 
     try reply(server, allocator, ent, sid, sess, 204, "");
 }
