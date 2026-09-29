@@ -110,4 +110,5 @@ commit when one opens or closes. Find them live:
 
 - [self-host.md](guides/self-host.md) — run the V2 stack on your own hosts: build, env, example systemd units, cluster bring-up
 - [activitypub-tutorial.md](guides/activitypub-tutorial.md) — ActivityPub bot in ~30 lines
+- [erasure.md](guides/erasure.md) — erase a person's data with `shredKey`: what it seals, what it cannot reach (key names, tags, URLs), and the backup window
 - [testing.md](guides/testing.md) — test handlers offline with `rewind test`: the `_tests/*.mjs` saga surface (`scenario`/`expect`, held-resume folds, WS, snapshots)
