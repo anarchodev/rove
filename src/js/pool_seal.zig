@@ -60,7 +60,7 @@ pub const Sealed = struct {
 /// This node's key state for `instance_id`, or null.
 fn keysFor(worker: anytype, instance_id: []const u8) ?*keyring_mod.TenantKeys {
     const slot = worker.node.deploy.tenant_files_map.get(instance_id) orelse return null;
-    return slot.keys;
+    return slot.keyState();
 }
 
 /// This tenant's body-pool key, or null when this node holds no keyring.

@@ -1045,7 +1045,7 @@ pub const DeploymentCache = struct {
         self.tenant_files_lock.lock();
         defer self.tenant_files_lock.unlock();
         const slot = self.tenant_files_map.get(tenant_id) orelse return .unverified;
-        const keys = slot.keys orelse return .unverified;
+        const keys = slot.keyState() orelse return .unverified;
         return keys.openBody(allocator, sealed_body, wrap);
     }
 
