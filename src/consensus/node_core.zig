@@ -170,11 +170,18 @@ pub const DEFAULT_AUTO_DEMOTE_NS: i64 = 5 * std.time.ns_per_s;
 /// timeout?" unanswerable. Gating the tick on a fixed monotonic interval
 /// decouples it: `tickGroups` fires at most once per `tick_interval_ns`
 /// regardless of loop speed, so `election_tick × tick_interval_ns` is a stable,
-/// justifiable number. The default is a ~1ms idle cadence while also CAPPING
-/// the rate under load; raise it
-/// (env `REWIND_RAFT_TICK_MS`) once a soak has measured the broadcast-time +
-/// pause-jitter tail this must clear (see docs/architecture/raft-best-practices.md).
-pub const DEFAULT_TICK_NS: i64 = 1 * std.time.ns_per_ms;
+/// justifiable number.
+///
+/// 10ms puts the defaults in the industry band — heartbeat ≈ 30ms, election
+/// timeout ≈ 100–200ms (`election_tick = 10`, raft's 1×–2× randomization) —
+/// rather than an order of magnitude inside it. The margin is what a leader's
+/// pump spends on real work between heartbeats: an fsync tail, scheduler
+/// preemption, and per-entry work the pump does in proportion to entry size,
+/// none of which may be mistaken for a dead leader. Failover is bounded by the
+/// same number, and a sub-second leaderless window is well inside the SLO for
+/// dedicated nodes. `REWIND_RAFT_TICK_MS` overrides it; the sizing procedure
+/// and soak are in docs/architecture/raft-best-practices.md.
+pub const DEFAULT_TICK_NS: i64 = 10 * std.time.ns_per_ms;
 
 /// Resolves the store a replicated entry applies to, keyed by the
 /// envelope's tenant id string. Two callers need it:

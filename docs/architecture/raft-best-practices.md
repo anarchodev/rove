@@ -81,12 +81,15 @@ so the wall-clock election timeout = `election_tick × tick_interval`. The pump
 used to tick once per loop *cycle*, coupling the timeout to load (faster when
 idle, slower under a write burst + fsync) — which makes "what is our election
 timeout?" unanswerable. `node.tick_interval_ns` now gates the tick at a fixed
-monotonic interval (env `REWIND_RAFT_TICK_MS`, default 1ms), so
+monotonic interval (env `REWIND_RAFT_TICK_MS`, default 10ms), so
 `election_tick × tick_interval` is a real, stable number. Without this, nothing
 below is meaningful.
 
-Defaults today: `election_tick=10`, `heartbeat_tick=3`, tick=1ms ⇒ **election
-timeout ≈ 10–20ms** (raft randomizes 1×–2×), **heartbeat ≈ 3ms**.
+Defaults: `election_tick=10`, `heartbeat_tick=3`, tick=10ms ⇒ **election
+timeout ≈ 100–200ms** (raft randomizes 1×–2×), **heartbeat ≈ 30ms** — the
+Raft-paper / etcd band. The earlier 1ms tick (≈ 10–20ms / 3ms) sat an order of
+magnitude inside every mainstream default, where one slow pump cycle — a
+large entry's per-byte work on an unoptimized build — reads as a dead leader.
 
 ### The three quantities (and how to read each one here)
 
@@ -104,9 +107,9 @@ timeout ≈ 10–20ms** (raft randomizes 1×–2×), **heartbeat ≈ 3ms**.
 - Keep raft's `[T, 2T]` randomization; make sure lockstep `tickGroups` doesn't
   collapse it (the thundering-herd note above).
 
-Today's defaults violate both guides: the ratio is `10:3 ≈ 3.3:1` (vs the 5:1
-raft-rs / 10:1 etcd norm), and ~15ms sits inside a realistic fsync/scheduler
-tail. That's the case for widening — see the soak result.
+The heartbeat ratio is still `10:3 ≈ 3.3:1` (vs the 5:1 raft-rs / 10:1 etcd
+norm); the absolute values moved into the band with the 10ms default tick, which
+is what the soak result below supported.
 
 ### Validate empirically — the soak (`scripts/smoke/raft_soak_v2.py`)
 
@@ -137,7 +140,7 @@ spurious elections at BOTH the default ~15–20ms timeout AND
 `REWIND_RAFT_TICK_MS=10` (~100–300ms), at identical throughput.** So widening to
 the etcd / Raft-paper band is *free* here and buys pause-tail margin.
 
-→ **Recommendation: set `REWIND_RAFT_TICK_MS=10` in prod** (election ≈ 100–300ms,
+→ **Adopted as the binary default (10ms tick)** (election ≈ 100–300ms,
 heartbeat ≈ 30ms — the industry band), then run a *multi-hour* soak on the actual
 BHS hardware before locking it. Caveats on the dev result: single box (all 3
 nodes + the load generator share one CPU = *more* scheduler contention than the
@@ -155,7 +158,7 @@ cluster-bound.
 | HashiCorp raft (Consul/Nomad/Vault) | 1000ms | 1000ms (+500ms leader lease) |
 | TiKV (raft-rs — same engine) | ~2s | ~10s |
 | MongoDB | 2s | 10s |
-| **rove (today, default tick)** | **~3ms** | **~15–20ms** |
+| **rove (default 10ms tick)** | **~30ms** | **~100–200ms** |
 
 The rule every implementation encodes: **heartbeat ≈ network RTT; election ≈ 10×
 heartbeat; both ≫ broadcastTime and ≪ MTBF.** rove is currently an order of
