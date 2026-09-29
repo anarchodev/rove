@@ -2558,3 +2558,46 @@ node with `REWIND_KEYRING_KEK` unset. Mechanism:
   1 ms raft tick far tighter than production raft systems run; the fix was
   the tick (10 ms, `architecture/raft-best-practices.md`), not moving the
   seal.
+
+### 18.2 Keys stay in the worker; there is no separate KMS artifact (2026-09-28)
+
+**Decision.** The keyring store, its shard replication, and the sealing code
+stay in the worker binary. There is no separate key-management service with
+its own release train.
+
+**Why.** The argument that once justified the split was that key material is
+the one thing with no recovery path: a restorable keyring is a resurrectable
+key, so keys got no backups, and a corrupting bug in key code meant
+permanently unreadable customer data. When the only defense is not having
+bugs, minimizing change is the control, and a weekly worker release cannot
+provide it.
+
+That premise no longer holds. Backups carry each tenant's keyring
+(`architecture/backup-and-restore.md`), and a restore cannot resurrect a
+destroyed key because the store's `_keys/dead/{slot}` tombstones land before
+the shards and the keyring reconciles against them. A key-code bug now costs
+at most the keys minted since the last backup, not every key. The other
+arguments for a split had already failed: backfill cost does not exist once a
+peer hands over the tail, and confidentiality does not improve because every
+worker holds its tenants' complete key set in memory — moving the cluster KEK
+out of the worker's environment protects disk residue, not a compromised
+worker.
+
+Meanwhile the worker's use of keys has deepened: the raft pump seals WAL
+entries under a key derived from each tenant's secret (§18.1), a node takes
+up a tenant's group only once it holds the keyring, and boot pulls missing
+keyrings before group recovery. A separate service would put key
+availability on the worker's boot and append paths.
+
+**Rejected.**
+- *A separate KMS binary on its own release cadence.* Cost — an RPC boundary,
+  a skewed-version compatibility contract, and a boot dependency — without
+  the benefit that justified it.
+- *KMS on separate machines.* Buys no-backup enforcement by machine boundary,
+  which the keyring backup has deliberately given up.
+
+**What would reopen it.** Evidence that the recovery path does not cover the
+real failure: key-corrupting defects that also reach every retained backup,
+or a recovery-point window for keys that is unacceptable and cannot be
+tightened by backing keyrings up more often (they are small, and restore
+already refuses to resurrect destroyed keys).
