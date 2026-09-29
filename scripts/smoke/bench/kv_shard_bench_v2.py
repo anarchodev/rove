@@ -54,6 +54,9 @@ Env:
     DIRECT=0          1 = drive the node ports directly (each tenant at its
                       group's leader), bypassing the front's 4-leg upstream
                       pool (see above)
+    KEYRING=1         0 = run the nodes with the keyring surface off, so no
+                      tenant WAL entry or tape is sealed — the A/B for what
+                      crypto-shredding costs the write path
     BALANCE=0         1 = rebalance group leadership across nodes before the
                       load starts (DIRECT multi-node only) — provisioning
                       births every group on one node, and an unbalanced run
@@ -84,6 +87,7 @@ DIRECT = os.environ.get("DIRECT", "0") not in ("", "0")
 # balance is reached by repeatedly shedding one group from the most-loaded
 # node until no node leads more than ceil(TENANTS/NODES).
 BALANCE = os.environ.get("BALANCE", "0") not in ("", "0")
+KEYRING = os.environ.get("KEYRING", "1") not in ("", "0")
 REQUESTS = int(sys.argv[1]) if len(sys.argv) > 1 else 20000
 CLIENTS = int(sys.argv[2]) if len(sys.argv) > 2 else 10
 STREAMS = int(sys.argv[3]) if len(sys.argv) > 3 else 10
@@ -134,15 +138,32 @@ def batch_occupancy(c: V2Cluster) -> tuple[float, float]:
     return total_count, (total_sum / total_count if total_count else 0.0)
 
 
+def wal_sealed_share(data_dir: Path) -> tuple[int, int]:
+    """Count entry records (tag 1 plain, tag 5 sealed) in a node's WAL:
+    `[tag:u8][group:u64][len:u32][payload][crc:u32]`."""
+    sealed = plain = 0
+    for p in sorted(Path(data_dir).glob("raft-wal*")):
+        wal, off = p.read_bytes(), 0
+        while off + 13 <= len(wal):
+            tag = wal[off]
+            plen = int.from_bytes(wal[off + 9:off + 13], "little")
+            if tag not in (1, 2, 3, 4, 5) or off + 13 + plen + 4 > len(wal):
+                break
+            sealed += tag == 5
+            plain += tag == 1
+            off += 13 + plen + 4
+    return sealed, sealed + plain
+
+
 def main() -> int:
     print(f"=== sharded write throughput: {TENANTS} tenants × {NODES} nodes "
-          f"× {WORKERS} worker(s) ===")
+          f"× {WORKERS} worker(s), keyring {'ON' if KEYRING else 'OFF'} ===")
     print(f"    n={REQUESTS} c={CLIENTS} m={STREAMS} per tenant, "
           + ("DIRECT to the node port (front's 4-leg pool bypassed)"
              if DIRECT else "through the front door (≤4 upstream legs per node)"))
     tenants = [f"write{i}" for i in range(TENANTS)]
 
-    with V2Cluster.spawn("kvshard", nodes=NODES) as c:
+    with V2Cluster.spawn("kvshard", nodes=NODES, keyring=KEYRING) as c:
         for t in tenants:
             c.provision(t)
             if NODES > 1:
@@ -260,6 +281,11 @@ def main() -> int:
         # entries.
         print("  (1.00 means the dispatch walk never coalesced — the state "
               "before the admission-reserve fix)")
+        # What the keyring switch actually did to the WAL, read off node 1's
+        # files: a sealed-entry share of 0 under KEYRING=1 would mean this
+        # run measured nothing it claims to.
+        sealed, total = wal_sealed_share(c.data_dirs[0])
+        print(f"  node 1 WAL: {sealed}/{total} entry records sealed")
 
         # A req/s number with a wall of non-2xx behind it is worse than no
         # number: it reads as throughput and measures a refusal path.
