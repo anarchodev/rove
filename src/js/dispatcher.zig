@@ -793,6 +793,11 @@ fn finishResponse(
                         // per-identity erasure and cannot have it.
                         state.pending_kv_error = err;
                     };
+                    // The activation's payloads seal under this identity at
+                    // capture (`pool_seal.sealReadsetPayloads`), which is
+                    // after the last of them is appended — several capture
+                    // paths append theirs once the handler has returned.
+                    if (state.readset) |rs| rs.shred_slot = key_slot;
                 }
             }
         }

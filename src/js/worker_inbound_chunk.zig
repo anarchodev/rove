@@ -32,6 +32,8 @@
 
 const std = @import("std");
 const blob_mod = @import("rove-blob");
+const crypt = @import("rove-crypt");
+const pool_seal = @import("pool_seal.zig");
 
 /// Per-fire payload bound. Queued arrivals concatenate/slice into
 /// fires up to this size.
@@ -68,6 +70,9 @@ pub const Prepared = struct {
     /// it names no object, which is the same shape an inline fire has,
     /// so the STATE is the discriminator here and never the ref.
     ref: blob_mod.coordinator.BodyRef = .none,
+    /// The wrapped data key for `ref`'s bytes, minted with the seal at
+    /// submit. Recorded on the tape entry beside the ref.
+    body_key: [pool_seal.WRAPPED_LEN]u8 = pool_seal.NO_WRAP,
 };
 
 pub const Job = struct {
@@ -87,6 +92,11 @@ pub const Job = struct {
     /// arm time. Rides into the pool object's header with every payload
     /// this job spills, so a sweep can attribute those bytes.
     tenant_hash: u64,
+    /// The tenant's body-pool key, resolved once at arm time where the
+    /// instance id is in scope. Null when this node holds no keyring for
+    /// the tenant, and then a spill FAILS rather than submitting
+    /// plaintext (`pool_seal`).
+    tenant_body_key: ?crypt.Key,
 
     chunks: std.ArrayListUnmanaged(Chunk) = .empty,
     /// Total bytes accepted from the wire.
@@ -131,6 +141,7 @@ pub const Job = struct {
         cap: u64,
         inline_threshold: usize,
         tenant_hash: u64,
+        tenant_body_key: ?crypt.Key,
     ) error{OutOfMemory}!*Job {
         const self = try allocator.create(Job);
         self.* = .{
@@ -138,6 +149,7 @@ pub const Job = struct {
             .cap = cap,
             .inline_threshold = inline_threshold,
             .tenant_hash = tenant_hash,
+            .tenant_body_key = tenant_body_key,
         };
         return self;
     }
@@ -150,6 +162,8 @@ pub const Job = struct {
         for (self.prepared.items) |p| self.allocator.free(p.bytes);
         self.prepared.deinit(self.allocator);
         if (self.last_fired) |lf| self.allocator.free(lf.bytes);
+        // Key material does not outlive its use in freed memory.
+        if (self.tenant_body_key) |*k| crypt.wipe(k);
         self.allocator.destroy(self);
     }
 
@@ -372,10 +386,13 @@ pub const Sink = struct {
 /// Stand-in tenant hash for tests: it rides to the coordinator, which is
 /// not exercised here.
 const T_TENANT: u64 = 0xA11CE;
+/// A body-pool key for the tests: a job with none refuses to spill,
+/// which is the behaviour these tests are not about.
+const TEST_TENANT_KEY: crypt.Key = [_]u8{0x31} ** crypt.KEY_LEN;
 
 test "job: accumulate → single-fire prepare" {
     const a = std.testing.allocator;
-    const j = try Job.create(a, 1024, 16 * 1024, T_TENANT);
+    const j = try Job.create(a, 1024, 16 * 1024, T_TENANT, TEST_TENANT_KEY);
     defer j.unref(); // worker ref
     defer j.unref(); // sink ref (test holds both)
     try std.testing.expect(j.sinkPush("hello "));
@@ -399,7 +416,7 @@ test "job: accumulate → single-fire prepare" {
 
 test "job: cap crossover pipelines prepared fires with repay-on-resolve" {
     const a = std.testing.allocator;
-    const j = try Job.create(a, 8, 4, T_TENANT); // inline threshold 4 to exercise .unsubmitted
+    const j = try Job.create(a, 8, 4, T_TENANT, TEST_TENANT_KEY); // inline threshold 4 to exercise .unsubmitted
     defer j.unref();
     defer j.unref();
     try std.testing.expect(j.sinkPush("12345678")); // == cap: accumulating
@@ -437,7 +454,7 @@ test "job: cap crossover pipelines prepared fires with repay-on-resolve" {
 
 test "job: kill drains everything" {
     const a = std.testing.allocator;
-    const j = try Job.create(a, 4, 16 * 1024, T_TENANT);
+    const j = try Job.create(a, 4, 16 * 1024, T_TENANT, TEST_TENANT_KEY);
     defer j.unref();
     defer j.unref();
     try std.testing.expect(j.sinkPush("123456")); // crosses cap (accumulate-accepted)

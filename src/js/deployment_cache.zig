@@ -1031,6 +1031,24 @@ pub const DeploymentCache = struct {
         return keys.openValue(allocator, value);
     }
 
+    /// `openSealedValue`'s twin for a pool body and the wrap its tape
+    /// entry carries. The lock is held ACROSS the open for the same
+    /// reason: `evictTenant` frees the slot the instant it leaves the map.
+    pub fn openPoolBody(
+        self: *DeploymentCache,
+        allocator: std.mem.Allocator,
+        tenant_id: []const u8,
+        sealed_body: []const u8,
+        wrap: []const u8,
+    ) !keyring_mod.keyspace.Opened {
+        if (wrap.len == 0) return .plaintext;
+        self.tenant_files_lock.lock();
+        defer self.tenant_files_lock.unlock();
+        const slot = self.tenant_files_map.get(tenant_id) orelse return .unverified;
+        const keys = slot.keyState() orelse return .unverified;
+        return keys.openBody(allocator, sealed_body, wrap);
+    }
+
     /// Drop a tenant's cached slot — its loaded bundle, bytecode map and
     /// resolved plan. Called when the tenant is torn down (`v2-evict`).
     ///

@@ -75,6 +75,10 @@ pub const keyring_pool = @import("keyring_pool.zig");
 pub const keyring_shard = @import("keyring_shard.zig");
 /// One tenant's key state and the `_keys/` keyspace (`rove-keyring`).
 pub const keyring = @import("rove-keyring");
+/// Sealing a body on its way into the cross-tenant pool, and refusing to
+/// spill when this node cannot vouch for the tenant's key material
+/// (`pool_seal.zig`).
+pub const pool_seal = @import("pool_seal.zig");
 /// Per-tenant slot state, including the keyring (`deployment_cache.zig`).
 pub const deployment_cache = @import("deployment_cache.zig");
 pub const DeploymentLoader = deployment_loader.DeploymentLoader;
@@ -169,6 +173,7 @@ test {
     _ = @import("static_cache.zig");
     _ = @import("blob_usage.zig");
     _ = @import("keyring_slots.zig");
+    _ = @import("pool_seal.zig");
     _ = @import("keyring_pool.zig");
     _ = @import("deploy_thread.zig");
     _ = @import("doc_examples.zig");

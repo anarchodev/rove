@@ -96,6 +96,26 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # when you are editing a branch of that repo alongside this one.
 APPS_DIR = Path(os.environ.get("REWIND_APPS_DIR") or (REPO_ROOT / "web"))
 
+# The route `door_log_get` reads through, and the module that answers it:
+# a tenant fetching its own logs over `rewind-logs.internal`, which is the
+# worker's logs door. Deploy `DOOR_PROBE_FILES` alongside a fixture to read
+# that tenant's payloads opened. Its own requests are logged like any
+# other, under this path — skip them when scanning for a record.
+DOOR_PROBE_ROUTE = "logdoor"
+DOOR_PROBE_FILES = {
+    f"{DOOR_PROBE_ROUTE}/index.mjs": (
+        "export default function ({ after, next }) {\n"
+        "  const p = new URLSearchParams(request.query || \"\").get(\"p\") || \"\";\n"
+        "  after.fetch(\"http://rewind-logs.internal/v1/\" + request.tenant + \"/\" + p);\n"
+        "  return next();\n"
+        "}\n"
+        "export function onFetchResult() {\n"
+        "  response.status = 200;\n"
+        "  return \"status:\" + (request.status || 0) + \"\\n\" + (request.text || \"\");\n"
+        "}\n"
+    ),
+}
+
 
 def require_apps_dir() -> Path:
     """`APPS_DIR`, or exit naming the fix.
@@ -903,6 +923,30 @@ class V2Cluster:
         return _curl(f"{self.log_url()}/v1/{subpath}",
                      headers={"Authorization": f"Bearer {token}"},
                      timeout=timeout)
+
+    def door_log_get(self, subpath: str, *, timeout: float = 30.0) -> HttpResponse:
+        """GET a log route THROUGH the worker's logs door — the path every real
+        consumer takes (the `rewind` CLI and the dashboard, via the admin app's
+        `/v1/logs/*`, which fetches `rewind-logs.internal`).
+
+        Use this for anything that reads a PAYLOAD out of a record: payloads
+        are sealed at rest (`src/keyring/body_seal.zig`) and only the door
+        opens them. `log_get` goes straight to the log-server, holds no keys,
+        and so returns ciphertext — exactly what a smoke asserting "the stored
+        bytes are sealed" wants as its control, and nothing else does.
+
+        The tenant must have `DOOR_PROBE_FILES` deployed: the door serves a
+        tenant its OWN logs, so the read has to come from inside it. Same
+        `subpath` shape as `log_get` (`{tenant}/show/{rid}`)."""
+        import urllib.parse
+        tenant, _, rest = subpath.partition("/")
+        r = self.request(tenant, f"/{DOOR_PROBE_ROUTE}?p=" + urllib.parse.quote(rest, safe=""),
+                         timeout=timeout)
+        if r.status != 200:
+            return r
+        head, _, body = r.body.partition("\n")
+        status = int(head.split(":", 1)[1]) if head.startswith("status:") else 0
+        return HttpResponse(status=status, body=body, headers={})
 
     # ── provisioning + deploy ──────────────────────────────────────────
     def provision(self, tenant: str, *, host: Optional[str] = None,

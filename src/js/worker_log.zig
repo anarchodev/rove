@@ -30,6 +30,7 @@ const log_server_mod = @import("rove-log-server");
 const jwt_mod = @import("rove-jwt");
 const blob_mod = @import("rove-blob");
 const tape_mod = @import("rove-tape");
+const pool_seal = @import("pool_seal.zig");
 const bodies_mod = @import("rove-bodies");
 const tenant_mod = @import("rove-tenant");
 
@@ -180,8 +181,8 @@ pub fn mintRequestId(
 // arenajs's per-context state by the dispatcher (`JS_SetRandomSeed` +
 // `JS_SetDateNow`).
 
-/// Body-size threshold for inlining `request_body` / `activation_bytes`
-/// directly into the LogRecord (vs leaving the caller to retrieve via
+/// Body-size threshold for carrying a payload inline on its tape entry
+/// in the LogRecord (vs leaving the caller to retrieve via
 /// the readset's BodyRef on demand).
 ///
 /// Matches `worker_dispatch.INBOUND_INLINE_THRESHOLD` (16 KB) — the
@@ -270,7 +271,7 @@ pub fn dropPartialDigest(readset: *tape_mod.Readset) void {
 pub fn captureTapes(
     worker: anytype,
     readset: *tape_mod.Readset,
-    request_body: []const u8,
+    instance_id: []const u8,
 ) log_mod.TapePayloads {
     const allocator = worker.allocator;
 
@@ -279,6 +280,13 @@ pub fn captureTapes(
     // raft-entry serialization on the success path runs after this,
     // so both copies agree). The body's STORAGE is untouched.
     readset.elideUnreadBody();
+
+    // Seal the activation's payloads — here, because every capture path
+    // has appended its last one by now, and both copies of the readset
+    // (this flushed record, and the raft entry serialized after it) must
+    // carry them sealed. It fails closed rather than record plaintext
+    // (`pool_seal.sealReadsetPayloads`).
+    pool_seal.sealReadsetPayloads(worker, readset, instance_id);
 
     var payloads: log_mod.TapePayloads = .{
         .seed = readset.seed,
@@ -304,11 +312,9 @@ pub fn captureTapes(
         .{ .tape = &readset.fetch_responses, .out = &payloads.fetch_responses_tape_bytes },
         .{ .tape = &readset.trigger_payload, .out = &payloads.trigger_payload_tape_bytes },
         .{ .tape = &readset.request_reads, .out = &payloads.request_reads_tape_bytes },
-        // NOT `readset.activation`: its two values reach the flushed record as
-        // the record's own `activation_bytes` / `export_name` fields, which
-        // every offline reader already resolves. That channel exists to make
-        // the RAFT ENTRY self-sufficient for a rebuild — flushing a second
-        // encoding of the same values would add a blob nobody reads.
+        // The activation's Msg (a WS frame, a wake bag) rides this tape on the
+        // record as on the raft entry, sealed like every other payload.
+        .{ .tape = &readset.activation, .out = &payloads.activation_tape_bytes },
     };
 
     for (channels) |ch| {
@@ -342,63 +348,6 @@ pub fn captureTapes(
         }
     }
 
-    // Request body — captured into the log record so the replay
-    // shell's `request.body` is non-empty for POST / PUT requests.
-    // Bodies ≤ `REQUEST_BODY_CAP` (16 KB) ride inline; larger bodies
-    // are NOT inlined here. They live in BlobBackend via the
-    // readset's `trigger_payload` BodyRef; the dashboard / replay
-    // fetches on demand. `request_body_truncated` is never set on
-    // this path (large bodies are absent, not truncated).
-    //
-    // Response body is intentionally NOT captured: deterministic
-    // replay re-produces the response by re-running the handler with
-    // the same request body + tapes, so storing the original would
-    // be pure duplication on every S3 batch PUT.
-    // Read-taping gate: only a body the handler actually read is
-    // captured (the `request.body` getter flips `body_read`). An
-    // unread body is absent from the record entirely — that's the
-    // data-minimization contract, not an oversight.
-    if (readset.body_read and request_body.len > 0 and request_body.len <= REQUEST_BODY_CAP) {
-        if (allocator.dupe(u8, request_body)) |captured| {
-            payloads.request_body_bytes = captured;
-        } else |err| {
-            std.log.warn("rove-js request-body capture failed: {s}", .{@errorName(err)});
-        }
-    }
-
-    return payloads;
-}
-
-/// `captureTapes` + activation-input bytes capture. Used by
-/// activations whose Msg payload carries bytes the handler reads as
-/// `request.activation.bytes` — today only `fetch_chunk`. Same inline
-/// rule as `request_body`: bytes ≤ `REQUEST_BODY_CAP` (16 KB) ride
-/// inline in `TapePayloads.activation_bytes`; larger chunks live in
-/// BlobBackend via the readset's `fetch_responses` BodyRef and are
-/// fetched on demand. L3 (algebra): every Msg is recorded (the BodyRef
-/// IS the record for the >16 KB case).
-///
-/// TODO(read-taping): `activation_bytes` is still captured
-/// unconditionally. Read-flagging it (like `request.body`) needs a
-/// keep-entry-drop-bytes partial elision — the `fetch_responses`
-/// entry doubles as the activation EVENT record (seq/final/status
-/// must survive even when bytes go unread) — plus a Uint8Array
-/// getter into the activation object. Deferred; see decisions.md
-/// (read-taped request surface).
-pub fn captureTapesWithActivation(
-    worker: anytype,
-    readset: *tape_mod.Readset,
-    request_body: []const u8,
-    activation_bytes: []const u8,
-) log_mod.TapePayloads {
-    var payloads = captureTapes(worker, readset, request_body);
-    if (activation_bytes.len == 0 or activation_bytes.len > REQUEST_BODY_CAP) return payloads;
-    const allocator = worker.allocator;
-    if (allocator.dupe(u8, activation_bytes)) |captured| {
-        payloads.activation_bytes = captured;
-    } else |err| {
-        std.log.warn("rove-js activation-bytes capture failed: {s}", .{@errorName(err)});
-    }
     return payloads;
 }
 
@@ -406,11 +355,10 @@ pub fn captureTapesWithActivation(
 /// resolved export, and the Msg for the kinds that keep it here (the wake
 /// batch's wakes JSON, the WS frame's `[opcode][data]`).
 ///
-/// This is the half that rides the RAFT ENTRY. `TapePayloads.export_name` and
-/// `.activation_bytes` reach only the flushed S3 record, so a hop whose leader
-/// died between propose and flush was rebuilt with an empty wakes bag and
-/// dispatched to the CONVENTIONAL export — a different handler run wearing the
-/// same request id (the promotion walker,
+/// The same tape rides the RAFT ENTRY and the flushed record, so a hop whose
+/// leader dies between propose and flush is rebuilt with its wakes bag and its
+/// resolved export rather than an empty bag through the CONVENTIONAL export — a
+/// different handler run wearing the same request id (the promotion walker,
 /// `docs/architecture/deployment-and-logs.md`).
 ///
 /// `msg_len` is the Msg's TRUE length — 0 for the kinds whose Msg rides
@@ -446,7 +394,7 @@ fn recordActivation(
 /// milliseconds (the JS-facing encoding — `fired_at_ns` is internal).
 /// An empty batch emits `[]` (never ""), so a taped wake_batch record
 /// explicitly says "empty batch" and the L3 guard can read an empty
-/// `activation_bytes` as "not recorded".
+/// `activation` tape as "not recorded".
 pub fn wakesToJson(
     allocator: std.mem.Allocator,
     wakes: []const components_mod.WakeEntry,
@@ -490,8 +438,8 @@ pub fn wakesToJson(
 
 /// Record a `wake_batch` activation's Msg — the drained fired-watch batch
 /// (follow-on to the fired-prefix contract) — so a wake
-/// resume is replayable. The batch tapes as `activation_bytes` (the wakes
-/// JSON, always at least `[]`); `ctx_body` is the `{"ctx":…}` envelope →
+/// resume is replayable. The batch tapes on the `activation` channel (the
+/// wakes JSON, always at least `[]`); `ctx_body` is the `{"ctx":…}` envelope →
 /// trigger_payload (→ `request.ctx`); `export_name` is the resolved wake
 /// export when the arm carried an `{on}` override (G3 — replay must
 /// invoke the same export), "" when the default `onWake` applies.
@@ -502,6 +450,7 @@ pub fn wakesToJson(
 pub fn captureWakeBatchTapes(
     worker: anytype,
     readset: *tape_mod.Readset,
+    instance_id: []const u8,
     ctx_body: []const u8,
     wakes: []const components_mod.WakeEntry,
     export_name: []const u8,
@@ -523,6 +472,7 @@ pub fn captureWakeBatchTapes(
         readset.trigger_payload.appendTriggerPayload(
             bodies_mod.BodyRef.carried(@intCast(ctx_body.len)),
             if (ctx_body.len <= REQUEST_BODY_CAP) ctx_body else "",
+            "",
         ) catch |err| {
             std.log.warn("rove-js wake-ctx capture failed: {s}", .{@errorName(err)});
         };
@@ -530,14 +480,14 @@ pub fn captureWakeBatchTapes(
     }
     const json = wakesToJson(allocator, wakes) catch |err| {
         std.log.warn("rove-js wake-batch tape serialize failed: {s}", .{@errorName(err)});
-        return captureTapes(worker, readset, ctx_body);
+        return captureTapes(worker, readset, instance_id);
     };
     defer allocator.free(json);
     // The bag + the resolved export ride the raft entry, not just the flushed
     // record: a writing wake hop whose leader dies before the flush is rebuilt
     // from the entry alone, and both have to survive that.
     recordActivation(readset, export_name, json.len, json);
-    var payloads = captureTapesWithActivation(worker, readset, ctx_body, json);
+    var payloads = captureTapes(worker, readset, instance_id);
     if (export_name.len > 0) {
         payloads.export_name = allocator.dupe(u8, export_name) catch &.{};
     }
@@ -562,6 +512,7 @@ pub fn captureWakeBatchTapes(
 pub fn captureSendCallbackTapes(
     worker: anytype,
     readset: *tape_mod.Readset,
+    instance_id: []const u8,
     envelope: []const u8,
     export_name: []const u8,
 ) log_mod.TapePayloads {
@@ -570,6 +521,7 @@ pub fn captureSendCallbackTapes(
         readset.trigger_payload.appendTriggerPayload(
             bodies_mod.BodyRef.carried(@intCast(envelope.len)),
             if (envelope.len <= REQUEST_BODY_CAP) envelope else "",
+            "",
         ) catch |err| {
             std.log.warn("rove-js send-callback envelope capture failed: {s}", .{@errorName(err)});
         };
@@ -579,7 +531,7 @@ pub fn captureSendCallbackTapes(
     // for the resolved export alone — which a rebuilt record needs just as
     // much (G3).
     recordActivation(readset, export_name, 0, "");
-    var payloads = captureTapes(worker, readset, envelope);
+    var payloads = captureTapes(worker, readset, instance_id);
     if (export_name.len > 0) {
         payloads.export_name = allocator.dupe(u8, export_name) catch &.{};
     }
@@ -623,7 +575,7 @@ pub const FetchEvent = struct {
 pub fn captureFetchChunkTapes(
     worker: anytype,
     readset: *tape_mod.Readset,
-    ctx_body: []const u8,
+    instance_id: []const u8,
     ev: FetchEvent,
 ) log_mod.TapePayloads {
     // A content-addressed chunk records its Msg BY REFERENCE, not by value —
@@ -666,13 +618,14 @@ pub fn captureFetchChunkTapes(
         ev.headers,
         if (fate == .carried) ev.bytes else "",
         if (fate == .referenced) ev.content_hash else "",
+        "",
     ) catch |err| {
         std.log.warn("rove-js fetch-event capture failed: {s}", .{@errorName(err)});
     };
     // The Msg rides `fetch_responses` above, so this entry exists for the
     // resolved export alone — which a rebuilt record needs just as much (G3).
     recordActivation(readset, ev.export_name, 0, "");
-    var payloads = captureTapes(worker, readset, ctx_body);
+    var payloads = captureTapes(worker, readset, instance_id);
     // Record the resolved export (G3) — owned, freed by TapePayloads.deinit.
     if (ev.export_name.len > 0) {
         payloads.export_name = worker.allocator.dupe(u8, ev.export_name) catch &.{};
@@ -681,15 +634,15 @@ pub fn captureFetchChunkTapes(
 }
 
 /// Record an inbound WS frame (`ws_message`'s Msg) so `onMessage` is
-/// replayable. The frame is `request.activation = {opcode, data}`; taped as
-/// `activation_bytes = [opcode:u8][data]` (inline ≤ `REQUEST_BODY_CAP`). `ctx`
+/// replayable. The frame is `request.activation = {opcode, data}`; taped on the
+/// `activation` channel as `[opcode:u8][data]` (inline ≤ `REQUEST_BODY_CAP`). `ctx`
 /// rides trigger_payload. Small frames replay offline; a frame over the cap has
 /// no home — too big for the raft entry, and a WS activation owns no durability
 /// park — so it records its LENGTH on the `activation` channel and no bytes.
 pub fn captureWsFrameTapes(
     worker: anytype,
     readset: *tape_mod.Readset,
-    ctx_body: []const u8,
+    instance_id: []const u8,
     opcode: u8,
     data: []const u8,
 ) log_mod.TapePayloads {
@@ -702,17 +655,17 @@ pub fn captureWsFrameTapes(
         // indistinguishable from an activation with no Msg, which replays as
         // an empty frame that looks like real data.
         recordActivation(readset, "", data.len + 1, "");
-        return captureTapes(worker, readset, ctx_body);
+        return captureTapes(worker, readset, instance_id);
     }
-    const framed = allocator.alloc(u8, 1 + data.len) catch return captureTapes(worker, readset, ctx_body);
+    const framed = allocator.alloc(u8, 1 + data.len) catch return captureTapes(worker, readset, instance_id);
     defer allocator.free(framed);
     framed[0] = opcode;
     @memcpy(framed[1..], data);
-    // Both halves: the raft entry (for a walker-rebuilt record) and the
-    // flushed record's `activation_bytes`. `onMessage` is conventional, so
-    // there is no resolved export to carry.
+    // The one `activation` tape carries it to both the raft entry (for a
+    // walker-rebuilt record) and the flushed record. `onMessage` is
+    // conventional, so there is no resolved export to carry.
     recordActivation(readset, "", framed.len, framed);
-    return captureTapesWithActivation(worker, readset, ctx_body, framed);
+    return captureTapes(worker, readset, instance_id);
 }
 
 /// L3 capture-time guard (`effect-algebra.md` §2.3 — *every Msg is a recorded
@@ -743,16 +696,16 @@ pub fn l3MissingChannel(
             "fetch_responses (the fetch result)"
         else
             null,
-        .ws_message => if (tapes.activation_bytes.len == 0)
-            "activation_bytes (the WS frame)"
+        .ws_message => if (tapes.activation_tape_bytes.len == 0)
+            "activation (the WS frame)"
         else
             null,
         // The drained fired-watch batch is the wake's Msg.
-        // `captureWakeBatchTapes` always emits at least `[]`, so an
-        // empty `activation_bytes` here means the capture was skipped,
+        // `captureWakeBatchTapes` always records at least `[]`, so an
+        // empty `activation` tape here means the capture was skipped,
         // never "the batch was empty".
-        .wake_batch => if (tapes.activation_bytes.len == 0)
-            "activation_bytes (the wake batch)"
+        .wake_batch => if (tapes.activation_tape_bytes.len == 0)
+            "activation (the wake batch)"
         else
             null,
         // A send_callback's Msg is the `{"ctx":…}` body
@@ -981,7 +934,7 @@ fn captureLogInner(
         if (raw > 1024 * 1024) {
             std.log.warn(
                 "log-ingest: tenant={s} {s} {s} charged {d} bytes in one record (body={d} kv={d} fetch={d} reads={d})",
-                .{ instance_id, method, path, raw, tapes.request_body_bytes.len, tapes.kv_tape_bytes.len, tapes.fetch_responses_tape_bytes.len, tapes.request_reads_tape_bytes.len },
+                .{ instance_id, method, path, raw, tapes.trigger_payload_tape_bytes.len, tapes.kv_tape_bytes.len, tapes.fetch_responses_tape_bytes.len, tapes.request_reads_tape_bytes.len },
             );
         }
         worker.limiter.charge(
@@ -1320,6 +1273,7 @@ test "captureFetchChunkTapes: an unretained chunk keeps its length, not a zero" 
         "",
         if (fate == .carried) big else "",
         "",
+        "",
     );
 
     const e = readset.fetch_responses.entries.items[0].fetch_responses;
@@ -1345,6 +1299,7 @@ test "captureWakeBatchTapes: the bag + resolved export ride the readset (rove#19
     var tapes = captureWakeBatchTapes(
         .{ .allocator = a },
         &readset,
+        "acme",
         "{\"ctx\":{\"armed\":true}}",
         &wakes,
         "onFired",
@@ -1354,8 +1309,12 @@ test "captureWakeBatchTapes: the bag + resolved export ride the readset (rove#19
     try testing.expectEqual(@as(usize, 1), readset.activation.entries.items.len);
     const e = readset.activation.entries.items[0].activation;
     try testing.expectEqualStrings("onFired", e.export_name);
-    try testing.expectEqualStrings(tapes.activation_bytes, e.inline_bytes);
-    try testing.expectEqual(@as(u32, @intCast(tapes.activation_bytes.len)), e.body_ref.len);
+    try testing.expect(std.mem.startsWith(u8, e.inline_bytes, "[{\"kind\":\"kv\""));
+    try testing.expectEqual(@as(u32, @intCast(e.inline_bytes.len)), e.body_ref.len);
+    // And the flushed record carries the same tape the raft entry does.
+    var pa = try tape_mod.parse(a, tapes.activation_tape_bytes);
+    defer pa.deinit();
+    try testing.expectEqualStrings(e.inline_bytes, pa.entries[0].activation.inline_bytes);
 }
 
 test "captureWsFrameTapes: an over-the-cap frame keeps its length, not a zero" {
@@ -1371,10 +1330,9 @@ test "captureWsFrameTapes: an over-the-cap frame keeps its length, not a zero" {
     defer a.free(data);
     @memset(data, 'x');
 
-    var tapes = captureWsFrameTapes(.{ .allocator = a }, &readset, "{\"ctx\":null}", 0x1, data);
+    var tapes = captureWsFrameTapes(.{ .allocator = a }, &readset, "acme", 0x1, data);
     defer tapes.deinit(a);
 
-    try testing.expectEqual(@as(usize, 0), tapes.activation_bytes.len);
     try testing.expectEqual(@as(usize, 1), readset.activation.entries.items.len);
     const e = readset.activation.entries.items[0].activation;
     try testing.expectEqual(@as(u32, @intCast(data.len + 1)), e.body_ref.len);
@@ -1394,7 +1352,7 @@ test "l3MissingChannel: fires on empty fetch_chunk/ws_message, exempts errors + 
     fr.fetch_responses_tape_bytes = "x";
     try testing.expect(l3MissingChannel(.fetch_chunk, .ok, fr) == null);
     var ab = log_mod.TapePayloads{};
-    ab.activation_bytes = "x";
+    ab.activation_tape_bytes = "x";
     try testing.expect(l3MissingChannel(.ws_message, .ok, ab) == null);
 
     // An errored activation may legitimately not tape.
@@ -1406,7 +1364,7 @@ test "l3MissingChannel: fires on empty fetch_chunk/ws_message, exempts errors + 
 
     // A wake_batch's Msg is the fired-watch batch —
     // `captureWakeBatchTapes` always tapes at least `[]`, so empty
-    // activation_bytes on a successful wake IS a missed capture.
+    // activation tape on a successful wake IS a missed capture.
     try testing.expect(l3MissingChannel(.wake_batch, .ok, empty) != null);
     try testing.expect(l3MissingChannel(.wake_batch, .ok, ab) == null);
     try testing.expect(l3MissingChannel(.wake_batch, .handler_error, empty) == null);

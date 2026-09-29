@@ -2229,6 +2229,13 @@ pub fn build(b: *std.Build) void {
         "scripts/ops/globals_lint.py",
         "scripts/ops/reserved_header_lint.py",
         "scripts/ops/spdx_lint.py",
+        // The tape format's JS mirror lives in the pinned `web` submodule,
+        // which this build cannot compile — so nothing but this lint stands
+        // between a wire-format bump here and a decoder one version behind
+        // there, whose symptom is a replay DIVERGENCE rather than a version
+        // mismatch. `src/rewind/version.zig` states the lockstep rule; this
+        // is what keeps it.
+        "scripts/ops/tape_mirror_lint.py",
         "scripts/ops/tenant_prefix_lint.py",
         "scripts/ops/test_reachability_lint.py",
     };

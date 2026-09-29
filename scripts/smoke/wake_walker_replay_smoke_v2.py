@@ -66,7 +66,7 @@ os.environ["REWIND_WORKERS"] = "1"
 os.environ["REWIND_LOG_FLUSH_INTERVAL_MS"] = str(3_600_000)  # 1h — effectively never
 os.environ["REWIND_LOG_FLUSH_RECORDS"] = str(RECORD_THRESHOLD)
 
-from smoke_lib_v2 import V2Cluster, MOVE_SECRET, _curl  # noqa: E402
+from smoke_lib_v2 import V2Cluster, MOVE_SECRET, _curl, DOOR_PROBE_FILES  # noqa: E402
 from replay_matrix_smoke_v2 import find_record, replay  # noqa: E402
 
 # The wake arm names a NON-conventional export, so the resolved export is part
@@ -108,7 +108,7 @@ def main() -> int:
         r = c.provision(TENANT)
         check("provision → 200/409", r.status in (200, 409), f"{r.status} {r.body!r}")
         c.wait_for_membership(TENANT, voters=3)
-        c.deploy_handlers(TENANT, FIXTURE)
+        c.deploy_handlers(TENANT, {**FIXTURE, **DOOR_PROBE_FILES})
         c.wait_for_handler(TENANT, "/?op=ready", want_body="ok", timeout_s=30.0)
 
         # ── The target: a WRITING wake resume, held in RAM ──
@@ -173,7 +173,7 @@ def main() -> int:
 
         tapes = (rec or {}).get("tapes", {}) or {}
         check("recovered record carries the wakes bag (activation channel → raft)",
-              bool(tapes.get("activation_bytes_b64")),
+              bool(tapes.get("activation_tape_b64")),
               f"tape keys={sorted(tapes.keys())}")
         check("recovered record carries the resolved export (G3)",
               tapes.get("export") == "onFired", f"export={tapes.get('export')!r}")
