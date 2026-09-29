@@ -48,7 +48,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import smoke_lib_v2  # noqa: E402
-from smoke_lib_v2 import V2Cluster, MOVE_SECRET, attach_join, BIN_DIR, _curl  # noqa: E402
+from smoke_lib_v2 import V2Cluster, MOVE_SECRET, attach_join, attach_retrying, BIN_DIR, _curl  # noqa: E402
 
 BACKUP_BIN = os.path.join(BIN_DIR, "rewind-backup")
 TENANT = "acme"
@@ -183,11 +183,12 @@ def main() -> int:
 
     print("leg B: restore into a cluster that never had this tenant")
     with V2Cluster.spawn("krdst", nodes=1) as b:
-        check("attach under the recorded incarnation",
-              attach_join(f"{b.node_url(0)}/_system/v2-attach", tenant=TENANT,
-                          incarnation=incarnation) == "204")
+        # The restore lands the secret first; the attach waits on it.
+        attached = attach_retrying(f"{b.node_url(0)}/_system/v2-attach", tenant=TENANT,
+                                   incarnation=incarnation)
         rc, _ = backup_tool("restore", "--run", RUN_ID,
                             "--tenant", TENANT, "--nodes", b.node_url(0))
+        check("attach under the recorded incarnation", attached() == "204")
         check("restore", rc == 0)
 
         restored = keyring_files(keyring_dir(b.data_dirs[0], TENANT))
@@ -206,11 +207,12 @@ def main() -> int:
     smoke_lib_v2.KEYRING_KEK = "a-different-cluster-kek-0123456789abcdef"
     try:
         with V2Cluster.spawn("krkek", nodes=1) as c:
-            check("attach on the foreign-KEK cluster",
-                  attach_join(f"{c.node_url(0)}/_system/v2-attach", tenant=TENANT,
-                              incarnation=incarnation) == "204")
             rc, out = backup_tool("restore", "--run", RUN_ID,
                                   "--tenant", TENANT, "--nodes", c.node_url(0))
+            # No keyring it can open landed, so it never takes the group up.
+            check("the foreign-KEK cluster refuses to attach the tenant",
+                  attach_join(f"{c.node_url(0)}/_system/v2-attach", tenant=TENANT,
+                              incarnation=incarnation, discard_body=True) == "503")
             check("restore FAILS", rc != 0)
             check("refused with 409, not written", "409" in out,
                   "no 409 in the tool's output")

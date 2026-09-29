@@ -1331,6 +1331,10 @@ pub const WorkerConfig = struct {
     /// tenant id, which is what lets replication ship bytes verbatim.
     /// When null the keyring surface is disabled (404). Borrowed.
     keyring_kek: ?[]const u8 = null,
+    /// The WAL's per-tenant key cache, so evicting a tenant's group drops
+    /// its derived key from memory with it. Null with the keyring surface
+    /// off. Borrowed; shared by every worker and the pump.
+    wal_seal: ?*keyring_mod.wal_seal.WalSeal = null,
     /// Peer HTTP bases, indexed by raft node id minus one — the same
     /// `REWIND_PEER_URLS` mapping snapshot catch-up resolves against, so
     /// the two cannot disagree about where a node lives. Borrowed.
@@ -1917,6 +1921,8 @@ pub fn Worker(comptime opts: Options) type {
         /// Cluster KEK for per-tenant keyrings. See
         /// `WorkerConfig.keyring_kek`.
         keyring_kek: ?[]const u8,
+        /// `WorkerConfig.wal_seal`.
+        wal_seal: ?*keyring_mod.wal_seal.WalSeal,
         /// Peer HTTP bases by node id minus one. See
         /// `WorkerConfig.peer_urls`.
         peer_urls: []const []const u8,
@@ -2025,6 +2031,7 @@ pub fn Worker(comptime opts: Options) type {
                 .services_jwt_secret = config.services_jwt_secret,
                 .move_secret = config.move_secret,
                 .keyring_kek = config.keyring_kek,
+                .wal_seal = config.wal_seal,
                 .peer_urls = config.peer_urls,
                 .cluster_id = config.cluster_id,
                 .cp_urls = config.cp_urls,

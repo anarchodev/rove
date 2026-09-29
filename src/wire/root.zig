@@ -30,6 +30,7 @@ pub const header_names = @import("wire-headers");
 pub const TENANT = header_names.TENANT;
 pub const INCARNATION = header_names.INCARNATION;
 pub const KEYRING_SECRET = header_names.KEYRING_SECRET;
+pub const KEYRING_FROM = header_names.KEYRING_FROM;
 pub const PLAN = header_names.PLAN;
 pub const BASELINE_INDEX = header_names.BASELINE_INDEX;
 pub const BASELINE_TERM = header_names.BASELINE_TERM;
@@ -106,12 +107,17 @@ pub const AttachEnvelope = struct {
     /// from a peer as KEK-sealed ciphertext instead, which is the same
     /// operation as an ordinary shard update (`js/keyring_shard.zig`).
     ///
-    /// That pull does not exist yet — the transport is push-only, so
-    /// today a node that missed pushes stays short. It is not silent:
-    /// such a node measures itself against the minted watermark, finds
-    /// itself incomplete, and answers `unverified` rather than reporting
-    /// erasure it cannot stand behind (`src/keyring/`).
+    /// A node the tenant is already placed on pulls it from its own
+    /// cluster's peers (`keyring_shard.pullFromPeers`).
     secret: ?[]const u8 = null,
+    /// Where a CROSS-CLUSTER move's destination gets the keyring: the
+    /// source cluster's node bases, comma-separated. The destination's
+    /// own peers have never held this tenant, so it pulls from these
+    /// instead — node to node, as KEK-sealed ciphertext, the CP carrying
+    /// only the addresses. A node takes up a tenant's raft group only
+    /// once it holds the keyring (its WAL entries are sealed under a key
+    /// derived from it), so a move without this could never complete.
+    keyring_from: ?[]const u8 = null,
 };
 
 /// Encoded attach headers. `headers` (and every formatted value in it)
@@ -150,6 +156,8 @@ pub fn encodeAttach(gpa: std.mem.Allocator, env: AttachEnvelope) !EncodedAttach 
     if (env.peer_addrs) |pa| if (pa.len != 0)
         try hs.append(a, .{ .name = PEER_ADDRS, .value = pa });
     if (env.secret) |sec| try hs.append(a, .{ .name = KEYRING_SECRET, .value = sec });
+    if (env.keyring_from) |kf| if (kf.len != 0)
+        try hs.append(a, .{ .name = KEYRING_FROM, .value = kf });
 
     return .{ .arena = arena, .headers = try hs.toOwnedSlice(a) };
 }
@@ -188,6 +196,8 @@ pub const DecodedAttach = struct {
     peer_addrs: ?[]const u8,
     /// Decoded keyring root secret, or null on a repair/move attach.
     secret: ?[32]u8,
+    /// Source nodes to pull the keyring from, on a cross-cluster move.
+    keyring_from: ?[]const u8 = null,
     voters_buf: [MAX_MEMBER_IDS]u64,
     voters_len: ?u8,
     learners_buf: [MAX_MEMBER_IDS]u64,
@@ -238,6 +248,7 @@ pub fn decodeAttach(headers: anytype) AttachDecodeError!DecodedAttach {
         .join_as_learner = join_as_learner,
         .peer_addrs = headers.get(PEER_ADDRS),
         .secret = null,
+        .keyring_from = headers.get(KEYRING_FROM),
         .voters_buf = undefined,
         .voters_len = null,
         .learners_buf = undefined,

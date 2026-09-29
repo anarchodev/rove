@@ -164,7 +164,7 @@ pub const RootEnsurer = struct {
             defer voters.deinit(a);
             for (addrs) |e| voters.append(a, e.id) catch break;
             const birth_voters: ?[]const u64 = if (voters.items.len > 0) voters.items else null;
-            if (!move.attachToAll(self, c.nodes, "__root__", null, birth_voters, "", null)) {
+            if (!move.attachToAll(self, c.nodes, "__root__", null, birth_voters, "", null, null)) {
                 std.log.warn("rewind-cp: __root__ attach fan-out on cluster {s} incomplete; retrying after backoff", .{c.id});
             } else {
                 std.log.info("rewind-cp: __root__ group attached on cluster {s} ({d} node(s))", .{ c.id, c.nodes.len });

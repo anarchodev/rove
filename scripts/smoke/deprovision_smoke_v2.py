@@ -34,7 +34,9 @@ Needs S3 env: `set -a; . ./.env; set +a` first.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -171,10 +173,16 @@ def main() -> int:
         # forever. The attach door is how the CP creates instances, so it is
         # also the door that plants one.
         T2 = "reborn531"
+        # A node takes up a tenant's group only with its keyring, so the plant
+        # goes in with one — then the keyring is removed, as deprovision's
+        # shred leaves it: the lifetime's keys gone, its instance surviving.
         st = attach_join(f"{c.node_url(0)}/_system/v2-attach",
-                         tenant=T2, incarnation="deadbeefdeadbeef")
+                         tenant=T2, incarnation="deadbeefdeadbeef",
+                         keyring_secret="5a" * 32)
         check("plant a stale-lifetime instance on node 1 → 204", st == "204",
               f"got {st}")
+        shutil.rmtree(c.data_dirs[0] / "keyrings" /
+                      hashlib.sha256(T2.encode()).hexdigest()[:32])
         r = cp("provision", {"tenant": T2})
         check("provision the same name → 200 (mints a fresh incarnation)",
               r.status == 200, f"got {r.status} {r.body!r}")

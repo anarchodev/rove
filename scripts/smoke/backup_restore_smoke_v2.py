@@ -41,7 +41,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from smoke_lib_v2 import V2Cluster, MOVE_SECRET, attach_join, BIN_DIR  # noqa: E402
+from smoke_lib_v2 import V2Cluster, MOVE_SECRET, attach_join, attach_retrying, BIN_DIR  # noqa: E402
 
 BACKUP_BIN = os.path.join(BIN_DIR, "rewind-backup")
 
@@ -145,24 +145,27 @@ def main():
 
     with V2Cluster.spawn("bkdst", nodes=1) as b:
         print("leg D: a destination attached under the WRONG incarnation is refused")
-        check("attach under a foreign incarnation",
-              attach_join(f"{b.node_url(0)}/_system/v2-attach", tenant=TENANT,
-                          incarnation="0000000000000000"), "204")
+        # The attach waits on the tenant's keyring, which the restore lands
+        # first — so it retries alongside the restore, as the CP's would.
+        attached = attach_retrying(f"{b.node_url(0)}/_system/v2-attach", tenant=TENANT,
+                                   incarnation="0000000000000000")
         rc, out = backup_tool("restore", "--run", RUN_ID,
                               "--tenant", TENANT, "--nodes", b.node_url(0))
+        check("attach under a foreign incarnation", attached(), "204")
         check("restore into the wrong lifetime fails", rc != 0, True)
         check("refused with 409", "409" in out, True)
         check("nothing was written", kv_get(b.node_url(0), TENANT, KEY)[0], 404)
 
     with V2Cluster.spawn("bkgood", nodes=1) as b:
         print("leg C: restore into a fresh cluster and read the value back")
-        check("attach the tenant under the recorded incarnation",
+        check("CONTROL: the attach is refused until the tenant's keyring is here",
               attach_join(f"{b.node_url(0)}/_system/v2-attach", tenant=TENANT,
-                          incarnation=incarnation), "204")
-        check("the destination has no data yet",
-              kv_get(b.node_url(0), TENANT, KEY)[0], 404)
+                          incarnation=incarnation, discard_body=True), "503")
+        attached = attach_retrying(f"{b.node_url(0)}/_system/v2-attach", tenant=TENANT,
+                                   incarnation=incarnation)
         rc, _ = backup_tool("restore", "--run", RUN_ID,
                             "--tenant", TENANT, "--nodes", b.node_url(0))
+        check("attach the tenant under the recorded incarnation", attached(), "204")
         check("restore", rc, 0)
         st, body = kv_get(b.node_url(0), TENANT, KEY)
         check("restored value reads back", (st, body), (200, VALUE))

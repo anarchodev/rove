@@ -151,6 +151,7 @@ const WorkerCtx = struct {
     move_secret: ?[]const u8,
     /// Cluster KEK for per-tenant keyrings (`REWIND_KEYRING_KEK`).
     keyring_kek: ?[]const u8,
+    wal_seal: ?*rjs.keyring.wal_seal.WalSeal,
     cluster_id: ?[]const u8,
     cp_urls: []const []const u8,
     /// Worker→log-server batch-push base (`REWIND_LOG_PUBLIC_BASE`, default the
@@ -454,6 +455,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .data_dir = args.data_dir,
         .move_secret = args.move_secret,
         .keyring_kek = args.keyring_kek,
+        .wal_seal = args.wal_seal,
         .peer_urls = args.peer_urls,
         .cluster_id = args.cluster_id,
         .cp_urls = args.cp_urls,
@@ -701,6 +703,70 @@ fn inFlightCount(worker: anytype) usize {
 }
 
 // ── Full-HA follower-apply store resolver (two-handle model) ──────────
+
+/// Pull, from peers, the keyring of every tenant group in this node's
+/// manifest whose keyring is not on disk — before group recovery, which
+/// needs the key to open the group's sealed WAL entries. Blocking HTTP, so
+/// boot only; a peer that is down answers fast (refused) or times out.
+fn pullMissingKeyrings(
+    allocator: std.mem.Allocator,
+    bridge: *Bridge,
+    ws: *rjs.keyring.wal_seal.WalSeal,
+    cfg: rjs.keyring_shard.PullConfig,
+) void {
+    const NodeT = @TypeOf(bridge.node.*);
+    const manifest = bridge.node.persistedGroups(allocator) catch return;
+    defer NodeT.freePersistedGroups(allocator, manifest.groups);
+    for (manifest.groups) |g| {
+        if (g.id_str.len == 0 or std.mem.eql(u8, g.id_str, tenant_mod.ROOT_INSTANCE_ID)) continue;
+        if (ws.holdsKeyFor(g.id_str)) continue;
+        if (rjs.keyring_shard.pullFromPeers(allocator, cfg, g.id_str)) |n| {
+            std.log.info("rewind: keyring {s} pulled from {d} peer(s) before recovering its group", .{ g.id_str, n });
+        } else |err| std.log.warn(
+            "rewind: keyring {s} missing and no peer supplied it ({s}) — its group will not recover until re-attached",
+            .{ g.id_str, @errorName(err) },
+        );
+    }
+}
+
+/// Attributes a raft group to its owner for WAL sealing, and adapts
+/// `WalSeal` to the WAL's `PayloadCodec`. A tenant group seals; the root
+/// group stays plaintext; a group the bridge does not know refuses — never
+/// a plaintext guess.
+const WalOwners = struct {
+    bridge: *Bridge,
+
+    fn ownerOf(self: *WalOwners) rjs.keyring.wal_seal.OwnerOf {
+        return .{ .ctx = self, .resolve = resolve };
+    }
+
+    fn resolve(ctx: *anyopaque, group_id: u64, buf: []u8) rjs.keyring.wal_seal.Owner {
+        const self: *WalOwners = @ptrCast(@alignCast(ctx));
+        const id = self.bridge.idStrForGid(group_id) orelse return .unknown;
+        if (id.len == 0 or std.mem.eql(u8, id, tenant_mod.ROOT_INSTANCE_ID)) return .plaintext;
+        if (id.len > buf.len) return .unknown;
+        @memcpy(buf[0..id.len], id);
+        return .{ .tenant = buf[0..id.len] };
+    }
+
+    fn seal(ctx: *anyopaque, a: std.mem.Allocator, group_id: u64, data: []const u8) anyerror!?[]u8 {
+        const w: *rjs.keyring.wal_seal.WalSeal = @ptrCast(@alignCast(ctx));
+        return w.seal(a, group_id, data);
+    }
+
+    fn open(ctx: *anyopaque, a: std.mem.Allocator, group_id: u64, sealed: []const u8) anyerror![]u8 {
+        const w: *rjs.keyring.wal_seal.WalSeal = @ptrCast(@alignCast(ctx));
+        return w.open(a, group_id, sealed);
+    }
+
+    /// A single-node propose births its group only when the group can seal:
+    /// a system group always, a tenant's only with its keyring here.
+    fn mayBirth(ctx: *anyopaque, id_str: []const u8) bool {
+        const w: *rjs.keyring.wal_seal.WalSeal = @ptrCast(@alignCast(ctx));
+        if (id_str.len == 0 or std.mem.eql(u8, id_str, tenant_mod.ROOT_INSTANCE_ID)) return true;
+        return w.holdsKeyFor(id_str);
+    }
+};
 
 /// Pump-side store handles — the TWO-HANDLE model. The pump must NEVER
 /// use the worker's per-tenant `KvStore` handles: a handle carries
@@ -1186,6 +1252,25 @@ pub fn main() !void {
     // touching the worker handle's txn state. Set BEFORE startPump so the
     // first replicated entry already routes here.
     bridge.setStoreResolver(.{ .ctx = &pump_stores, .func = PumpStores.resolve });
+    // At-rest sealing of this node's raft WAL (rove#611). Every tenant's
+    // entries interleave in one file per node, and the WAL is the only place
+    // readsets live, so a tenant's writes and reads stay on disk with no
+    // time bound. Each tenant group's entry data is sealed under a subkey of
+    // its own stored secret, so a deprovision's keyring destroy makes every
+    // entry it ever wrote unreadable at once. Framing and hard state stay
+    // plaintext; the root group does too (instance and domain rows, no
+    // customer data). Installed before `recoverGroups`, which needs it to
+    // open what the last run sealed. Off with the keyring surface.
+    var wal_owners: WalOwners = .{ .bridge = bridge };
+    var wal_seal: ?rjs.keyring.wal_seal.WalSeal = if (keyring_kek) |kek|
+        try rjs.keyring.wal_seal.WalSeal.init(allocator, data_dir, kek, wal_owners.ownerOf())
+    else
+        null;
+    defer if (wal_seal) |*w| w.deinit();
+    if (wal_seal) |*w| {
+        bridge.node.wal.setCodec(.{ .ctx = w, .seal = WalOwners.seal, .open = WalOwners.open });
+        bridge.birth_gate = .{ .ctx = w, .allow = WalOwners.mayBirth };
+    }
     // Auto-demote policy: a far-behind, presumed-dead
     // voter is demoted to a learner so it stops pinning the WAL-compaction
     // floor. Defaults are baked into Node; env overrides tune the lag threshold
@@ -1225,6 +1310,29 @@ pub fn main() !void {
     // missing tail once the pump starts. BEFORE startPump (group lifecycle is
     // single-threaded until the pump owns the Manager), mirroring the CP
     // directory's boot `ensureGroup` scan. No-op on a fresh data dir.
+    const keyring_pull: ?rjs.keyring_shard.PullConfig = blk: {
+        const kek = keyring_kek orelse break :blk null;
+        const secret = move_secret orelse break :blk null;
+        // No peers is not "cannot pull": a cross-cluster move names its
+        // source nodes explicitly, and a single-node destination still has
+        // to fetch the moving tenant's keyring from them.
+        break :blk .{
+            .raft = bridge,
+            .self_id = bridge.config.node_id,
+            .peer_urls = peer_urls,
+            .move_secret = secret,
+            .keyring_kek = kek,
+            .data_dir = data_dir,
+        };
+    };
+    // A tenant group this node holds whose keyring it does not (the
+    // keyring directory was lost, or never arrived): the WAL sealed the
+    // group's entries under a key derived from that keyring, so the group
+    // cannot recover without it. Pull it from peers BEFORE recovering, so
+    // the one-shot recovery below finds the key. A group whose key still
+    // cannot be had is skipped by `recoverGroups` and healed later by the
+    // CP's reconciler through the attach gate, which pulls it too.
+    if (wal_seal) |*ws| if (keyring_pull) |cfg| pullMissingKeyrings(allocator, bridge, ws, cfg);
     const recovered = bridge.recoverGroups();
     if (recovered > 0) std.log.info("rewind: recovered {d} tenant group(s) at boot", .{recovered});
     // WAL sync mode: async (default — the flusher thread keeps the fsync
@@ -1313,19 +1421,6 @@ pub fn main() !void {
     // keyring, pulling for a tenant this node cannot vouch for, and
     // adopting a keyring for a slot opened with none (rove#666). Pulling
     // needs peers, the move secret that gates their route, and the KEK.
-    const keyring_pull: ?rjs.keyring_shard.PullConfig = blk: {
-        const kek = keyring_kek orelse break :blk null;
-        const secret = move_secret orelse break :blk null;
-        if (peer_urls.len == 0) break :blk null;
-        break :blk .{
-            .raft = bridge,
-            .self_id = bridge.config.node_id,
-            .peer_urls = peer_urls,
-            .move_secret = secret,
-            .keyring_kek = kek,
-            .data_dir = data_dir,
-        };
-    };
     var keyring_driver: rjs.keyring_pool.RefillDriver = undefined;
     try keyring_driver.start(allocator, &node_state.deploy, keyring_pull);
     defer keyring_driver.deinit();
@@ -1434,6 +1529,7 @@ pub fn main() !void {
             .admin_api_domain = admin_api_domain,
             .move_secret = move_secret,
             .keyring_kek = keyring_kek,
+            .wal_seal = if (wal_seal) |*w| w else null,
             .cluster_id = cluster_id,
             .cp_urls = cp_urls,
             .log_push_bases = log_push_bases,

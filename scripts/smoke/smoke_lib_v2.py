@@ -379,6 +379,33 @@ def attach_join(url: str, *, tenant: str,
     return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
+
+def attach_retrying(url: str, *, deadline_s: float = 90.0, **kw):
+    """Start `attach_join` on a background thread, retrying while the node
+    answers 503 — as the CP's reconciler does. A node with the keyring surface
+    on refuses a tenant's group until it holds the tenant's keyring, so an
+    attach that a restore or a keyring transfer satisfies has to be retried
+    ALONGSIDE it rather than before it. Returns a callable that joins the
+    thread and returns the last status."""
+    import threading
+    result = {"status": ""}
+
+    def run():
+        deadline = time.time() + deadline_s
+        while True:
+            result["status"] = attach_join(url, discard_body=True, **kw)
+            if result["status"] != "503" or time.time() > deadline:
+                return
+            time.sleep(0.25)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+    def join() -> str:
+        t.join(deadline_s + 30.0)
+        return result["status"]
+    return join
+
 def claim_storage_namespace(prefix: str, *, generation: int = 0) -> None:
     """Stamp `prefix` with a storage-namespace marker (rove#266).
 
@@ -481,6 +508,10 @@ class V2Cluster:
     # (rove-ssrf, wired 2026-06-11) blocks in production. ssrf_smoke_v2
     # passes unsafe_outbound=False to test the production posture.
     unsafe_outbound: bool = True
+    # False spawns the workers with NO keyring KEK: the crypto-shred surface
+    # off, and with it WAL sealing. Only a smoke that needs the unsealed
+    # control (`wal_seal_smoke_v2`) asks for it.
+    keyring: bool = True
     # Optional second, TLS-terminating front (docs/architecture/auth-consolidation.md B2). When set,
     # a `rewind-front` runs with REWIND_TLS_CERT/KEY on this port, and every
     # worker's tenant door (REWIND_INTERNAL_FRONT) pins outbound tenant-host
@@ -511,7 +542,8 @@ class V2Cluster:
               genesis: bool = False,
               storage_generation: int = 0,
               worker_log_push: bool = True,
-              deploy_private_port: bool = False) -> "V2Cluster":
+              deploy_private_port: bool = False,
+              keyring: bool = True) -> "V2Cluster":
         if not os.environ.get("S3_ENDPOINT"):
             raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
         ensure_smoke_bins()
@@ -556,6 +588,7 @@ class V2Cluster:
             worker_log_push=worker_log_push,
             logs_metrics_port=base + 59,
             deploy_private_port=private_port,
+            keyring=keyring,
             _block_base=base,
         )
         for d in (*c.data_dirs, c.cp_data_dir):
@@ -738,7 +771,8 @@ class V2Cluster:
         # portable ciphertext only because its file key derives from this
         # plus the tenant id, so a per-node value would make replication
         # ship bytes no peer could open.
-        env["REWIND_KEYRING_KEK"] = KEYRING_KEK
+        # Empty is read as unset — the surface off (`keyring=False`).
+        env["REWIND_KEYRING_KEK"] = KEYRING_KEK if self.keyring else ""
         env["REWIND_NODE_ID"] = str(i + 1)
         if i == 0 and self.deploy_private_port:
             env["REWIND_DEPLOY_PRIVATE_PORT"] = str(self.deploy_private_port)

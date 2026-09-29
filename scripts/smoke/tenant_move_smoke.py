@@ -14,7 +14,9 @@ serves it:
 
     write → move → read-back
 
-The tenant store is seeded + read through the cluster-internal move
+The tenant is born on cluster-1 by a birth attach carrying its keyring
+secret (what the CP sends at provision; the static placement here provisions
+nothing), and its store is seeded + read through the cluster-internal move
 surface (`/_system/v2-kv`, gated by REWIND_MOVE_SECRET): a PUT writes
 through the real propose→commit path; a GET reads the kvexp store. The
 move itself is one call to the CP's `POST /_control/move` (the zero-downtime
@@ -46,6 +48,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from smoke_ports import alloc_port  # noqa: E402
+from smoke_lib_v2 import attach_join  # noqa: E402
 from v2_topology import spawn_cp, spawn_front, await_line, CP_BIN, FRONT_BIN
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "..", "zig-out", "bin")
@@ -57,6 +60,7 @@ P1 = alloc_port()
 P2 = alloc_port()
 
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
+KEYRING_KEK = "rewindkeyringkekpadding0123456789abcdef0"
 TENANT = "movetenant"
 HOST = "mover.localhost"
 KEY = "greeting"
@@ -72,6 +76,11 @@ def spawn_rewind(name, port, data_dir):
     env.setdefault("REWIND_METRICS_PORT", "0")
     env["REWIND_ADMIN_DOMAIN"] = f"{name}.localhost"
     env["REWIND_MOVE_SECRET"] = MOVE_SECRET
+    # The production configuration: per-tenant keyrings on, and with them
+    # WAL sealing — so the move has to carry the tenant's keyring to a
+    # cluster that has never held it, or the destination cannot take the
+    # tenant's group up at all.
+    env["REWIND_KEYRING_KEK"] = KEYRING_KEK
     env["REWIND_ROOT_TOKEN"] = "smoke-nonprod-root-token-0123456789abcdef"  # non-default: rewind rejects unset/default
     p = subprocess.Popen(
         [REWIND, data_dir, str(port)],
@@ -187,6 +196,13 @@ def main():
 
         # ── A. seed on c1, read it back two ways ──────────────────────
         print("leg A: seed movetenant on cluster-1")
+        # Born the way the CP births a tenant: an attach carrying its keyring
+        # secret. A node with keyrings on never births a tenant's group from
+        # a bare write — the group would have no key to seal its WAL entries
+        # under — and the static placement here provisions nothing.
+        check("birth movetenant on c1 (with its keyring secret)",
+              attach_join(f"http://127.0.0.1:{P1}/_system/v2-attach", tenant=TENANT,
+                          keyring_secret=os.urandom(32).hex(), discard_body=True), "204")
         check("PUT c1 seed", kv_put(P1, TENANT, KEY, VALUE), 204)
         st, body = kv_get(P1, TENANT, KEY)
         check("GET c1 read-back status", st, 200)
@@ -208,6 +224,14 @@ def main():
         st, body = kv_get(P2, TENANT, KEY)
         check("GET c2 read-back status", st, 200)
         check("GET c2 read-back value", body, VALUE)
+
+        # The destination took the tenant up only after pulling its keyring
+        # from the source (the attach gate): the secret it was born with
+        # on cluster-1 is now on cluster-2's disk, never having passed
+        # through the CP.
+        import hashlib
+        kr = os.path.join(d2, "keyrings", hashlib.sha256(TENANT.encode()).hexdigest()[:32], "tenant.kr")
+        check("c2 holds the moved tenant's keyring", os.path.exists(kr), True)
 
         # ── D. source released ───────────────────────────────────────
         print("leg D: source cluster-1 released the tenant")

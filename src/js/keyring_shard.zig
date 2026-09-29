@@ -131,7 +131,7 @@ pub fn handlePush(
 
 /// Tell an open keyring that its disk moved under it. A tenant with no
 /// open slot here has nothing in memory to be stale.
-fn markStale(dc: anytype, tenant: []const u8) void {
+pub fn markStale(dc: anytype, tenant: []const u8) void {
     dc.tenant_files_lock.lock();
     defer dc.tenant_files_lock.unlock();
     const slot = dc.tenant_files_map.get(tenant) orelse return;
@@ -402,6 +402,39 @@ pub fn pullFromVoters(allocator: std.mem.Allocator, cfg: PullConfig, tenant: []c
         if (peer == cfg.self_id) continue;
         if (peer == 0 or peer - 1 >= cfg.peer_urls.len) continue;
         if (pullOne(allocator, cfg, dir, cfg.peer_urls[peer - 1], tenant)) answered += 1;
+    }
+    if (answered == 0) return PullError.NoPeerAnswered;
+    return answered;
+}
+
+/// Pull `tenant`'s keyring from EVERY configured peer node — for a node that
+/// does not hold the tenant's raft group yet, and so has no voter set to
+/// ask (`pullFromVoters`). A node with no keyring for the tenant answers
+/// 404 and costs one request.
+pub fn pullFromPeers(allocator: std.mem.Allocator, cfg: PullConfig, tenant: []const u8) PullError!usize {
+    const dir = keyringDir(allocator, cfg.data_dir) catch return PullError.OutOfMemory;
+    defer allocator.free(dir);
+    var answered: usize = 0;
+    for (cfg.peer_urls, 0..) |base, i| {
+        if (i + 1 == cfg.self_id) continue;
+        if (pullOne(allocator, cfg, dir, base, tenant)) answered += 1;
+    }
+    if (answered == 0) return PullError.NoPeerAnswered;
+    return answered;
+}
+
+/// Pull `tenant`'s keyring from the nodes named in `csv` (comma-separated
+/// HTTP bases) — a cross-cluster move's source cluster, the only nodes that
+/// hold a keyring for a tenant arriving here.
+pub fn pullFromUrls(allocator: std.mem.Allocator, cfg: PullConfig, tenant: []const u8, csv: []const u8) PullError!usize {
+    const dir = keyringDir(allocator, cfg.data_dir) catch return PullError.OutOfMemory;
+    defer allocator.free(dir);
+    var answered: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, csv, ',');
+    while (it.next()) |raw| {
+        const base = std.mem.trim(u8, raw, " ");
+        if (base.len == 0) continue;
+        if (pullOne(allocator, cfg, dir, base, tenant)) answered += 1;
     }
     if (answered == 0) return PullError.NoPeerAnswered;
     return answered;

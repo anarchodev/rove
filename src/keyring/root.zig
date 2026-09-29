@@ -38,6 +38,8 @@ pub const seal = @import("seal.zig");
 /// place at the write boundary, while a body is already immutable and
 /// shared by then, so its data key is what gets sealed instead.
 pub const body_seal = @import("body_seal.zig");
+/// The per-tenant key half of the raft WAL's payload codec.
+pub const wal_seal = @import("wal_seal.zig");
 pub const tenant_keys = @import("tenant_keys.zig");
 
 pub const TenantKeys = tenant_keys.TenantKeys;
@@ -49,4 +51,5 @@ test {
     _ = seal;
     _ = body_seal;
     _ = tenant_keys;
+    _ = wal_seal;
 }
