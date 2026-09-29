@@ -33,6 +33,11 @@ const std = @import("std");
 
 pub const keyspace = @import("keyspace.zig");
 pub const seal = @import("seal.zig");
+/// Sealing a body that spilled to the cross-tenant pool. A separate file
+/// from `seal.zig` because the mechanism differs: a kv value seals in
+/// place at the write boundary, while a body is already immutable and
+/// shared by then, so its data key is what gets sealed instead.
+pub const body_seal = @import("body_seal.zig");
 pub const tenant_keys = @import("tenant_keys.zig");
 
 pub const TenantKeys = tenant_keys.TenantKeys;
@@ -42,5 +47,6 @@ pub const Completeness = keyspace.Completeness;
 test {
     _ = keyspace;
     _ = seal;
+    _ = body_seal;
     _ = tenant_keys;
 }

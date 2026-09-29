@@ -1457,7 +1457,19 @@ fn handleBody(
     const enc_at = out.items.len;
     try out.resize(allocator, enc_at + enc_len);
     _ = std.base64.standard.Encoder.encode(out.items[enc_at..], resolved.bytes);
-    try out.appendSlice(allocator, "\"}\n");
+    try out.appendSlice(allocator, "\"");
+    // A sealed pool body leaves here as ciphertext plus its wrap: this
+    // process holds no keys, so the worker's logs door opens it on the
+    // way out (`src/js/logs_door_shred.zig`, `openBodyResponse`).
+    if (resolved.body_key.len > 0) {
+        const key_len = std.base64.standard.Encoder.calcSize(resolved.body_key.len);
+        try out.appendSlice(allocator, ",\"body_key_b64\":\"");
+        const key_at = out.items.len;
+        try out.resize(allocator, key_at + key_len);
+        _ = std.base64.standard.Encoder.encode(out.items[key_at..], resolved.body_key);
+        try out.appendSlice(allocator, "\"");
+    }
+    try out.appendSlice(allocator, "}\n");
     try setResponseOwned(server, ent, sid, sess, 200, try out.toOwnedSlice(allocator), cfg);
 }
 

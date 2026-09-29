@@ -3530,6 +3530,7 @@ test "dispatch: request_reads — body flag set on read (incl. empty body), abse
         try readset.trigger_payload.appendTriggerPayload(
             bodies_mod.BodyRef.carried(5),
             "hello",
+            "",
         );
         var txn = try kv.beginTrackedImmediate();
         defer txn.rollback() catch {};

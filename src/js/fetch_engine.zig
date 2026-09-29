@@ -2031,12 +2031,19 @@ fn emitFinalWithBody(s: *FetchCtx, status: u16, ok: bool) !void {
     defer if (gated) |g| a.free(g);
     if (s.logs_tenant) |tenant| {
         if (status >= 200 and status < 300) {
-            if (openLogsRecords(s, tenant)) |rewritten| {
+            if (gateLogsResponse(s, tenant)) |rewritten| {
                 if (rewritten) |r| {
                     gated = r;
                     body = r;
                 }
-            } else |err| {
+            } else |err| if (err == logs_door_shred.BodyError.Erased) {
+                // The body's key is destroyed and this node can say so.
+                // The same answer a swept pool object gets from the
+                // log-server: the bytes are no longer there.
+                gate_status = 410;
+                gated = a.dupe(u8, BODY_ERASED_BODY) catch null;
+                body = gated orelse "";
+            } else {
                 std.log.warn(
                     "rove-js fetch_engine: logs door refusing a record for {s}: {s} — this node cannot vouch for its key material",
                     .{ tenant, @errorName(err) },
@@ -2081,6 +2088,47 @@ const KEY_MATERIAL_UNVERIFIED_BODY =
     "\"message\":\"this node does not hold every key this tenant has minted, " ++
     "so it cannot say whether a sealed value was erased or is merely unreadable here; " ++
     "retry once the node's keyring is complete\"}";
+
+/// What the logs door answers for a pool body whose key was destroyed.
+/// Distinct from `KEY_MATERIAL_UNVERIFIED_BODY` on purpose — "erased" and
+/// "this node cannot tell" are the two answers the gate exists to keep
+/// apart.
+const BODY_ERASED_BODY =
+    "{\"error\":\"erased\"," ++
+    "\"message\":\"this payload was sealed under a key that has been destroyed\"}";
+
+/// Both serve-side gates over one buffered logs-door response: a pool
+/// body is opened with its wrap, then any kv tapes are opened. A route
+/// answers one shape or the other, so at most one of them rewrites.
+fn gateLogsResponse(s: *FetchCtx, tenant: []const u8) !?[]u8 {
+    if (try openLogsBody(s, tenant)) |r| return r;
+    return openLogsRecords(s, tenant);
+}
+
+/// Open a body-route response's sealed pool body
+/// (`logs_door_shred.openBodyResponse`). Null when it carries no wrap.
+fn openLogsBody(s: *FetchCtx, tenant: []const u8) !?[]u8 {
+    const Bound = struct {
+        ctx: *FetchCtx,
+        tenant: []const u8,
+
+        fn open(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            sealed_body: []const u8,
+            wrap: []const u8,
+        ) anyerror!logs_door_shred.Opened {
+            const b: *@This() = @ptrCast(@alignCast(ptr));
+            return b.ctx.engine.node.deploy.openPoolBody(allocator, b.tenant, sealed_body, wrap);
+        }
+    };
+    var bound: Bound = .{ .ctx = s, .tenant = tenant };
+    return logs_door_shred.openBodyResponse(
+        s.allocator,
+        s.body_buf.items,
+        .{ .ctx = &bound, .open = &Bound.open },
+    );
+}
 
 /// Run the serve-side shred gate over a buffered logs-door response.
 ///

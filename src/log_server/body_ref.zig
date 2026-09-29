@@ -363,12 +363,31 @@ pub const Source = enum {
 pub const Resolved = struct {
     bytes: []u8,
     source: Source,
+    /// The wrapped data key the entry carried beside a pool ref, owned, or
+    /// empty. Non-empty means `bytes` is CIPHERTEXT. This process holds no
+    /// keys, so it passes the wrap on and the worker's logs door opens the
+    /// body (`src/js/logs_door_shred.zig`) — the one process holding both
+    /// the tenant's keys and the completeness watermark that says whether
+    /// a missing key means erased.
+    body_key: []u8 = &.{},
 
     pub fn deinit(self: *Resolved, allocator: std.mem.Allocator) void {
         allocator.free(self.bytes);
+        allocator.free(self.body_key);
         self.* = undefined;
     }
 };
+
+/// The wrap an entry carries for its pool body, or empty. Only a pool ref
+/// has one: a carried or content-addressed payload was never sealed here.
+fn bodyKeyOf(entry: tape_mod.Entry, ref: Ref) []const u8 {
+    if (ref != .pool) return "";
+    return switch (entry) {
+        .trigger_payload => |t| t.body_key,
+        .fetch_responses => |f| f.body_key,
+        else => "",
+    };
+}
 
 /// The whole read path, end to end: record JSON + channel + entry index →
 /// bytes plus the verdict on where they came from.
@@ -399,10 +418,14 @@ pub fn resolveFromRecord(
     if (parsed.channel != channel.tapeChannel()) return Error.BadRecordJson;
     if (index >= parsed.entries.len) return Error.NoSuchEntry;
 
-    const ref = try locate(parsed.entries[index]);
+    const entry = parsed.entries[index];
+    const ref = try locate(entry);
+    const bytes = try resolve(allocator, store, tenant_id, ref);
+    errdefer allocator.free(bytes);
     return .{
-        .bytes = try resolve(allocator, store, tenant_id, ref),
+        .bytes = bytes,
         .source = Source.ofRef(ref),
+        .body_key = try allocator.dupe(u8, bodyKeyOf(entry, ref)),
     };
 }
 
@@ -667,6 +690,7 @@ test "tapeFromRecordJson: absent tapes, null field, and a real channel" {
     try t.appendTriggerPayload(
         tPoolRef(3, 128, 40_000),
         "",
+        "",
     );
     const raw = try t.serialize(a);
     defer a.free(raw);
@@ -706,6 +730,7 @@ test "resolveFromRecord: end to end, a spilled body comes back whole" {
     try t.appendTriggerPayload(
         tPoolRef(11, "NEIGHBOUR".len, @intCast(body.len)),
         "",
+        "",
     );
     const raw = try t.serialize(a);
     defer a.free(raw);
@@ -737,6 +762,7 @@ test "resolveFromRecord: an index past the end is NoSuchEntry" {
     try t.appendTriggerPayload(
         bodies_mod.BodyRef.carried(2),
         "hi",
+        "",
     );
     const raw = try t.serialize(a);
     defer a.free(raw);

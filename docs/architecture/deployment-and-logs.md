@@ -251,6 +251,39 @@ so a node that cannot tell those apart says nothing rather than guessing.
 A **streamed** read of the door is refused for the same reason: the gate
 rewrites a whole response body, which a streamed transfer never has in hand.
 
+### Sealed pool bodies
+
+A request body or fetch chunk too large to ride the tape spills to the
+cross-tenant `_pool/`, and it is written there **before any handler code
+runs** — so it cannot seal at the write boundary the way a kv value does, and
+by the time an identity exists the pool object is content-addressed,
+immutable and shared with other tenants.
+
+So a body is sealed as an **envelope** (`src/keyring/body_seal.zig`): at
+submit, under a data key minted for that body alone; the data key is then
+**wrapped** under the tenant key, and the wrap rides the tape entry that
+references the body (`trigger_payload` / `fetch_responses`, `body_key`), not
+the pool object. When the handler returns, the same late-binding moment that
+seals kv values moves the wrap onto the identity the activation named. The
+wrap is **replaced**, never added to: two wraps of one data key would leave
+the tenant key able to read what destroying the identity promised to erase.
+Destroying the naming key destroys the only copy of the data key, so the
+pool bytes go unreadable everywhere at once — backups included — without
+rewriting an object that cannot be rewritten.
+
+A node with no keyring for the tenant **refuses to spill** rather than submit
+plaintext: a plaintext pool object is copied into every later backup and no
+destroy can ever reach it.
+
+The log-server holds no keys, so its body route answers with the ciphertext
+and the wrap (`body_key_b64`), and the door opens it on the way out with the
+same three answers — plaintext; **410 `erased`** when the key is destroyed
+and the keyring complete; 503 when this node cannot tell. The wrap never
+leaves the door.
+
+Bodies small enough to ride the tape inline are not covered by this: they
+sit in the tape as plaintext.
+
 ### The execution-sequence stamp (`exec_seq`)
 
 Per-tenant execution is strictly serial: the tenant has one authoritative

@@ -14,6 +14,12 @@ This drives the whole chain against real S3:
     log-server indexes → `/v1/{t}/body/{req}/trigger_payload/0` range-GETs
     the pool object at (offset, len) and hands the bytes back.
 
+The pool holds CIPHERTEXT (`src/keyring/body_seal.zig`): the log-server
+holds no keys, so straight off it the large body comes back sealed with its
+wrap beside it, and only the worker's `rewind-logs.internal` door hands back
+plaintext. The large body is therefore read BOTH ways — the direct read is
+the control that proves there was something to open.
+
 The assertions that matter are the NEGATIVE ones: the record must NOT carry
 `request_body_b64` (over the cap, so it was never inlined) while the door
 still returns the exact bytes. A door that passed only because the body
@@ -54,6 +60,32 @@ export default function () {
 """
 READY_SRC = 'export function handler(_a) { return "ready"; }\n'
 
+# Reads one payload back THROUGH the worker's logs door — the only reader
+# that can open a sealed pool body. Self-tenant, so the engine pins the read
+# to this handler's own id.
+DOOR_SRC = r"""export default function ({ after, next }) {
+    const q = new URLSearchParams(request.query || "");
+    after.fetch("http://rewind-logs.internal/v1/" + request.tenant + "/body/"
+                + q.get("rid") + "/" + q.get("addr"));
+    return next();
+}
+export function onFetchResult() {
+    response.status = 200;
+    return "status:" + (request.status || 0) + "\n" + (request.text || "");
+}
+"""
+
+
+def door_body(c, rid: str, addr: str):
+    """A body-route read through the worker door → (status, parsed JSON)."""
+    r = c.request("acme", f"/door?rid={rid}&addr={addr}", timeout=30.0)
+    head, _, body = r.body.partition("\n")
+    status = int(head.split(":", 1)[1]) if head.startswith("status:") else 0
+    try:
+        return status, json.loads(body) if 200 <= status < 300 else {}
+    except json.JSONDecodeError:
+        return status, {}
+
 # Comfortably over INBOUND_INLINE_THRESHOLD / REQUEST_BODY_CAP (16 KiB),
 # so the spill is forced by construction rather than by timing.
 BIG_LEN = 64 * 1024
@@ -93,6 +125,7 @@ def main() -> int:
         c.deploy_handlers("acme", {
             "index.mjs": rpc_wrap(READY_SRC),
             "echo/index.mjs": ECHO_LEN_SRC,
+            "door/index.mjs": DOOR_SRC,
         })
         c.wait_for_handler("acme", "/?fn=handler", want_body="ready", timeout_s=30.0)
 
@@ -149,25 +182,40 @@ def main() -> int:
               bool(tapes.get("trigger_payload_tape_b64")),
               f"keys={sorted(tapes.keys())}")
 
-        # The door resolves the pointer.
+        # CONTROL: straight off the log-server the pool body is sealed. If
+        # this came back as plaintext the pool was never sealed, and the
+        # door's plaintext below would prove nothing about opening it.
         d = c.log_get(f"acme/body/{big_id}/trigger_payload/0", timeout=30.0)
-        got = {}
+        raw = {}
         if d.status == 200:
             try:
-                got = json.loads(d.body)
+                raw = json.loads(d.body)
             except json.JSONDecodeError:
-                got = {}
-        check("door resolves the spilled body → 200", d.status == 200,
+                raw = {}
+        check("log-server resolves the spilled body → 200", d.status == 200,
               f"status={d.status} body={d.body[:200]!r}")
+        check("CONTROL: the pool bytes carry a wrap beside them",
+              bool(raw.get("body_key_b64")), f"keys={sorted(raw.keys())}")
+        raw_bytes = base64.b64decode(raw.get("bytes_b64") or "")
+        check("CONTROL: the pool bytes are NOT the plaintext",
+              big.encode()[:64] not in raw_bytes,
+              "the plaintext is in the pool unsealed")
+
+        # The worker door opens it.
+        status, got = door_body(c, big_id, "trigger_payload/0")
+        check("door resolves the spilled body → 200", status == 200,
+              f"status={status}")
         check("door reports it came from the pool",
               got.get("source") == "pool",
               f"source={got.get('source')!r}")
+        check("the wrap does not leave the door", "body_key_b64" not in got,
+              f"keys={sorted(got.keys())}")
         decoded = ""
         if got.get("bytes_b64") is not None:
             decoded = base64.b64decode(got["bytes_b64"]).decode("utf-8", "replace")
         check(f"resolved body is byte-exact ({BIG_LEN} bytes)",
-              decoded == big,
-              f"len={len(decoded)} want={BIG_LEN} "
+              decoded == big and got.get("len") == BIG_LEN,
+              f"len={len(decoded)} reported={got.get('len')} want={BIG_LEN} "
               f"head={decoded[:32]!r} tail={decoded[-32:]!r}")
 
         # The small body takes the other resolution path through the same
