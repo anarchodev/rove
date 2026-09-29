@@ -1207,9 +1207,9 @@ pub fn main() !void {
         std.log.info("rewind: snapshot grace buffer = {d} entries", .{bridge.node.snapshot_grace});
     }
     // Raft logical-tick cadence (ms). The wall-clock election timeout is
-    // `election_tick × this` (see node.zig DEFAULT_TICK_NS); the default
-    // preserves the historical ~1ms cadence. Raise it once a soak has measured
-    // the broadcast-time + pause-jitter tail it must clear
+    // `election_tick × this` (see node.zig DEFAULT_TICK_NS; 10ms by default,
+    // the industry band). Tune it only from a soak that has measured the
+    // broadcast-time + pause-jitter tail it must clear
     // (docs/architecture/raft-best-practices.md "how to size election/heartbeat").
     if (std.posix.getenv("REWIND_RAFT_TICK_MS")) |v| {
         if (std.fmt.parseInt(i64, v, 10)) |ms| {

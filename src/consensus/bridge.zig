@@ -2020,6 +2020,9 @@ test "bridge: a hibernated group whose leader died re-elects on a requestWake nu
                 ok = false;
                 break;
             };
+            // The windows below are sized against a 1ms tick (election
+            // ≈ 10–20ms), so pin it rather than inherit the default.
+            bridges[i].node.setTickInterval(1 * std.time.ns_per_ms);
             // Short hibernate window: long enough to elect, short enough to
             // idle past within the test.
             bridges[i].node.hibernate_ns = 150 * std.time.ns_per_ms;
