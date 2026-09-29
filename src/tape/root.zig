@@ -152,7 +152,24 @@ pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 /// change; the bump exists because a v9 tape's named keys read against a
 /// v10 store-spelled overlay miss on every row — a silent all-miss dressed
 /// as a divergence, which is exactly what a version guard is for.
-pub const VERSION: u16 = 10;
+/// v10 -> v11: the two entries that can reference the cross-tenant body pool
+/// (`trigger_payload`, `fetch_responses`) gained a trailing
+/// `body_key` — the pool body's data key, sealed under key material a destroy
+/// can reach (`rove-keyring`'s `body_seal`), so destroying that key makes the
+/// referenced bytes unreadable everywhere at once, backups included. Appended
+/// at the END of each entry, so nothing else moved.
+/// The bump is still a GUARD and not a compatibility band: a v10 tape's pool
+/// references name PLAINTEXT bytes, and a v11 reader that took one for a
+/// sealed body would report live data as erased — the worst failure this
+/// design has (`keyring/seal.zig`'s discriminator note). Rejecting it loudly
+/// is the point.
+/// v11 -> v12: payload sealing reaches the INLINE path. A `body_key` on an entry
+/// whose bytes ride `inline_bytes` means those bytes are sealed under it the same
+/// way a pool body is, and the `activation` entry gained a trailing `body_key`
+/// too — its Msg (a WS frame, a wake bag) is flushed on the record's
+/// `activation` tape instead of a plaintext side field. A v11 reader takes sealed
+/// inline bytes for the payload itself, so the bump is again a guard.
+pub const VERSION: u16 = 12;
 
 /// Wire width of a `BodyRef`: stamp(8) + digest(16) + offset(4) + len(4).
 /// Lockstep-asserted against the offline decoder above.
@@ -249,10 +266,9 @@ pub const Channel = enum(u16) {
     /// log blob.
     fetch_responses = 2,
     /// Readset replication (`docs/architecture/effects-and-handlers.md`). Zero or one entry
-    /// per inbound dispatch. Captures the request body's `BodyRef`
-    /// (the bytes streamed into the cross-tenant pool blob) so
-    /// replay can resolve `request.body` via `BlobStore.getRange`
-    /// instead of the inline `request_body_bytes` capture.
+    /// per inbound dispatch: the request body — inline under the cap, or
+    /// a `BodyRef` into the cross-tenant pool over it — or a resume's
+    /// `{"ctx": …}` envelope. The record's only copy of either.
     /// Zero entries when the request had no body.
     trigger_payload = 3,
     /// The lazily-recorded inbound request surface
@@ -540,6 +556,19 @@ pub const Entry = union(Channel) {
         /// whose body does not hash to its key, so the hash provably names
         /// those bytes.
         content_hash: []const u8 = "",
+        /// The data key for the bytes `body_ref` names, sealed under key
+        /// material a destroy can reach (`keyring.body_seal`). Empty
+        /// unless `body_ref` names a pool object.
+        ///
+        /// It travels HERE rather than inside the pool object, and that
+        /// placement is the whole reason per-identity erasure reaches a
+        /// body at all: a pool object is content-addressed and immutable
+        /// the moment it is written, which is before any handler has
+        /// named an identity. A wrap stored in it could only ever name
+        /// the tenant. Stored on the entry, it is still rewritable when
+        /// the identity becomes known — the same late-binding window the
+        /// kv seal uses.
+        body_key: []const u8 = "",
     };
 
     /// One inbound request's body — either by-reference into the
@@ -571,6 +600,19 @@ pub const Entry = union(Channel) {
     pub const TriggerPayloadEntry = struct {
         body_ref: bodies_mod.BodyRef,
         inline_bytes: []const u8,
+        /// The data key for the bytes `body_ref` names, sealed under key
+        /// material a destroy can reach (`keyring.body_seal`). Empty
+        /// unless `body_ref` names a pool object.
+        ///
+        /// It travels HERE rather than inside the pool object, and that
+        /// placement is the whole reason per-identity erasure reaches a
+        /// body at all: a pool object is content-addressed and immutable
+        /// the moment it is written, which is before any handler has
+        /// named an identity. A wrap stored in it could only ever name
+        /// the tenant. Stored on the entry, it is still rewritable when
+        /// the identity becomes known — the same late-binding window the
+        /// kv seal uses.
+        body_key: []const u8 = "",
     };
 
     /// One lazily-recorded request-surface read. See
@@ -608,6 +650,10 @@ pub const Entry = union(Channel) {
         export_name: []const u8,
         body_ref: bodies_mod.BodyRef,
         inline_bytes: []const u8,
+        /// The data key `inline_bytes` is sealed under, wrapped under key
+        /// material a destroy can reach (`keyring.body_seal`). Empty when
+        /// the bytes are plaintext. See `TriggerPayloadEntry.body_key`.
+        body_key: []const u8 = "",
     };
 };
 
@@ -942,6 +988,9 @@ pub const Tape = struct {
         /// Non-empty ⇒ the payload was left in content-addressed storage and
         /// this names it; `inline_bytes` is then empty by construction.
         content_hash: []const u8,
+        /// The pool body's wrapped data key. Non-empty only when `body_ref`
+        /// names a pool object.
+        body_key: []const u8,
     ) !void {
         std.debug.assert(self.channel == .fetch_responses);
         // Alternatives, never both: a chunk is carried or referenced. Both
@@ -956,8 +1005,11 @@ pub const Tape = struct {
         errdefer self.allocator.free(inline_copy);
         const hash_copy = try self.allocator.dupe(u8, content_hash);
         errdefer self.allocator.free(hash_copy);
+        const key_copy = try self.allocator.dupe(u8, body_key);
+        errdefer self.allocator.free(key_copy);
         try self.entries.append(self.allocator, .{ .fetch_responses = .{
             .content_hash = hash_copy,
+            .body_key = key_copy,
             .fetch_id = fid_copy,
             .seq = seq,
             .byte_offset = byte_offset,
@@ -969,7 +1021,7 @@ pub const Tape = struct {
             .headers = headers_copy,
             .inline_bytes = inline_copy,
         } });
-        self.owned_bytes += fid_copy.len + headers_copy.len + inline_copy.len + hash_copy.len;
+        self.owned_bytes += fid_copy.len + headers_copy.len + inline_copy.len + hash_copy.len + key_copy.len;
     }
 
     /// Append one inbound trigger payload entry. The channel
@@ -981,19 +1033,25 @@ pub const Tape = struct {
     /// (`body_ref.isNone()`); empty for the by-reference path
     /// (`!body_ref.isNone()`, bytes live in the pool object the ref
     /// names). The slice is dup'd into tape storage.
+    /// `body_key` is the pool body's wrapped data key — empty for the
+    /// inline path, which has no pool object to point at.
     pub fn appendTriggerPayload(
         self: *Tape,
         body_ref: bodies_mod.BodyRef,
         inline_bytes: []const u8,
+        body_key: []const u8,
     ) !void {
         std.debug.assert(self.channel == .trigger_payload);
         const inline_copy = try self.allocator.dupe(u8, inline_bytes);
         errdefer self.allocator.free(inline_copy);
+        const key_copy = try self.allocator.dupe(u8, body_key);
+        errdefer self.allocator.free(key_copy);
         try self.entries.append(self.allocator, .{ .trigger_payload = .{
             .body_ref = body_ref,
             .inline_bytes = inline_copy,
+            .body_key = key_copy,
         } });
-        self.owned_bytes += inline_copy.len;
+        self.owned_bytes += inline_copy.len + key_copy.len;
     }
 
     /// Append the activation's own record (`Channel.activation`): the
@@ -1018,8 +1076,52 @@ pub const Tape = struct {
             .export_name = export_copy,
             .body_ref = body_ref,
             .inline_bytes = inline_copy,
+            // Plaintext until the seal replaces it; a zero-length free is a no-op.
+            .body_key = "",
         } });
         self.owned_bytes += export_copy.len + inline_copy.len;
+    }
+
+    /// Replace entry `i`'s inline payload with its sealed form and the
+    /// wrapped data key that opens it (`keyring.body_seal`). Only the three
+    /// payload-carrying channels have one; anything else is a caller bug.
+    /// Owned bytes are swapped, never aliased, so the entry stays freeable
+    /// by `freeEntry` whatever happened before.
+    pub fn sealInlinePayload(self: *Tape, i: usize, sealed: []const u8, wrap: []const u8) !void {
+        const sealed_copy = try self.allocator.dupe(u8, sealed);
+        errdefer self.allocator.free(sealed_copy);
+        const wrap_copy = try self.allocator.dupe(u8, wrap);
+        const e = &self.entries.items[i];
+        const slots: struct { bytes: *[]const u8, key: *[]const u8 } = switch (e.*) {
+            .trigger_payload => |*t| .{ .bytes = &t.inline_bytes, .key = &t.body_key },
+            .fetch_responses => |*f| .{ .bytes = &f.inline_bytes, .key = &f.body_key },
+            .activation => |*a| .{ .bytes = &a.inline_bytes, .key = &a.body_key },
+            else => unreachable,
+        };
+        self.owned_bytes -= slots.bytes.len + slots.key.len;
+        self.allocator.free(slots.bytes.*);
+        self.allocator.free(slots.key.*);
+        slots.bytes.* = sealed_copy;
+        slots.key.* = wrap_copy;
+        self.owned_bytes += sealed_copy.len + wrap_copy.len;
+    }
+
+    /// Drop entry `i`'s inline payload, keeping its recorded length: the
+    /// unretained shape. Never allocates, so it cannot fail — it is what a
+    /// caller that must not leave plaintext behind falls back to.
+    pub fn dropInlinePayload(self: *Tape, i: usize) void {
+        const e = &self.entries.items[i];
+        const slots: struct { bytes: *[]const u8, key: *[]const u8 } = switch (e.*) {
+            .trigger_payload => |*t| .{ .bytes = &t.inline_bytes, .key = &t.body_key },
+            .fetch_responses => |*f| .{ .bytes = &f.inline_bytes, .key = &f.body_key },
+            .activation => |*a| .{ .bytes = &a.inline_bytes, .key = &a.body_key },
+            else => unreachable,
+        };
+        self.owned_bytes -= slots.bytes.len + slots.key.len;
+        self.allocator.free(slots.bytes.*);
+        self.allocator.free(slots.key.*);
+        slots.bytes.* = "";
+        slots.key.* = "";
     }
 
     /// Record one request-surface read, once: if an entry with the
@@ -1118,11 +1220,9 @@ pub fn serializeEntries(
 /// 1:1 (rewind-apps repo `replay/replay-wasm-plan.md` §4) — same
 /// channels, same names, for the five that engine consumes. No
 /// translation layer between capture and replay. The sixth,
-/// `activation`, is raft-side only: the flushed record carries the same
-/// two values as `TapePayloads.activation_bytes` / `.export_name`,
-/// which every offline reader already resolves, so the channel exists
-/// to make the RAFT ENTRY self-sufficient, not to add a blob nobody
-/// reads.
+/// `activation`, carries the resolved export and the Msg of a wake or WS
+/// hop; it rides the raft entry so a rebuilt record is self-sufficient,
+/// and the flushed record alike.
 ///
 /// The readset is the single home for every per-request
 /// non-deterministic input the raft entry carries: the per-channel
@@ -1174,6 +1274,12 @@ pub const Readset = struct {
     /// wrongly verified. Zero means "not computed", which readers must treat
     /// as absent rather than as a digest of an empty run.
     interaction_digest: u64 = 0,
+    /// The identity slot the activation named (`shredKey`), set once the
+    /// handler returns. In memory only — never serialized. Capture seals
+    /// the activation's payloads under it (`src/js/pool_seal.zig`), since
+    /// several capture paths append their payloads after the handler's own
+    /// frame, where the dispatcher's copy of it is already gone.
+    shred_slot: ?u64 = null,
     kv: Tape,
     module: Tape,
     /// Readset replication (`docs/architecture/effects-and-handlers.md`): one entry per
@@ -1182,9 +1288,7 @@ pub const Readset = struct {
     /// the bytes via `BlobStore.getRange`.
     fetch_responses: Tape,
     /// Readset replication (`docs/architecture/effects-and-handlers.md`): zero-or-one
-    /// entry for the inbound request body's `BodyRef`. Replay
-    /// resolves `request.body` via `BlobStore.getRange` instead of
-    /// the inline `request_body_bytes` capture.
+    /// entry for the activation's body — see `Channel.trigger_payload`.
     trigger_payload: Tape,
     /// The activation's own record — resolved export, plus the Msg of a
     /// `wake_batch` / `ws_message` hop (see `Channel.activation`).
@@ -1198,8 +1302,7 @@ pub const Readset = struct {
     request_reads: Tape,
     /// Set by the `request.body` getter on first access. Consulted
     /// AFTER the handler ran (DispatchState is gone by then):
-    /// `elideUnreadBody` + the worker's `request_body_bytes` capture
-    /// gate on it. False ⇒ the body never influenced execution and
+    /// `elideUnreadBody` gates on it. False ⇒ the body never influenced execution and
     /// the log carries no reference to it.
     body_read: bool = false,
     /// True when the `trigger_payload` entry is a resume's threaded-ctx
@@ -1785,9 +1888,11 @@ fn freeEntry(allocator: std.mem.Allocator, e: *Entry) void {
             allocator.free(f.fetch_id);
             allocator.free(f.headers);
             allocator.free(f.inline_bytes);
+            allocator.free(f.body_key);
         },
         .trigger_payload => |*t| {
             allocator.free(t.inline_bytes);
+            allocator.free(t.body_key);
         },
         .request_reads => |*r| {
             allocator.free(r.name);
@@ -1796,6 +1901,7 @@ fn freeEntry(allocator: std.mem.Allocator, e: *Entry) void {
         .activation => |*a| {
             allocator.free(a.export_name);
             allocator.free(a.inline_bytes);
+            allocator.free(a.body_key);
         },
     }
 }
@@ -1879,10 +1985,12 @@ fn encodeEntry(
             // v6 trailing field — see `VERSION`. Appended LAST so the older
             // layout is a strict prefix of this one.
             try appendLenPrefixed(allocator, buf, f.content_hash);
+            try appendLenPrefixed(allocator, buf, f.body_key);
         },
         .trigger_payload => |t| {
             try appendBodyRef(allocator, buf, t.body_ref);
             try appendLenPrefixed(allocator, buf, t.inline_bytes);
+            try appendLenPrefixed(allocator, buf, t.body_key);
         },
         .request_reads => |r| {
             try buf.append(allocator, @intFromEnum(r.kind));
@@ -1893,6 +2001,7 @@ fn encodeEntry(
             try appendLenPrefixed(allocator, buf, a.export_name);
             try appendBodyRef(allocator, buf, a.body_ref);
             try appendLenPrefixed(allocator, buf, a.inline_bytes);
+            try appendLenPrefixed(allocator, buf, a.body_key);
         },
     }
 }
@@ -1973,15 +2082,22 @@ fn decodeEntry(
             cur += 1;
             const headers = try readLenPrefixed(bytes, &cur);
             const inline_bytes = try readLenPrefixed(bytes, &cur);
-            // v6 trailing content hash. Tolerated-absent so this decoder
-            // reads a v5 entry too — the whole point of appending it last.
+            // Trailing optional fields, in the order they were appended.
+            // Tolerated-absent because each was added at the END, which is
+            // the whole point of appending: a shorter entry is a strict
+            // prefix rather than a mis-slice.
             const content_hash: []const u8 = if (cur < bytes.len)
+                try readLenPrefixed(bytes, &cur)
+            else
+                "";
+            const body_key: []const u8 = if (cur < bytes.len)
                 try readLenPrefixed(bytes, &cur)
             else
                 "";
             if (cur != bytes.len) return ParseError.Truncated;
             return .{ .fetch_responses = .{
                 .content_hash = content_hash,
+                .body_key = body_key,
                 .fetch_id = fid,
                 .seq = seq,
                 .byte_offset = byte_offset,
@@ -1997,10 +2113,12 @@ fn decodeEntry(
         .trigger_payload => {
             const body_ref = try readBodyRef(bytes, &cur);
             const inline_bytes = try readLenPrefixed(bytes, &cur);
+            const body_key = try readLenPrefixed(bytes, &cur);
             if (cur != bytes.len) return ParseError.Truncated;
             return .{ .trigger_payload = .{
                 .body_ref = body_ref,
                 .inline_bytes = inline_bytes,
+                .body_key = body_key,
             } };
         },
         .request_reads => {
@@ -2021,11 +2139,13 @@ fn decodeEntry(
             const export_name = try readLenPrefixed(bytes, &cur);
             const body_ref = try readBodyRef(bytes, &cur);
             const inline_bytes = try readLenPrefixed(bytes, &cur);
+            const body_key = try readLenPrefixed(bytes, &cur);
             if (cur != bytes.len) return ParseError.Truncated;
             return .{ .activation = .{
                 .export_name = export_name,
                 .body_ref = body_ref,
                 .inline_bytes = inline_bytes,
+                .body_key = body_key,
             } };
         },
     }
@@ -2182,9 +2302,11 @@ test "readset: serialize + parseReadset roundtrip" {
         "{}",
         "",
         "",
+        "",
     );
     try rs.trigger_payload.appendTriggerPayload(
         poolRef(3, 0, 128),
+        "",
         "",
     );
     try rs.request_reads.appendRequestReadOnce(.header_value, "user-agent", "smoke/1");
@@ -2407,6 +2529,7 @@ test "trigger_payload tape: BodyRef-only roundtrip (large body)" {
     try tape.appendTriggerPayload(
         poolRef(3, 4096, 1024),
         "",
+        "",
     );
     const bytes = try tape.serialize(testing.allocator);
     defer testing.allocator.free(bytes);
@@ -2430,6 +2553,7 @@ test "trigger_payload tape: inline small-body roundtrip" {
     try tape.appendTriggerPayload(
         bodies_mod.BodyRef.carried(@intCast(body.len)),
         body,
+        "",
     );
     const bytes = try tape.serialize(testing.allocator);
     defer testing.allocator.free(bytes);
@@ -2648,6 +2772,7 @@ test "elideUnreadBody: drops trigger_payload entries unless body was read" {
     try rs.trigger_payload.appendTriggerPayload(
         bodies_mod.BodyRef.carried(5),
         "hello",
+        "",
     );
     try testing.expectEqual(@as(usize, 1), rs.trigger_payload.entries.items.len);
 
@@ -2664,6 +2789,7 @@ test "elideUnreadBody: drops trigger_payload entries unless body was read" {
     try rs2.trigger_payload.appendTriggerPayload(
         bodies_mod.BodyRef.carried(5),
         "hello",
+        "",
     );
     rs2.body_read = true;
     rs2.elideUnreadBody();
@@ -2698,6 +2824,7 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
         "{\"content-type\":\"application/json\"}",
         "",
         "",
+        "",
     );
     // Mid-stream chunk: no headers, BodyRef path.
     try tape.appendFetchResponse(
@@ -2712,6 +2839,7 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
         "",
         "",
         "",
+        "",
     );
     // Terminal: empty body, status + ok set.
     try tape.appendFetchResponse(
@@ -2723,6 +2851,7 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
         200,
         true,
         false,
+        "",
         "",
         "",
         "",
@@ -2775,6 +2904,7 @@ test "fetch_responses tape: inline small-chunk roundtrip" {
         false,
         "{\"content-type\":\"application/json\"}",
         chunk,
+        "",
         "",
     );
     const bytes = try tape.serialize(testing.allocator);
@@ -2933,9 +3063,11 @@ test "cross-decoder: fetch_responses channel reads back via tape_decode" {
     // Seq-0 inline chunk with headers; then a BodyRef terminal.
     try tape.appendFetchResponse("ftch_1", 0, 0, bodies_mod.BodyRef.carried(4), false, 0, false, false, "{\"content-type\":\"text/plain\"}", "body",
         "",
+        "",
 );
     try tape.appendFetchResponse("ftch_1", 1, 4, poolRef(7, 100, 256), true, 200, true, false, "", "",
         "",
+        "wrapped-data-key",
 );
     const bytes = try tape.serialize(a);
     defer a.free(bytes);
@@ -2955,6 +3087,34 @@ test "cross-decoder: fetch_responses channel reads back via tape_decode" {
     try testing.expect(out[1].final);
     try testing.expectEqual(@as(u16, 200), out[1].terminal_status);
     try testing.expect(out[1].terminal_ok);
+    // The wrap rides beside the ref, and only there.
+    try testing.expectEqualStrings("", out[0].body_key);
+    try testing.expectEqualStrings("wrapped-data-key", out[1].body_key);
+}
+
+test "sealInlinePayload swaps the payload for its sealed form, on each payload channel" {
+    const a = testing.allocator;
+    var tp = Tape.init(a, .trigger_payload);
+    defer tp.deinit();
+    try tp.appendTriggerPayload(bodies_mod.BodyRef.carried(5), "hello", "");
+    try tp.sealInlinePayload(0, "CIPHERTEXT", "WRAP");
+    const t = tp.entries.items[0].trigger_payload;
+    try testing.expectEqualStrings("CIPHERTEXT", t.inline_bytes);
+    try testing.expectEqualStrings("WRAP", t.body_key);
+    // The carried length is the PLAINTEXT's: the ref describes what the
+    // handler saw, not how it is stored.
+    try testing.expectEqual(@as(u32, 5), t.body_ref.len);
+
+    var act = Tape.init(a, .activation);
+    defer act.deinit();
+    try act.appendActivation("onMessage", bodies_mod.BodyRef.carried(3), "\x01hi");
+    try act.sealInlinePayload(0, "SEALED", "W");
+    const bytes = try act.serialize(a);
+    defer a.free(bytes);
+    var parsed = try parse(a, bytes);
+    defer parsed.deinit();
+    try testing.expectEqualStrings("SEALED", parsed.entries[0].activation.inline_bytes);
+    try testing.expectEqualStrings("W", parsed.entries[0].activation.body_key);
 }
 
 test "cross-decoder: trigger_payload channel reads back via tape_decode" {
@@ -2962,8 +3122,8 @@ test "cross-decoder: trigger_payload channel reads back via tape_decode" {
     var tape = Tape.init(a, .trigger_payload);
     defer tape.deinit();
     const body = "{\"ctx\":{\"n\":1}}";
-    try tape.appendTriggerPayload(bodies_mod.BodyRef.carried(@intCast(body.len)), body);
-    try tape.appendTriggerPayload(poolRef(42, 4096, 1024), "");
+    try tape.appendTriggerPayload(bodies_mod.BodyRef.carried(@intCast(body.len)), body, "");
+    try tape.appendTriggerPayload(poolRef(42, 4096, 1024), "", "wrapped-data-key");
     const bytes = try tape.serialize(a);
     defer a.free(bytes);
 
@@ -3069,7 +3229,7 @@ test "serializeForEntry drops the channels rather than build an entry nobody can
     const chunk = try a.alloc(u8, 8 * 1024);
     defer a.free(chunk);
     @memset(chunk, 'z');
-    try rs.trigger_payload.appendTriggerPayload(bodies_mod.BodyRef.none, chunk);
+    try rs.trigger_payload.appendTriggerPayload(bodies_mod.BodyRef.none, chunk, "");
 
     const room: usize = 1024;
     var stats: TrimStats = .{};

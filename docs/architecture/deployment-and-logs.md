@@ -251,6 +251,48 @@ so a node that cannot tell those apart says nothing rather than guessing.
 A **streamed** read of the door is refused for the same reason: the gate
 rewrites a whole response body, which a streamed transfer never has in hand.
 
+### Sealed payloads
+
+A request body or fetch chunk too large to ride the tape spills to the
+cross-tenant `_pool/`, and it is written there **before any handler code
+runs** — so it cannot seal at the write boundary the way a kv value does, and
+by the time an identity exists the pool object is content-addressed,
+immutable and shared with other tenants.
+
+So a body is sealed as an **envelope** (`src/keyring/body_seal.zig`): at
+submit, under a data key minted for that body alone; the data key is then
+**wrapped** under the tenant key, and the wrap rides the tape entry that
+references the body (`trigger_payload` / `fetch_responses`, `body_key`), not
+the pool object. When the handler returns, the same late-binding moment that
+seals kv values moves the wrap onto the identity the activation named. The
+wrap is **replaced**, never added to: two wraps of one data key would leave
+the tenant key able to read what destroying the identity promised to erase.
+Destroying the naming key destroys the only copy of the data key, so the
+pool bytes go unreadable everywhere at once — backups included — without
+rewriting an object that cannot be rewritten.
+
+A node with no keyring for the tenant **refuses to spill** rather than submit
+plaintext: a plaintext pool object is copied into every later backup and no
+destroy can ever reach it.
+
+The log-server holds no keys, so its body route answers with the ciphertext
+and the wrap (`body_key_b64`), and the door opens it on the way out with the
+same three answers — plaintext; **410 `erased`** when the key is destroyed
+and the keyring complete; 503 when this node cannot tell. The wrap never
+leaves the door.
+
+A payload small enough to ride its tape entry inline — a request body, a
+fetch chunk, a `{ctx}` envelope, a WS frame or wake bag on the `activation`
+tape — is sealed **in place** the same way, with the wrap beside it on the
+entry, at capture: after the activation's last append and before either copy
+of the readset (the raft entry, the flushed record) is serialized. The record
+has no other copy of any of them. The door opens these on every record it
+serves, and strips every wrap. Capture never fails an activation over this: a
+payload that cannot be sealed as asked (no keyring, a destroyed identity) is
+**dropped** to its recorded length with no bytes — the shape every reader
+already reports as not kept — rather than recorded in plaintext. An erased
+payload reaches a reader in that same shape.
+
 ### The execution-sequence stamp (`exec_seq`)
 
 Per-tenant execution is strictly serial: the tenant has one authoritative
@@ -351,11 +393,12 @@ that window.
   `StreamResumeCtx.tapes`.) Every kind's Msg has exactly one channel:
   `ctx`/envelope → `trigger_payload`, fetch event → `fetch_responses`, and the
   wake bag / WS frame → `activation`, which also carries the **resolved export**
-  for every kind. That last one exists only because a rebuild has nothing else:
-  the flushed record holds those two as its own `activation_bytes` / `export`
-  fields, which never touch raft, so a record rebuilt without them replayed with
-  an empty wakes bag through the conventional export — the same handler id
-  running a different handler (rove#199).
+  for every kind. It rides the raft entry and the flushed record alike, because
+  a rebuild has nothing else: a record rebuilt without it replays with an empty
+  wakes bag through the conventional export — the same handler id running a
+  different handler. The record carries **every** payload on a tape and never
+  as a raw side field, which is what lets payload sealing cover them uniformly
+  (see "Sealed payloads" above).
 
 ## Known limitations (as-built)
 

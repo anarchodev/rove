@@ -412,8 +412,7 @@ LogRecordSummary & {
     timestamp_ns: string,       // §9 fold-in: pinned Date.now origin (i64, JSON string)
     kv_tape_b64?: string,
     module_tree_b64?: string,
-    request_body_b64?: string,
-    request_body_truncated?: boolean,
+    trigger_payload_tape_b64?: string, // the request body, on its tape
     // No response_body field — replay re-produces the response
     // deterministically from (request body + scalars + tapes +
     // source). Math.random / crypto.* / Date.now draw from

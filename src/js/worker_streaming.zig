@@ -77,7 +77,6 @@ const KvWakeOp = worker_mod.KvWakeOp;
 const KvWakeEvent = worker_mod.KvWakeEvent;
 const MAX_STREAM_ACTIVATIONS = worker_mod.MAX_STREAM_ACTIVATIONS;
 const captureLogWithId = worker_mod.captureLogWithId;
-const captureTapesWithActivation = worker_mod.captureTapesWithActivation;
 const resolveDeployment = worker_mod.resolveDeployment;
 
 // ── Stream lifecycle ──────────────────────────────────────────────────
@@ -572,10 +571,10 @@ inline fn streamTapes(worker: anytype, comptime tape: StreamTape, ctx: *const St
         // Guarded on the runtime kind: resumeStream only fires
         // `.wake_batch` today, but the activation param is runtime.
         .wake => if (ctx.act == .wake_batch)
-            worker_mod.captureWakeBatchTapes(worker, ctx.readset, ctx.tape_body, ctx.wakes, ctx.wake_export)
+            worker_mod.captureWakeBatchTapes(worker, ctx.readset, ctx.chain_ctx.tenant_id, ctx.tape_body, ctx.wakes, ctx.wake_export)
         else
             .{},
-        .fetch => worker_mod.captureFetchChunkTapes(worker, ctx.readset, ctx.tape_body, ctx.tape_ev.?),
+        .fetch => worker_mod.captureFetchChunkTapes(worker, ctx.readset, ctx.chain_ctx.tenant_id, ctx.tape_ev.?),
     };
 }
 
@@ -1408,7 +1407,7 @@ pub fn resumeBoundFetchStream(
         txn.rollback() catch {};
         txn_done = true;
         markStreamDrainingAnywhere(server, ent);
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.saga_id, &.{}, .fetch_chunk, 0, exec_seq);
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, chain_ctx.tenant_id, fetch_ev), chain_ctx.saga_id, &.{}, .fetch_chunk, 0, exec_seq);
         return;
     };
 
@@ -1712,20 +1711,21 @@ pub fn fireLogHeader(
 /// Tape payloads for one log record. Fresh per call —
 /// `captureLogWithId` takes ownership of the byte allocations.
 /// `.callback` records the fire's whole body envelope (the callee
-/// outcome) plus the resolved export; `.activation`
-/// records the input bytes as `activation_bytes` (fetch chunks).
+/// outcome) plus the resolved export; `.activation` records the readset
+/// alone — a fetch chunk's input bytes already ride its `fetch_responses`
+/// entry.
 fn fireTapes(
     worker: anytype,
     comptime tape: FireTape,
     readset: *tape_mod.Readset,
+    tenant_id: []const u8,
     body: []const u8,
-    activation_bytes: []const u8,
     export_name: []const u8,
 ) log_mod.TapePayloads {
     return switch (tape) {
         .none => .{},
-        .activation => captureTapesWithActivation(worker, readset, body, activation_bytes),
-        .callback => worker_mod.captureSendCallbackTapes(worker, readset, body, export_name),
+        .activation => worker_mod.captureTapes(worker, readset, tenant_id),
+        .callback => worker_mod.captureSendCallbackTapes(worker, readset, tenant_id, body, export_name),
     };
 }
 
@@ -1782,7 +1782,6 @@ pub fn runFire(
     log_path: []const u8,
     corr: ?[]const u8,
     label: []const u8,
-    activation_bytes: []const u8,
 ) void {
     const allocator = worker.allocator;
     const tenant_id = p.dep.inst.id;
@@ -1825,7 +1824,7 @@ pub fn runFire(
         worker_mod.noteChurnyOutcome(worker, tenant_id, dep_id, log_path);
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, fallback_tags, spec.act, 0, p.exec_seq);
+        captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, tenant_id, req.body, req_w.fn_override orelse ""), corr, fallback_tags, spec.act, 0, p.exec_seq);
         return;
     };
 
@@ -1844,7 +1843,7 @@ pub fn runFire(
                 );
                 p.txn.rollback() catch {};
                 p.txn_done = true;
-                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, r.console, r.exception, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, r.tags, spec.act, 0, p.exec_seq);
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, r.console, r.exception, fireTapes(worker, spec.tape, &p.readset, tenant_id, req.body, req_w.fn_override orelse ""), corr, r.tags, spec.act, 0, p.exec_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1872,7 +1871,7 @@ pub fn runFire(
                 // promotion walker rebuilds a faithful record from it
                 // (`docs/architecture/deployment-and-logs.md`). Consumed by
                 // exactly one `captureLogWithId` below (fault or ok).
-                const tapes = fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse "");
+                const tapes = fireTapes(worker, spec.tape, &p.readset, tenant_id, req.body, req_w.fn_override orelse "");
                 const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &pending_fetches, &p.readset, lh) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): propose failed: {s}", .{ label, @errorName(perr) });
                     // EntryTooLarge is a stated rule, not a platform fault — the record
@@ -1896,7 +1895,7 @@ pub fn runFire(
             }
             commitReadOnlyFire(p, spec.site ++ ".commit(terminal)");
             flushFireFetches(worker, &pending_fetches);
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, r.tags, spec.act, 0, p.exec_seq);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.tape, &p.readset, tenant_id, req.body, req_w.fn_override orelse ""), corr, r.tags, spec.act, 0, p.exec_seq);
             p.completed_ok = true;
             if (comptime spec.capture_terminal) captureTerminal(allocator, p, st, r.body);
             r.console = &.{};
@@ -1932,7 +1931,7 @@ pub fn runFire(
                 const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, "POST", log_path, "", corr, p.now_ns, p.exec_seq);
                 // Tapes before propose — input channels ride the raft readset
                 // for the promotion walker (see the terminal arm above).
-                const tapes = fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse "");
+                const tapes = fireTapes(worker, spec.tape, &p.readset, tenant_id, req.body, req_w.fn_override orelse "");
                 const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &pending_fetches, &p.readset, lh) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): cont-return propose failed: {s}", .{ label, @errorName(perr) });
                     // EntryTooLarge is a stated rule, not a platform fault — the record
@@ -1955,7 +1954,7 @@ pub fn runFire(
                 p.txn.rollback() catch {};
                 p.txn_done = true;
             }
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, cval.tags, spec.act, 0, p.exec_seq);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, tenant_id, req.body, req_w.fn_override orelse ""), corr, cval.tags, spec.act, 0, p.exec_seq);
         },
         .stream => |*s2| {
             s2.deinit(allocator);
@@ -1975,7 +1974,7 @@ pub fn runFire(
                 const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, "POST", log_path, "", corr, p.now_ns, p.exec_seq);
                 // Tapes before propose — input channels ride the raft readset
                 // for the promotion walker (see the terminal arm above).
-                const tapes = fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse "");
+                const tapes = fireTapes(worker, spec.tape, &p.readset, tenant_id, req.body, req_w.fn_override orelse "");
                 const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &pending_fetches, &p.readset, lh) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): stream-return propose failed: {s}", .{ label, @errorName(perr) });
                     // EntryTooLarge is a stated rule, not a platform fault — the record
@@ -1993,7 +1992,7 @@ pub fn runFire(
             }
             commitReadOnlyFire(p, spec.site ++ ".commit(stream)");
             flushFireFetches(worker, &pending_fetches);
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, fallback_tags, spec.act, 0, p.exec_seq);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, tenant_id, req.body, req_w.fn_override orelse ""), corr, fallback_tags, spec.act, 0, p.exec_seq);
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations
         // produce these; connectionless fires never dispatch as one.
@@ -2001,7 +2000,7 @@ pub fn runFire(
         .no_onheaders, .no_onchunk => {
             p.txn.rollback() catch {};
             p.txn_done = true;
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, req.body, activation_bytes, req_w.fn_override orelse ""), corr, fallback_tags, spec.act, 0, p.exec_seq);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.tape, &p.readset, tenant_id, req.body, req_w.fn_override orelse ""), corr, fallback_tags, spec.act, 0, p.exec_seq);
         },
     }
 }

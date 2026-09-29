@@ -19,6 +19,7 @@ const std = @import("std");
 const rove = @import("rove");
 const h2 = @import("rove-h2");
 const kv_mod = @import("raft-kv");
+const pool_seal = @import("pool_seal.zig");
 const log_mod = @import("rove-log");
 const tape_mod = @import("rove-tape");
 const bodies_mod = @import("rove-bodies");
@@ -2213,6 +2214,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                         sid.id,
                         body_cap,
                         kv_mod.hashStoreId(scope_inst.id),
+                        // Resolved HERE, where the instance id is in
+                        // scope; the job itself takes everything by
+                        // injection and never looks a tenant up.
+                        pool_seal.tenantKeyFor(worker, scope_inst.id),
                     ) orelse
                     {
                         try respb.setSimpleResponse(server, ent, sid, sess, 503, "client disconnected before body completed\n", allocator);
@@ -2434,11 +2439,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             readset.body_read = true;
             if (h.coord == .inline_ok) {
                 const inline_ref: bodies_mod.BodyRef = bodies_mod.BodyRef.carried(@intCast(h.bytes.len));
-                readset.trigger_payload.appendTriggerPayload(inline_ref, h.bytes) catch |err| {
+                readset.trigger_payload.appendTriggerPayload(inline_ref, h.bytes, "") catch |err| {
                     std.log.warn("rove-js inbound-chunk: trigger_payload append (inline, first fire): {s}", .{@errorName(err)});
                 };
             } else {
-                readset.trigger_payload.appendTriggerPayload(h.ref, "") catch |err| {
+                readset.trigger_payload.appendTriggerPayload(h.ref, "", &h.body_key) catch |err| {
                     std.log.warn("rove-js inbound-chunk: trigger_payload append (ref, first fire): {s}", .{@errorName(err)});
                 };
             }
@@ -2448,7 +2453,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // durability before moving the entity back; the saved
                 // body_ref points into S3. Skip append + flush;
                 // record the BodyRef on the readset.
-                readset.trigger_payload.appendTriggerPayload(body_wait.body_ref, "") catch |err| {
+                readset.trigger_payload.appendTriggerPayload(body_wait.body_ref, "", &body_wait.body_key) catch |err| {
                     std.log.warn(
                         "rove-js inbound: readset.trigger_payload append (resume) tenant={s}: {s}",
                         .{ scope_inst.id, @errorName(err) },
@@ -2468,7 +2473,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     // ride inline in the readset; the raft entry's
                     // fsync IS durability. Handler runs immediately.
                     const inline_ref: bodies_mod.BodyRef = bodies_mod.BodyRef.carried(@intCast(body.len));
-                    readset.trigger_payload.appendTriggerPayload(inline_ref, body) catch |err| {
+                    readset.trigger_payload.appendTriggerPayload(inline_ref, body, "") catch |err| {
                         std.log.warn(
                             "rove-js inbound: readset.trigger_payload append (inline) tenant={s} bytes={d}: {s}",
                             .{ scope_inst.id, body.len, @errorName(err) },
@@ -2483,12 +2488,26 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     // the BodyRef once the seq is durable.
                     if (worker.node.blob_coord.coordinator) |coord| {
                         const wid = worker.coord_queue_id;
-                        if (coord.submit(wid, kv_mod.hashStoreId(scope_inst.id), body)) |seq| {
+                        // Seal before submitting: the pool carries
+                        // ciphertext, and the wrap rides the park to the
+                        // tape entry. Refusing on a missing keyring is
+                        // deliberate — see `pool_seal`.
+                        const sealed = pool_seal.sealForPool(worker, worker.allocator, scope_inst.id, body) catch |err| {
+                            std.log.warn(
+                                "rove-js inbound: cannot seal body for the pool tenant={s} bytes={d}: {s}",
+                                .{ scope_inst.id, body.len, @errorName(err) },
+                            );
+                            body_gate_failed = true;
+                            continue;
+                        };
+                        defer worker.allocator.free(sealed.body);
+                        if (coord.submit(wid, kv_mod.hashStoreId(scope_inst.id), sealed.body)) |seq| {
                             try server.reg.set(ent, server.coll(.request_out), worker_mod.BodyDurabilityWait, .{
                                 .worker_seq = seq,
                                 .queue_id = wid,
                                 .status = .fresh,
                                 .tenant_id = scope_inst.id,
+                                .body_key = sealed.wrapped_key,
                             });
                             try server.reg.move(ent, server.coll(.request_out), worker.body_pending);
                             processed += 1;
@@ -2793,7 +2812,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // failure mode (e.g. step through the same kv reads to see
             // why the handler hit the CPU budget).
             worker_mod.dropPartialDigest(&readset);
-            const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
+            const tape_payloads = worker_mod.captureTapes(worker, &readset, scope_inst.id);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, tape_payloads, saga_id, &.{}, .inbound, 0, exec_seq);
             processed += 1;
             continue;
@@ -2941,7 +2960,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                         .{ scope_inst.id, @errorName(re) },
                     );
                     try respb.setSimpleResponse(server, ent, sid, sess, 500, worker_mod.NEXT_FN_UNSUPPORTED_BODY, allocator);
-                    worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, body), saga_id, &.{}, .inbound, 0, exec_seq);
+                    worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, scope_inst.id), saga_id, &.{}, .inbound, 0, exec_seq);
                     processed += 1;
                     continue;
                 }
@@ -3090,7 +3109,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // any tape-consuming expression baked into the throw
             // message (e.g. `Date.now()`) resolves to the same value
             // it did originally.
-            const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
+            const tape_payloads = worker_mod.captureTapes(worker, &readset, scope_inst.id);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, console_owned, exception_owned, tape_payloads, saga_id, &.{}, .inbound, 0, exec_seq);
             processed += 1;
             continue;
@@ -3110,7 +3129,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // point with the same prior reads. The digest does not
             // survive: this activation never reached its result.
             worker_mod.dropPartialDigest(&readset);
-            const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
+            const tape_payloads = worker_mod.captureTapes(worker, &readset, scope_inst.id);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, tape_payloads, saga_id, &.{}, .inbound, 0, exec_seq);
             processed += 1;
             continue;
@@ -3154,7 +3173,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     .{ scope_inst.id, @errorName(re) },
                 );
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, worker_mod.HELD_NO_WAKE_SOURCE_BODY, allocator);
-                worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, body), saga_id, &.{}, .inbound, 0, exec_seq);
+                worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, scope_inst.id), saga_id, &.{}, .inbound, 0, exec_seq);
                 processed += 1;
                 continue;
             }
@@ -3212,7 +3231,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // ride inline in the next ndjson flush. Inbound `body` is
         // included for replay; the outbound response is NOT — replay
         // re-produces it deterministically from (body, tapes, source).
-        const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
+        const tape_payloads = worker_mod.captureTapes(worker, &readset, scope_inst.id);
 
         // Serialize this request's readset and append to
         // the batch's list. finalizeBatch wraps the collected blobs

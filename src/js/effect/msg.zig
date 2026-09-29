@@ -176,7 +176,7 @@ pub const SubscriptionFire = struct {};
 /// four-primitive effect model, `docs/effect-algebra.md`).
 /// FetchPool libcurl → `enqueueFetchEventForTenant` → MsgQueue →
 /// dispatch fires `on_chunk` activation. The chunk bytes get taped
-/// via `TapePayloads.activation_bytes`. One tag covers terminal
+/// on the readset's `fetch_responses` entry. One tag covers terminal
 /// events too: `UpstreamFetchEvent.final` is `true` on the last event
 /// for any fetch and carries the terminal `status` / `ok` /
 /// `body_truncated` fields.

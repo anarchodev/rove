@@ -213,13 +213,13 @@ Capture writes six channels (`src/tape/root.zig`, `Channel`):
 | `request_reads` (4) | the read-recorded `request` surface (header names/values, body-read flag, ip) |
 | `activation` (5) | the activation's own record: the **resolved export** it dispatched to, plus its Msg for the two kinds no other channel holds (`wake_batch`'s fired-watch bag, `ws_message`'s `[opcode][data]` frame) |
 
-The sixth is the only one the offline readers never see as a blob: the flushed
-record carries those two values as its own `export`/`activation_bytes` fields,
-which every reader already resolves. The channel exists so they ride the **raft
-entry** as well — that entry is all a promoted leader's walker has when the
-original leader died between propose and flush, and a record rebuilt without
-them replays with an empty wakes bag, through the conventional export
-(rove#199).
+The flushed record carries the sixth as `activation_tape_b64` (and the export
+again as its own `export` field). It rides the **raft entry** too — that entry
+is all a promoted leader's walker has when the original leader died between
+propose and flush, and a record rebuilt without it replays with an empty wakes
+bag, through the conventional export. A record carries every payload on a tape
+and nowhere else; a payload tape leaves the logs door opened
+(`docs/architecture/deployment-and-logs.md`, sealed payloads).
 
 ### A read the budget dropped is refused, not answered
 
@@ -428,10 +428,10 @@ replay` reproduces `request.body` + `request.status`. `on_fetch_smoke_v2` and
 bug affected the WS `ws_message` / `wake_batch` / `disconnect` resumes (via
 `finishWsResume` + `fireWsDisconnect`). Fixed with the same shape — tape the
 activation's Msg: `ws_message` records the frame (`captureWsFrameTapes` →
-`activation_bytes = [opcode][data]`; `root.run` rebuilds
+the `activation` tape, `[opcode][data]`; `root.run` rebuilds
 `request.activation = {opcode, data}` — text frames reproduce, binary is a
 follow-up), `wake_batch` / `disconnect` record readset + ctx. `pull` carries
-`activation_bytes`. **Validated end-to-end** (`replay_ws_message_smoke_v2.py`): a
+the `activation` tape. **Validated end-to-end** (`replay_ws_message_smoke_v2.py`): a
 live WS text frame → `onMessage` now tapes the frame and offline replay
 reproduces `request.activation.data` (asserted via the handler's `kv` write).
 `ws_worker`/`ws_wake`/`ws_fetch` smokes unregressed. (HTTP non-fetch continuation
@@ -462,7 +462,7 @@ as base64 (`activation.dataB64`); the epilogue rebuilds the `Uint8Array` on
 silently return: (1) an **L3 capture-time assert** (`worker_log.l3AssertMsgRecorded`
 at the `captureLogWithId` chokepoint) — a successful callback activation whose
 Msg channel is known-and-always-populated (`fetch_chunk`→`fetch_responses`,
-`ws_message`→`activation_bytes`) that ships **empty tapes** panics in debug/
+`ws_message`→`activation`) that ships **empty tapes** panics in debug/
 tests (loud-logs in prod — the log path must never crash a live request) and
 names the fix. Zero false positives: kinds whose Msg may legitimately be empty
 (disconnect/boot/edge-wakes) aren't asserted; **extend the switch when a new
@@ -477,7 +477,7 @@ unit test.
 **Update 2026-07-12 — `wake_batch` fully recorded (issue #62).** A wake
 resume's Msg is the drained fired-watch batch (`request.activation.wakes[]`,
 the #8 fired-prefix contract) — now taped on all three resume paths (stream /
-held `next()` / WS) as `activation_bytes` (the wakes JSON, verbatim in the
+held `next()` / WS) on the `activation` tape (the wakes JSON, verbatim in the
 JS-facing encoding — `captureWakeBatchTapes`; always at least `[]`, so the L3
 guard asserts it), alongside the threaded ctx envelope on `trigger_payload`
 (kept past the read-taping elision via `Readset.ctx_payload` — ctx is consumed

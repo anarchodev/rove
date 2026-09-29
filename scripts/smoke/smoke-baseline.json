@@ -524,6 +524,11 @@
     "seconds": 7.6,
     "status": "pass"
   },
+  "pool_body_shred_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 6.4,
+    "status": "pass"
+  },
   "promote_back_smoke_v2.py": {
     "rc": 0,
     "seconds": 16.1,
