@@ -1882,10 +1882,11 @@ pub fn armBackup(
 /// seals under; then the store dump, so the tenant's `_keys/dead/`
 /// tombstones are present; then the shards, whose landing marks an open
 /// keyring stale so it reloads and reconciles against those tombstones. That
-/// reconcile is what stops a restore from resurrecting a key a crypto-shred
-/// destroyed (`docs/architecture/backup-and-restore.md`, why a restore cannot
-/// undo an erasure). The secret carries no identity keys, so it can precede
-/// the tombstones.
+/// reconcile keeps a keyring from outrunning its store — it cannot help a run
+/// taken before the destroy, which holds the key and no tombstone
+/// (`docs/architecture/backup-and-restore.md`, what a restore can and cannot
+/// undo). The secret carries no identity keys, so it can precede the
+/// tombstones.
 pub fn handleKeyringRestore(
     server: anytype,
     allocator: std.mem.Allocator,

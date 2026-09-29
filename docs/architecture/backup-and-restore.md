@@ -100,16 +100,29 @@ without `REWIND_KEYRING_KEK`, and that lives in SOPS, never in the backup
 store. Two factors, separated by construction — which is the property that
 makes shipping this off-provider defensible at all.
 
-### Why a restore cannot undo an erasure
+### What a restore can and cannot undo
 
 Holding keys in a backup raises the obvious question: an old backup's shard
 still contains a key the tenant has since destroyed, so does restoring it
-bring the key back? No — and the reason is the split crypto-shredding already
-makes. A destroy carries no key material, so it rides the tenant's **raft
-log** as `_keys/dead/{slot}`; the key itself never does. The tombstone is
-therefore part of the store dump, and `TenantKeys.open` reconciles against it
-before anything can reach the keyring: any slot with a tombstone is evicted
-and its shard rewritten without it.
+bring the key back? It depends on which run.
+
+**A run taken before the destroy brings it back.** Its keyring holds the key,
+its store holds the data sealed under it, and its store predates the
+tombstone — so restoring it is restoring the tenant to a moment before the
+erasure. Nothing in the run can know better. That is the **resurrection
+window**: an erasure is complete only once every run predating it has aged
+out of retention (below), and anyone holding both the backup store and the
+cluster KEK can open such a run without this tool at all. A customer-facing
+erasure claim must state that window.
+
+**A keyring never outruns its store.** A destroy carries no key material, so
+it rides the tenant's **raft log** as `_keys/dead/{slot}`; the key itself
+never does. The tombstone is therefore part of any store dump taken after the
+destroy, and the keyring reconciles against it before anything can reach it:
+any slot with a tombstone is evicted and its shard rewritten without it. So
+pairing an older keyring with a newer store — or a restore that lands the
+shards after a store that already carries the tombstone — cannot bring the
+key back.
 
 That makes the restore **order** load-bearing rather than stylistic:
 

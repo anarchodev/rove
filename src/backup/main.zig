@@ -38,9 +38,13 @@
 //! restored: every value it sealed under `shredKey` is ciphertext in the
 //! dump, and the keys live outside raft. They move verbatim — nothing is
 //! decrypted to make the copy — so the whole backup stays inert without the
-//! cluster KEK, which lives in SOPS and never here. A restore lands the store
-//! FIRST and the keyring second, because the store carries the `_keys/dead/`
-//! tombstones that stop a restore from resurrecting a destroyed key.
+//! cluster KEK, which lives in SOPS and never here. A restore lands the
+//! tenant secret, then the store, then the shards: the store carries the
+//! `_keys/dead/` tombstones the shards reconcile against, so a keyring never
+//! outruns its store. A run taken BEFORE a destroy still holds that key —
+//! erasure is complete only once such runs age out of retention
+//! (`docs/architecture/backup-and-restore.md`, what a restore can and cannot
+//! undo).
 //!
 //! The manifest is written LAST: a run without one is an incomplete run, and
 //! `verify` says so rather than reporting a partial set as restorable.
