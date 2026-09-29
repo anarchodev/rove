@@ -47,6 +47,7 @@ const keyring_slots = @import("keyring_slots.zig");
 const keyring_shard = @import("keyring_shard.zig");
 const deployment_cache = @import("deployment_cache.zig");
 const keyring_mod = @import("rove-keyring");
+const tenant_mod = @import("rove-tenant");
 const kv_mod = @import("raft-kv");
 
 const reserved = @import("rove-reserved");
@@ -230,6 +231,9 @@ pub const RefillDriver = struct {
         while (it.next()) |entry| {
             const slot = entry.value_ptr.*;
             const keys = slot.keyState() orelse {
+                // The root group is plaintext by design: no keyring exists
+                // anywhere to adopt, so asking is only a retry loop.
+                if (std.mem.eql(u8, slot.instance_id, tenant_mod.ROOT_INSTANCE_ID)) continue;
                 if (self.pull == null or now < slot.keyring_retry_ns) continue;
                 if (!slot.keyring_repair.tryLock()) continue;
                 return .{ .missing = slot };
@@ -333,6 +337,7 @@ pub const RefillDriver = struct {
     fn adopt(self: *RefillDriver, slot: *deployment_cache.TenantSlot) void {
         const cfg = self.pull orelse return;
         const now: i64 = @intCast(std.time.nanoTimestamp());
+        const tombstones_before = self.dc.tombstones_applied.load(.monotonic);
         const published = blk: {
             _ = keyring_shard.pullFromVoters(self.allocator, cfg, slot.instance_id) catch break :blk false;
             const kdir = keyring_mod.keyspace.keyringDir(self.allocator, cfg.data_dir) catch break :blk false;
@@ -350,10 +355,18 @@ pub const RefillDriver = struct {
             std.log.info("keyring {s}: adopted from peers (complete={})", .{
                 slot.instance_id, keys.complete.load(.acquire),
             });
-            if (slot.keys.cmpxchgStrong(null, keys, .acq_rel, .acquire) != null) {
-                // Published by another path meanwhile. Keep that one.
-                keys.deinit();
-            }
+            // Published under the slot lock, against the tombstone count:
+            // see `DeploymentCache.tombstones_applied`.
+            const lost = lost: {
+                self.dc.tenant_files_lock.lock();
+                defer self.dc.tenant_files_lock.unlock();
+                if (slot.keys.cmpxchgStrong(null, keys, .acq_rel, .acquire) != null) break :lost true;
+                if (self.dc.tombstones_applied.load(.monotonic) != tombstones_before) keys.markStale();
+                break :lost false;
+            };
+            // Published by another path meanwhile: keep that one. Freed
+            // outside the lock — deinit waits out any sweep in flight.
+            if (lost) keys.deinit();
             break :blk true;
         };
         if (published) return;
