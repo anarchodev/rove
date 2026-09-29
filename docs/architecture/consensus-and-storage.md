@@ -552,6 +552,47 @@ scoping in S3 mirrors the on-disk layout exactly
 (`{key_prefix_base}{id}/file-blobs/`) so leader and followers hit identical
 keys. This is why tenant move never moves blobs.
 
+## Keyring replication (key material rides around raft)
+
+A tenant's crypto-shredding keys (`src/keyring/`, `src/crypt/keyring.zig`) are
+node-local files: a sealed secret plus one sealed file per shard of slots,
+under `{data_dir}/keyrings/{hash(tenant)}/`. **Erasure goes through the log, key
+material around it.** A destroy carries only a slot number, so it rides the
+tenant's raft group as a `_keys/dead/{slot}` tombstone and reaches every node,
+including one that was down. Key material can never take that path, since the
+log would keep a destroyed key legible forever. A shard's file key is
+`HKDF(cluster KEK, tenant id)`, the same on every node, so shards move between
+nodes as **portable ciphertext** and nothing is decrypted in transit.
+
+- **Push** (`keyring_shard.pushToQuorum`). The leader mints a block of slots
+  and offers the shard to **every** voter, and hands out no slot until a
+  majority holds it. It is offered once; a voter that is down misses it.
+- **Pull** (`GET /_system/v2-keyring-pull`, move-secret gated). A node asks
+  every other voter for everything it holds for a tenant (secret plus all
+  shards) and **merges by union** (`mergeSealedShard`). Union is monotonic,
+  so a peer that is behind cannot cost the asker a key. Two different keys
+  for one slot refuse, and install nothing. A key a destroy removed can come
+  back through a union; reconciling against the tombstones removes it again
+  before any read sees it.
+- **Completeness is recomputed, not settled once.** A replica opens a tenant's
+  keyring at placement, before anything is minted, when an empty keyring is
+  complete. Shards later land on its disk by push or pull, behind the open
+  keyring. So the minted watermark's apply and a push's receipt both **mark
+  the keyring stale** (`TenantKeys.markStale`). That clears completeness at
+  once, so a miss reads `unverified` rather than as an erasure, and the
+  keyring driver reloads from disk (`TenantKeys.refresh`): tombstoned slots
+  are dropped before the fresh set goes live, then destroys are reconciled and
+  completeness recomputed.
+- **Where the pull runs.** On the keyring driver (`keyring_pool.RefillDriver`),
+  never on a read. It pulls for a tenant this node cannot vouch for, with a
+  backoff, and adopts a keyring for a slot opened with none: a move
+  destination or a voter added after birth, since the CP hands a secret out
+  only at a tenant's birth. Pulling on a key miss instead would make absence
+  non-authoritative everywhere, reintroducing the invalidation class a
+  complete cache removes.
+- `GET /_system/v2-keyring-status?tenant=T` reports a node's view: whether it
+  holds a keyring, whether it can vouch for it, and how many keys it holds.
+
 ## Performance characteristics (what to expect, and not)
 
 - **Apply-bound, not consensus-bound.** At realistic handler costs

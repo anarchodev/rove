@@ -66,6 +66,14 @@ const IDLE_SLEEP_NS: u64 = 25 * std.time.ns_per_ms;
 /// unavailable does not spin the driver on behalf of every other tenant.
 const FAIL_SLEEP_NS: u64 = 100 * std.time.ns_per_ms;
 
+/// First and longest wait between pulls for one tenant this node cannot
+/// vouch for (or holds no keyring for). Doubling from the first: a peer
+/// that is briefly behind is retried promptly, and a tenant with no keyring
+/// anywhere — one that predates crypto-shredding — settles at one request
+/// per voter every few minutes.
+const REPAIR_FIRST_NS: i64 = 1 * std.time.ns_per_s;
+const REPAIR_MAX_NS: i64 = 5 * std.time.ns_per_min;
+
 /// Per-tenant callback context. Generic over the worker type so this
 /// file needs no import of it — the worker owns the deployment cache
 /// that owns the slots that own these, and naming it here would close
@@ -133,7 +141,7 @@ pub fn Ctx(comptime W: type) type {
 /// wrong key later. Leadership already arbitrates every other write to
 /// this tenant.
 pub fn ensurePool(worker: anytype, slot: *deployment_cache.TenantSlot) !void {
-    const keys = slot.keys orelse return;
+    const keys = slot.keyState() orelse return;
     if (keys.hasPool()) return;
 
     // Leader-gated: two nodes refilling the same tenant would produce
@@ -158,6 +166,9 @@ pub fn ensurePool(worker: anytype, slot: *deployment_cache.TenantSlot) !void {
 pub const RefillDriver = struct {
     allocator: std.mem.Allocator,
     dc: *deployment_cache.DeploymentCache,
+    /// How this node pulls a keyring from its peers, or null when it
+    /// cannot (the surface is off, or there are no peers to ask).
+    pull: ?keyring_shard.PullConfig = null,
     threads: []std.Thread = &.{},
     stopping: std.atomic.Value(bool) = .init(false),
 
@@ -171,8 +182,9 @@ pub const RefillDriver = struct {
         self: *RefillDriver,
         allocator: std.mem.Allocator,
         dc: *deployment_cache.DeploymentCache,
+        pull: ?keyring_shard.PullConfig,
     ) !void {
-        self.* = .{ .allocator = allocator, .dc = dc };
+        self.* = .{ .allocator = allocator, .dc = dc, .pull = pull };
         const ts = try allocator.alloc(std.Thread, WORKERS);
         errdefer allocator.free(ts);
         var started: usize = 0;
@@ -193,61 +205,145 @@ pub const RefillDriver = struct {
         self.threads = &.{};
     }
 
-    /// Claim one pool that wants a block, or null.
-    ///
-    /// The claim is taken while the map lock is held, which is what makes
-    /// the returned pointer safe to use after the lock is released: the
-    /// slot was alive at claim time, and teardown blocks on the same
-    /// mutex. `tryLock` rather than `lock`, so a tenant another worker is
-    /// already refilling is skipped instead of stalling the map lock
-    /// behind a raft round trip.
+    /// One tenant's worth of driver work, claimed.
+    const Work = union(enum) {
+        /// A keyring with something to do; its `claim_lock` is held.
+        keys: *keyring_mod.TenantKeys,
+        /// A slot with no keyring at all, whose tenant may have one on a
+        /// peer; its `keyring_repair` is held.
+        missing: *deployment_cache.TenantSlot,
+    };
+
     /// Claim one tenant with work, or null.
     ///
     /// The claim is taken while the map lock is held, which is what makes
     /// the pointer safe to use after the lock is released: the slot was
     /// alive at claim time, and teardown blocks on the same mutex.
-    fn claim(self: *RefillDriver) ?*keyring_mod.TenantKeys {
+    /// `tryLock` rather than `lock`, so a tenant another worker already
+    /// has is skipped instead of stalling the map lock behind a raft round
+    /// trip.
+    fn claim(self: *RefillDriver) ?Work {
+        const now: i64 = @intCast(std.time.nanoTimestamp());
         self.dc.tenant_files_lock.lock();
         defer self.dc.tenant_files_lock.unlock();
         var it = self.dc.tenant_files_map.iterator();
         while (it.next()) |entry| {
-            const keys = entry.value_ptr.*.keys orelse continue;
-            // Either kind of work claims it. A destroy is owed even by a
+            const slot = entry.value_ptr.*;
+            const keys = slot.keyState() orelse {
+                if (self.pull == null or now < slot.keyring_retry_ns) continue;
+                if (!slot.keyring_repair.tryLock()) continue;
+                return .{ .missing = slot };
+            };
+            // Any kind of work claims it. A destroy is owed even by a
             // tenant with no pool — a node can hold keys for a tenant it
             // does not lead, and it still has to erase them.
-            if (!keys.hasPendingDestroys() and !keys.poolNeedsRefill()) continue;
+            const wants = keys.stale.load(.acquire) or
+                (self.pull != null and keys.repairDue(now)) or
+                keys.hasPendingDestroys() or keys.poolNeedsRefill();
+            if (!wants) continue;
             if (!keys.claim_lock.tryLock()) continue;
-            return keys;
+            return .{ .keys = keys };
         }
         return null;
     }
 
     fn loop(self: *RefillDriver) void {
         while (!self.stopping.load(.acquire)) {
-            const keys = self.claim() orelse {
+            const work = self.claim() orelse {
                 std.Thread.sleep(IDLE_SLEEP_NS);
                 continue;
             };
-            // Destroys first: an erasure this node owes outranks keeping
-            // its pool warm, and the queue is usually empty.
-            const drained = keys.drainDestroys() catch |err| blk: {
-                std.log.warn(
-                    "keyring {s}: destroy rewrite failed: {s} — reconciliation will retry",
-                    .{ keys.instance_id, @errorName(err) },
-                );
-                break :blk 0;
-            };
-            _ = drained;
-            const res = keys.refillPoolOnce();
-            keys.claim_lock.unlock();
-            if (res) |_| {} else |err| {
-                std.log.warn(
-                    "keyring pool {s}: refill failed: {s}",
-                    .{ keys.instance_id, @errorName(err) },
-                );
-                std.Thread.sleep(FAIL_SLEEP_NS);
+            switch (work) {
+                .keys => |keys| {
+                    defer keys.claim_lock.unlock();
+                    self.catchUp(keys);
+                    self.maintain(keys);
+                },
+                .missing => |slot| {
+                    defer slot.keyring_repair.unlock();
+                    self.adopt(slot);
+                },
             }
         }
+    }
+
+    /// Bring a keyring level with its disk, then with its peers.
+    fn catchUp(self: *RefillDriver, keys: *keyring_mod.TenantKeys) void {
+        if (keys.stale.load(.acquire)) keys.refresh() catch |err| std.log.warn(
+            "keyring {s}: refresh failed: {s} — it stays unverified and retries",
+            .{ keys.instance_id, @errorName(err) },
+        );
+        const cfg = self.pull orelse return;
+        const now: i64 = @intCast(std.time.nanoTimestamp());
+        if (!keys.repairDue(now)) return;
+        if (keyring_shard.pullFromVoters(self.allocator, cfg, keys.instance_id)) |_| {
+            keys.refresh() catch |err| std.log.warn(
+                "keyring {s}: refresh after pull failed: {s}",
+                .{ keys.instance_id, @errorName(err) },
+            );
+        } else |err| std.log.warn(
+            "keyring {s}: cannot vouch for its keys and no peer helped: {s}",
+            .{ keys.instance_id, @errorName(err) },
+        );
+        keys.noteRepair(now, REPAIR_FIRST_NS, REPAIR_MAX_NS);
+        if (keys.complete.load(.acquire))
+            std.log.info("keyring {s}: complete after pulling from peers", .{keys.instance_id});
+    }
+
+    /// Owed destroys, then the pool.
+    fn maintain(self: *RefillDriver, keys: *keyring_mod.TenantKeys) void {
+        _ = self;
+        // Destroys first: an erasure this node owes outranks keeping its
+        // pool warm, and the queue is usually empty.
+        _ = keys.drainDestroys() catch |err| std.log.warn(
+            "keyring {s}: destroy rewrite failed: {s} — reconciliation will retry",
+            .{ keys.instance_id, @errorName(err) },
+        );
+        _ = keys.refillPoolOnce() catch |err| {
+            std.log.warn("keyring pool {s}: refill failed: {s}", .{ keys.instance_id, @errorName(err) });
+            std.Thread.sleep(FAIL_SLEEP_NS);
+        };
+    }
+
+    /// Give a slot with no keyring the one its tenant has on a peer.
+    ///
+    /// A move destination, or a voter added after the tenant's birth,
+    /// takes the tenant up with no secret: the CP hands one out only at
+    /// birth and keeps no copy, since a key in the directory would sit in
+    /// a raft log. Its peers hold it — so pull, open, and publish into the
+    /// live slot (`TenantSlot.keys` is atomic for exactly this).
+    fn adopt(self: *RefillDriver, slot: *deployment_cache.TenantSlot) void {
+        const cfg = self.pull orelse return;
+        const now: i64 = @intCast(std.time.nanoTimestamp());
+        const published = blk: {
+            _ = keyring_shard.pullFromVoters(self.allocator, cfg, slot.instance_id) catch break :blk false;
+            const kdir = keyring_mod.keyspace.keyringDir(self.allocator, cfg.data_dir) catch break :blk false;
+            defer self.allocator.free(kdir);
+            const keys = (keyring_mod.TenantKeys.open(
+                self.allocator,
+                kdir,
+                slot.instance_id,
+                cfg.keyring_kek,
+                slot.app_kv,
+            ) catch |err| {
+                std.log.warn("keyring {s}: open after pull failed: {s}", .{ slot.instance_id, @errorName(err) });
+                break :blk false;
+            }) orelse break :blk false;
+            std.log.info("keyring {s}: adopted from peers (complete={})", .{
+                slot.instance_id, keys.complete.load(.acquire),
+            });
+            if (slot.keys.cmpxchgStrong(null, keys, .acq_rel, .acquire) != null) {
+                // Published by another path meanwhile. Keep that one.
+                keys.deinit();
+            }
+            break :blk true;
+        };
+        if (published) return;
+        slot.keyring_retry_backoff_ns = if (slot.keyring_retry_backoff_ns == 0)
+            REPAIR_FIRST_NS
+        else
+            @min(slot.keyring_retry_backoff_ns * 2, REPAIR_MAX_NS);
+        slot.keyring_retry_ns = now + slot.keyring_retry_backoff_ns;
     }
 };
 
@@ -300,7 +396,7 @@ pub fn resolveSlot(
     txn: anytype,
     writeset: *kv_mod.WriteSet,
 ) !u64 {
-    const keys = slot.keys orelse return error.KeyringUnavailable;
+    const keys = slot.keyState() orelse return error.KeyringUnavailable;
     const pk = keyring_mod.keyspace.pseudonymKey(keys.tenantSecret());
 
     const bind_key = try keyring_mod.keyspace.bindKey(allocator, pk, identity);

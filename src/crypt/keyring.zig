@@ -309,6 +309,33 @@ pub const Keyring = struct {
         return &self.secret;
     }
 
+    /// A second keyring holding exactly what this tenant's shards on disk
+    /// hold now, sharing no memory with this one.
+    ///
+    /// Shards land on disk behind an open keyring — a push from the leader,
+    /// a pull from a peer — and nothing about the in-memory set changes
+    /// when they do. This is how a holder catches up without reopening:
+    /// build the fresh set with no lock held, then `adoptKeys` it in one
+    /// swap. The caller deinits the result.
+    pub fn snapshotFromDisk(self: *const Self) Error!Self {
+        var fresh: Self = .{
+            .allocator = self.allocator,
+            .tenant_dir = self.allocator.dupe(u8, self.tenant_dir) catch return Error.OutOfMemory,
+            .file_key = self.file_key,
+            .secret = self.secret,
+        };
+        errdefer fresh.deinit();
+        try fresh.readShards();
+        return fresh;
+    }
+
+    /// Take `other`'s key set as this keyring's, leaving `other` holding
+    /// the old one — so `other.deinit` zeroes the keys this one gave up.
+    pub fn adoptKeys(self: *Self, other: *Self) void {
+        std.mem.swap(std.AutoHashMapUnmanaged(u64, Entry), &self.keys, &other.keys);
+        std.mem.swap(std.AutoHashMapUnmanaged(u32, u32), &self.shard_counts, &other.shard_counts);
+    }
+
     pub fn count(self: *const Self) usize {
         return self.keys.count();
     }
@@ -1108,6 +1135,124 @@ pub fn readSealedShard(
         else => Error.Io,
     };
 }
+
+/// Install a peer's sealed shard as the UNION of it and what this node
+/// already holds for that shard.
+///
+/// A pull is served by whichever peer answers, and that peer may be
+/// behind this node — so unlike a push, which comes from the node that
+/// just minted and replaces the shard verbatim, a pulled shard must never
+/// cost this node a key it already has. Union is monotonic: running it
+/// against any peer, in any order, only adds.
+///
+/// A slot both copies hold must hold the same key. Two different keys for
+/// one slot means two nodes minted it independently, and installing either
+/// would hand one identity's data the wrong key later — so that refuses as
+/// `Corrupt` and installs nothing. Keys a destroy has since removed can
+/// come back through a union; the caller reconciles against the tenant's
+/// tombstones before any read can see them (`TenantKeys.refresh`).
+///
+/// Verified before anything lands, exactly as `installSealedShard` is.
+pub fn mergeSealedShard(
+    allocator: std.mem.Allocator,
+    base_dir: []const u8,
+    tenant_id: []const u8,
+    kek: []const u8,
+    shard: u32,
+    sealed: []const u8,
+) Error!void {
+    // A peer's empty shard adds nothing. It is NOT a removal here: only a
+    // destroy through the log may take a key away.
+    if (sealed.len == 0) return;
+
+    var kr = try Keyring.init(allocator, base_dir, tenant_id, kek);
+    defer kr.deinit();
+    try sweepStaleTemps(allocator, kr.tenant_dir);
+
+    const plain = crypt.openAlloc(allocator, sealed, kr.file_key) catch |err| switch (err) {
+        crypt.Error.AuthFailed => return Error.AuthFailed,
+        crypt.Error.OutOfMemory => return Error.OutOfMemory,
+        else => return Error.Corrupt,
+    };
+    defer {
+        std.crypto.secureZero(u8, plain);
+        allocator.free(plain);
+    }
+    const n = try validateShardPlain(plain, shard);
+
+    try kr.readShard(shard);
+    const held: u32 = kr.shard_counts.get(shard) orelse 0;
+    kr.keys.ensureUnusedCapacity(allocator, n) catch return Error.OutOfMemory;
+
+    var added: u32 = 0;
+    var pos: usize = SHARD_HEADER_LEN;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const slot = std.mem.readInt(u64, plain[pos..][0..8], .little);
+        pos += 8;
+        var key: crypt.Key = undefined;
+        @memcpy(&key, plain[pos..][0..crypt.KEY_LEN]);
+        defer std.crypto.secureZero(u8, &key);
+        pos += crypt.KEY_LEN;
+        const created = std.mem.readInt(i64, plain[pos..][0..8], .little);
+        pos += 8;
+        if (kr.keys.get(slot)) |mine| {
+            if (!std.mem.eql(u8, &mine.key, &key)) return Error.Corrupt;
+            continue;
+        }
+        kr.keys.putAssumeCapacity(slot, .{ .key = key, .created_unix_ns = created });
+        added += 1;
+    }
+    if (added == 0) return;
+    kr.shard_counts.put(allocator, shard, held + added) catch return Error.OutOfMemory;
+    try kr.flushShard(shard);
+}
+
+/// Install a peer's sealed secret file when this node has none, or accept
+/// it when it matches the one this node has.
+///
+/// The pull's counterpart to `installSealedSecret`, which refuses whenever
+/// the tenant holds shards: a restore lands on a tenant with nothing, but a
+/// node repairing itself can legitimately hold shards and no secret — a
+/// voter receives every push whether or not it was given the secret. What
+/// must never happen is REPLACING a secret, since every pseudonym derived
+/// from the old one would then point nowhere; a mismatch refuses as
+/// `Corrupt`.
+pub fn adoptSealedSecret(
+    allocator: std.mem.Allocator,
+    base_dir: []const u8,
+    tenant_id: []const u8,
+    kek: []const u8,
+    sealed: []const u8,
+) Error!void {
+    var kr = try Keyring.init(allocator, base_dir, tenant_id, kek);
+    defer kr.deinit();
+    try sweepStaleTemps(allocator, kr.tenant_dir);
+
+    const plain = crypt.openAlloc(allocator, sealed, kr.file_key) catch |err| switch (err) {
+        crypt.Error.AuthFailed => return Error.AuthFailed,
+        crypt.Error.OutOfMemory => return Error.OutOfMemory,
+        else => return Error.Corrupt,
+    };
+    defer {
+        std.crypto.secureZero(u8, plain);
+        allocator.free(plain);
+    }
+    if (plain.len != SECRET_FILE_LEN) return Error.Corrupt;
+    if (std.mem.readInt(u32, plain[0..4], .big) != SECRET_MAGIC) return Error.Corrupt;
+    if (std.mem.readInt(u16, plain[4..6], .little) != FORMAT_VERSION) return Error.Corrupt;
+
+    kr.readSecretFile() catch |err| switch (err) {
+        Error.NoKeyring => {
+            const path = try kr.secretPath();
+            defer allocator.free(path);
+            return kr.writeRaw(path, sealed);
+        },
+        else => return err,
+    };
+    if (!std.mem.eql(u8, &kr.secret, plain[6..][0..SECRET_LEN])) return Error.Corrupt;
+}
+
 
 /// Identifies THIS process's temporaries, so a sweep can tell one that
 /// may be in flight from one that is provably abandoned.
@@ -2153,4 +2298,161 @@ test "replication: installing is idempotent, so a retried push is safe" {
     defer b.deinit();
     try testing.expectEqual(@as(usize, 2), b.count());
     try testing.expectEqualSlices(u8, &minted, &b.keyAt(1).?);
+}
+
+test "pull: a merged shard only ever adds keys, whichever node is behind" {
+    // A pull is served by whichever peer answers, and that peer may hold
+    // LESS than this node. Replacing would cost keys; union never does.
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const node_a = tmpDirPath(&buf_a);
+    defer cleanup(node_a);
+    const node_b = tmpDirPath(&buf_b);
+    defer cleanup(node_b);
+
+    // A holds slots 1..3; B holds 1..3 and also 4..5, the same keys for the
+    // overlap (B received A's first push, then the mint of 4..5).
+    {
+        var a = try Keyring.create(testing.allocator, node_a, "acme", TEST_KEK, TEST_SECRET);
+        defer a.deinit();
+        try a.mintRange(1, 3, 1);
+    }
+    {
+        var b = try Keyring.create(testing.allocator, node_b, "acme", TEST_KEK, TEST_SECRET);
+        b.deinit();
+    }
+    const from_a = (try readSealedShard(testing.allocator, node_a, "acme", TEST_KEK, 0)).?;
+    defer testing.allocator.free(from_a);
+    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, 0, from_a);
+    {
+        var b = try Keyring.open(testing.allocator, node_b, "acme", TEST_KEK);
+        defer b.deinit();
+        try b.mintRange(4, 2, 1);
+    }
+
+    // B pulls from A, who is behind. B keeps all five.
+    try mergeSealedShard(testing.allocator, node_b, "acme", TEST_KEK, 0, from_a);
+    {
+        var b = try Keyring.open(testing.allocator, node_b, "acme", TEST_KEK);
+        defer b.deinit();
+        try testing.expectEqual(@as(usize, 5), b.count());
+    }
+
+    // A pulls from B, who is ahead. A gains 4 and 5.
+    const from_b = (try readSealedShard(testing.allocator, node_b, "acme", TEST_KEK, 0)).?;
+    defer testing.allocator.free(from_b);
+    try mergeSealedShard(testing.allocator, node_a, "acme", TEST_KEK, 0, from_b);
+    var a = try Keyring.open(testing.allocator, node_a, "acme", TEST_KEK);
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 5), a.count());
+
+    // And a peer's EMPTY shard is not a removal: only a destroy through the
+    // log may take a key away.
+    try mergeSealedShard(testing.allocator, node_a, "acme", TEST_KEK, 0, "");
+    var a2 = try Keyring.open(testing.allocator, node_a, "acme", TEST_KEK);
+    defer a2.deinit();
+    try testing.expectEqual(@as(usize, 5), a2.count());
+}
+
+test "pull: two different keys for one slot refuse, and install nothing" {
+    // Two nodes that minted the same slot independently. Installing either
+    // key would hand one identity's data the wrong key later.
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const node_a = tmpDirPath(&buf_a);
+    defer cleanup(node_a);
+    const node_b = tmpDirPath(&buf_b);
+    defer cleanup(node_b);
+    {
+        var a = try Keyring.create(testing.allocator, node_a, "acme", TEST_KEK, TEST_SECRET);
+        defer a.deinit();
+        try a.mintRange(1, 2, 1);
+    }
+    var mine: crypt.Key = undefined;
+    {
+        var b = try Keyring.create(testing.allocator, node_b, "acme", TEST_KEK, TEST_SECRET);
+        defer b.deinit();
+        try b.mintRange(1, 1, 1);
+        mine = b.keyAt(1).?;
+    }
+    const from_a = (try readSealedShard(testing.allocator, node_a, "acme", TEST_KEK, 0)).?;
+    defer testing.allocator.free(from_a);
+    try testing.expectError(Error.Corrupt, mergeSealedShard(testing.allocator, node_b, "acme", TEST_KEK, 0, from_a));
+    var b = try Keyring.open(testing.allocator, node_b, "acme", TEST_KEK);
+    defer b.deinit();
+    try testing.expectEqual(@as(usize, 1), b.count());
+    try testing.expectEqualSlices(u8, &mine, &b.keyAt(1).?);
+}
+
+test "pull: a node holding shards but no secret adopts the secret; a different one refuses" {
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const node_a = tmpDirPath(&buf_a);
+    defer cleanup(node_a);
+    const node_b = tmpDirPath(&buf_b);
+    defer cleanup(node_b);
+    {
+        var a = try Keyring.create(testing.allocator, node_a, "acme", TEST_KEK, TEST_SECRET);
+        defer a.deinit();
+        try a.mintRange(1, 2, 1);
+    }
+    // B received the push but never the secret — a voter added after birth.
+    const shard = (try readSealedShard(testing.allocator, node_a, "acme", TEST_KEK, 0)).?;
+    defer testing.allocator.free(shard);
+    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, 0, shard);
+    try testing.expectError(Error.NoKeyring, Keyring.open(testing.allocator, node_b, "acme", TEST_KEK));
+    // A restore would refuse here (shards exist); a pull must not.
+    const secret = (try readSealedSecret(testing.allocator, node_a, "acme", TEST_KEK)).?;
+    defer testing.allocator.free(secret);
+    try testing.expectError(Error.Corrupt, installSealedSecret(testing.allocator, node_b, "acme", TEST_KEK, secret));
+    try adoptSealedSecret(testing.allocator, node_b, "acme", TEST_KEK, secret);
+    {
+        var b = try Keyring.open(testing.allocator, node_b, "acme", TEST_KEK);
+        defer b.deinit();
+        try testing.expectEqual(@as(usize, 2), b.count());
+        try testing.expectEqualSlices(u8, &TEST_SECRET, b.tenantSecret());
+    }
+    // Idempotent for the same secret; a DIFFERENT one never replaces.
+    try adoptSealedSecret(testing.allocator, node_b, "acme", TEST_KEK, secret);
+    var buf_c: [64]u8 = undefined;
+    const node_c = tmpDirPath(&buf_c);
+    defer cleanup(node_c);
+    {
+        var other = try Keyring.create(testing.allocator, node_c, "acme", TEST_KEK, [_]u8{0x42} ** SECRET_LEN);
+        other.deinit();
+    }
+    const other_secret = (try readSealedSecret(testing.allocator, node_c, "acme", TEST_KEK)).?;
+    defer testing.allocator.free(other_secret);
+    try testing.expectError(Error.Corrupt, adoptSealedSecret(testing.allocator, node_b, "acme", TEST_KEK, other_secret));
+}
+
+test "a holder picks up shards that landed behind it, in one swap" {
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const node_a = tmpDirPath(&buf_a);
+    defer cleanup(node_a);
+    const node_b = tmpDirPath(&buf_b);
+    defer cleanup(node_b);
+    {
+        var a = try Keyring.create(testing.allocator, node_a, "acme", TEST_KEK, TEST_SECRET);
+        defer a.deinit();
+        try a.mintRange(1, 3, 1);
+    }
+    // B opened before the push: its in-memory set is empty.
+    {
+        var b0 = try Keyring.create(testing.allocator, node_b, "acme", TEST_KEK, TEST_SECRET);
+        b0.deinit();
+    }
+    var b = try Keyring.open(testing.allocator, node_b, "acme", TEST_KEK);
+    defer b.deinit();
+    const sealed = (try readSealedShard(testing.allocator, node_a, "acme", TEST_KEK, 0)).?;
+    defer testing.allocator.free(sealed);
+    try installSealedShard(testing.allocator, node_b, "acme", TEST_KEK, 0, sealed);
+    try testing.expect(b.keyAt(2) == null); // landed behind the open keyring
+
+    var fresh = try b.snapshotFromDisk();
+    b.adoptKeys(&fresh);
+    fresh.deinit();
+    try testing.expectEqual(@as(usize, 3), b.count());
+    try testing.expect(b.keyAt(2) != null);
 }

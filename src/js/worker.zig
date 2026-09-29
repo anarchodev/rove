@@ -2943,7 +2943,7 @@ pub fn Worker(comptime opts: Options) type {
         ) ?*keyring_mod.TenantKeys {
             const self: *Self = @ptrCast(@alignCast(ctx));
             const slot = self.node.deploy.tenant_files_map.get(instance_id) orelse return null;
-            return slot.keys;
+            return slot.keyState();
         }
 
         /// `ShredCaps.resolve_slot` — turn the identity a handler named

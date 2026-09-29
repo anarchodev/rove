@@ -45,6 +45,7 @@ const blob = @import("rove-blob");
 const wire = @import("rove-wire");
 const curl = blob.curl;
 const respb = @import("response_builder.zig");
+const bridge_mod = @import("bridge");
 
 /// `/_system/` suffix this handles. Registered in the `v2-*` family, so
 /// it inherits that family's move-secret gate.
@@ -122,7 +123,19 @@ pub fn handlePush(
         return respb.setSystemResponse(server, ent, sid, sess, status, "keyring install failed\n", allocator, null, null);
     };
 
+    // The shard landed on disk, behind whatever this node holds in memory.
+    markStale(&worker.node.deploy, frame.tenant_id);
+
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
+}
+
+/// Tell an open keyring that its disk moved under it. A tenant with no
+/// open slot here has nothing in memory to be stale.
+fn markStale(dc: anytype, tenant: []const u8) void {
+    dc.tenant_files_lock.lock();
+    defer dc.tenant_files_lock.unlock();
+    const slot = dc.tenant_files_map.get(tenant) orelse return;
+    if (slot.keyState()) |keys| keys.markStale();
 }
 
 // ── push ─────────────────────────────────────────────────────────────
@@ -229,6 +242,218 @@ pub fn pushToQuorum(
         );
         return PushError.NoQuorum;
     }
+}
+
+// ── pull ─────────────────────────────────────────────────────────────
+//
+// A push reaches the voters that are up when a shard is written, and
+// nothing ever offers it again. A node that was down, joined later, or took
+// the tenant up by a move therefore stays short of keys indefinitely — and a
+// node short of keys can only answer `unverified`. The pull is how it stops
+// being short: it asks a peer for everything that peer holds for the tenant.
+//
+// It runs where a node takes a tenant up, never on a read. The keyring
+// driver pulls for a tenant this node cannot vouch for (`repairDue`), and
+// for a slot opened with no keyring at all. Pulling on a key miss instead
+// would make absence non-authoritative everywhere and bring back the
+// invalidation class a complete cache removes.
+
+/// `/_system/` suffix serving a pull. `v2-*`, so the move-secret gate
+/// covers it the same as a push.
+pub const PULL_ROUTE = "v2-keyring-pull";
+
+/// `GET /_system/v2-keyring-pull?tenant=T` — everything this node holds for
+/// `T`: the sealed secret file and every sealed shard, verbatim.
+///
+/// Served whether or not this node is itself complete. The receiver merges
+/// by union, so a peer that is behind can only fail to help; it cannot
+/// cost the receiver a key. 404 when this node has no keyring for `T`.
+pub fn handlePull(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    tenant_opt: ?[]const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "GET"))
+        return respb.setSystemResponse(server, ent, sid, sess, 405, "GET only\n", allocator, null, null);
+    const tenant = tenant_opt orelse
+        return respb.setSystemResponse(server, ent, sid, sess, 400, "missing tenant\n", allocator, null, null);
+    const kek = worker.keyring_kek orelse
+        return respb.setSystemResponse(server, ent, sid, sess, 404, "keyring surface disabled\n", allocator, null, null);
+    const data_dir = worker.data_dir orelse
+        return respb.setSystemResponse(server, ent, sid, sess, 404, "keyring surface disabled\n", allocator, null, null);
+
+    const body = bundleFor(allocator, data_dir, kek, tenant) catch |err| {
+        std.log.warn("v2-keyring-pull {s}: {s}", .{ tenant, @errorName(err) });
+        return respb.setSystemResponse(server, ent, sid, sess, 500, "keyring read failed\n", allocator, null, null);
+    } orelse return respb.setSystemResponse(server, ent, sid, sess, 404, "no keyring for tenant\n", allocator, null, null);
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, null, "application/octet-stream");
+}
+
+/// This node's whole keyring for `tenant` as a pull answer, or null when
+/// it has none. Caller frees.
+fn bundleFor(allocator: std.mem.Allocator, data_dir: []const u8, kek: []const u8, tenant: []const u8) !?[]u8 {
+    const dir = try keyringDir(allocator, data_dir);
+    defer allocator.free(dir);
+
+    const secret = (try crypt.keyring.readSealedSecret(allocator, dir, tenant, kek)) orelse return null;
+    defer allocator.free(secret);
+
+    const shards = try crypt.keyring.listShards(allocator, dir, tenant);
+    defer allocator.free(shards);
+    var parts: std.ArrayListUnmanaged(crypt.replicate.ShardPart) = .empty;
+    defer {
+        for (parts.items) |p| allocator.free(p.sealed);
+        parts.deinit(allocator);
+    }
+    for (shards) |shard| {
+        // Emptied between the listing and the read: an absent shard is an
+        // empty one, and a union gains nothing from it.
+        const sealed = (try crypt.keyring.readSealedShard(allocator, dir, tenant, kek, shard)) orelse continue;
+        errdefer allocator.free(sealed);
+        try parts.append(allocator, .{ .shard = shard, .sealed = sealed });
+    }
+    return try crypt.replicate.encodeBundle(allocator, .{
+        .tenant_id = tenant,
+        .secret = secret,
+        .shards = parts.items,
+    });
+}
+
+/// `/_system/` suffix for a node's view of one tenant's keyring.
+pub const STATUS_ROUTE = "v2-keyring-status";
+
+/// `GET /_system/v2-keyring-status?tenant=T` — whether this node holds a
+/// keyring for `T`, whether it can vouch for it, and how many keys it has
+/// loaded. Diagnostic: it is how an operator (and the failover smoke) tells
+/// "this node is short of keys" from "this node has them" without reading
+/// a sealed value. 404 when the tenant has no open slot here.
+pub fn handleStatus(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    tenant_opt: ?[]const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "GET"))
+        return respb.setSystemResponse(server, ent, sid, sess, 405, "GET only\n", allocator, null, null);
+    const tenant = tenant_opt orelse
+        return respb.setSystemResponse(server, ent, sid, sess, 400, "missing tenant\n", allocator, null, null);
+    const dc = &worker.node.deploy;
+    dc.tenant_files_lock.lock();
+    const slot = dc.tenant_files_map.get(tenant) orelse {
+        dc.tenant_files_lock.unlock();
+        return respb.setSystemResponse(server, ent, sid, sess, 404, "no open slot\n", allocator, null, null);
+    };
+    const json = if (slot.keyState()) |keys| std.fmt.allocPrint(
+        allocator,
+        "{{\"keyring\":true,\"complete\":{},\"stale\":{},\"keys\":{d}}}",
+        .{ keys.complete.load(.acquire), keys.stale.load(.acquire), keys.keyCount() },
+    ) else allocator.dupe(u8, "{\"keyring\":false,\"complete\":false,\"stale\":false,\"keys\":0}");
+    dc.tenant_files_lock.unlock();
+    const body = json catch return respb.setSystemResponse(server, ent, sid, sess, 500, "encode failed\n", allocator, null, null);
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, null, "application/json");
+}
+
+/// What the keyring driver needs to pull: node-wide, fixed at boot.
+pub const PullConfig = struct {
+    raft: *bridge_mod.Bridge,
+    self_id: u64,
+    peer_urls: []const []const u8,
+    move_secret: []const u8,
+    keyring_kek: []const u8,
+    data_dir: []const u8,
+};
+
+pub const PullError = error{
+    /// The tenant's membership could not be read.
+    UnknownMembership,
+    /// No voter answered with a keyring this node could install.
+    NoPeerAnswered,
+    OutOfMemory,
+};
+
+/// Pull `tenant`'s keyring from every other voter and merge each answer
+/// into this node's. Blocks on HTTP — keyring driver only.
+///
+/// Every voter, not the first that answers: any single peer may itself be
+/// short (it missed the same push this node did), and union makes asking
+/// more of them strictly better. A peer that is down or has nothing costs
+/// a failed request and no more.
+pub fn pullFromVoters(allocator: std.mem.Allocator, cfg: PullConfig, tenant: []const u8) PullError!usize {
+    const gid = cfg.raft.gidForTenant(tenant) orelse return PullError.UnknownMembership;
+    var voters_buf: [MAX_VOTERS]u64 = undefined;
+    var learners_buf: [MAX_VOTERS]u64 = undefined;
+    const cs = cfg.raft.confState(gid, &voters_buf, &learners_buf) orelse
+        return PullError.UnknownMembership;
+
+    const dir = keyringDir(allocator, cfg.data_dir) catch return PullError.OutOfMemory;
+    defer allocator.free(dir);
+
+    var answered: usize = 0;
+    for (cs.voters) |peer| {
+        if (peer == cfg.self_id) continue;
+        if (peer == 0 or peer - 1 >= cfg.peer_urls.len) continue;
+        if (pullOne(allocator, cfg, dir, cfg.peer_urls[peer - 1], tenant)) answered += 1;
+    }
+    if (answered == 0) return PullError.NoPeerAnswered;
+    return answered;
+}
+
+/// One peer: fetch, verify it names this tenant, adopt the secret, merge
+/// every shard. True when the peer's keyring landed.
+fn pullOne(allocator: std.mem.Allocator, cfg: PullConfig, dir: []const u8, base: []const u8, tenant: []const u8) bool {
+    const url = std.fmt.allocPrint(allocator, "{s}/_system/" ++ PULL_ROUTE ++ "?tenant={s}", .{ base, tenant }) catch return false;
+    defer allocator.free(url);
+    const headers = [_]curl.Header{.{ .name = MOVE_SECRET_HEADER, .value = cfg.move_secret }};
+    var resp = curl.cpGet(allocator, url, .{ .headers = &headers }) catch |err| {
+        std.log.warn("keyring pull {s} from {s}: transport error: {s}", .{ tenant, base, @errorName(err) });
+        return false;
+    };
+    defer resp.deinit(allocator);
+    if (resp.status != 200) {
+        // 404 is ordinary — that peer has no keyring for the tenant either —
+        // but still worth a line: it is the answer that explains a node that
+        // never converges.
+        if (resp.status == 404)
+            std.log.info("keyring pull {s} from {s}: peer holds no keyring for it", .{ tenant, base })
+        else
+            std.log.warn("keyring pull {s} from {s}: peer replied {d}", .{ tenant, base, resp.status });
+        return false;
+    }
+    const body = resp.body orelse return false;
+    const bundle = crypt.replicate.decodeBundle(allocator, body) catch |err| {
+        std.log.warn("keyring pull {s} from {s}: undecodable answer: {s}", .{ tenant, base, @errorName(err) });
+        return false;
+    };
+    defer allocator.free(bundle.shards);
+    // An answer for a different tenant would install someone else's keys
+    // under this tenant's name.
+    if (!std.mem.eql(u8, bundle.tenant_id, tenant)) {
+        std.log.warn("keyring pull {s} from {s}: answer names tenant {s}", .{ tenant, base, bundle.tenant_id });
+        return false;
+    }
+    crypt.keyring.adoptSealedSecret(allocator, dir, tenant, cfg.keyring_kek, bundle.secret) catch |err| {
+        std.log.warn("keyring pull {s} from {s}: secret refused: {s}", .{ tenant, base, @errorName(err) });
+        return false;
+    };
+    for (bundle.shards) |part| {
+        crypt.keyring.mergeSealedShard(allocator, dir, tenant, cfg.keyring_kek, part.shard, part.sealed) catch |err| {
+            std.log.warn(
+                "keyring pull {s} from {s} shard={d}: merge refused: {s}",
+                .{ tenant, base, part.shard, @errorName(err) },
+            );
+            return false;
+        };
+    }
+    return true;
 }
 
 /// Resolve a raft node id to its HTTP base. Node ids are 1-based

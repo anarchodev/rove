@@ -605,7 +605,25 @@ pub const TenantSlot = struct {
     /// the tenant predates crypto-shredding. Neither is an error, and
     /// neither may be read as "everything was erased": a lookup against a
     /// null keyring is `unverified`.
-    keys: ?*keyring_mod.TenantKeys = null,
+    ///
+    /// Atomic because it can be PUBLISHED into a live slot: a node that
+    /// takes up a tenant without its keyring (a move destination, a voter
+    /// added after birth) pulls it from a peer on the keyring driver and
+    /// sets it here, while the poll loop reads it lock-free (`keyState`).
+    /// Only ever null → keyring; teardown is the one place it is freed.
+    keys: std.atomic.Value(?*keyring_mod.TenantKeys) = .init(null),
+    /// Held by the keyring driver while it pulls a keyring this slot has
+    /// none of — claimed under `tenant_files_lock` so the slot is provably
+    /// alive at the claim, and taken by teardown before anything is freed,
+    /// the same handoff `TenantKeys.claim_lock` gives a slot that has keys.
+    keyring_repair: std.Thread.Mutex = .{},
+    /// Earliest time (ns) the driver may try to pull a missing keyring
+    /// again — so a tenant with no keyring anywhere (one that predates
+    /// crypto-shredding) costs a peer round trip at a falling rate, not
+    /// every sweep.
+    keyring_retry_ns: i64 = 0,
+    keyring_retry_backoff_ns: i64 = 0,
+
 
     /// Resolved per-tenant plan limits (docs/architecture/control-plane.md —
     /// operational state). Null until the CP delivers a plan
@@ -667,6 +685,11 @@ pub const TenantSlot = struct {
     /// pull the watermark *earlier*; `scheduler_tick` recomputes the
     /// exact min when it next fires. Monotone-min so concurrent
     /// committing workers converge without a lock.
+    /// This tenant's key state, or null. Lock-free; see `keys`.
+    pub fn keyState(self: *const TenantSlot) ?*keyring_mod.TenantKeys {
+        return self.keys.load(.acquire);
+    }
+
     pub fn lowerWake(self: *TenantSlot, when_ns: i64) void {
         if (when_ns == 0) return;
         while (true) {
@@ -1004,7 +1027,7 @@ pub const DeploymentCache = struct {
         self.tenant_files_lock.lock();
         defer self.tenant_files_lock.unlock();
         const slot = self.tenant_files_map.get(tenant_id) orelse return .unverified;
-        const keys = slot.keys orelse return .unverified;
+        const keys = slot.keyState() orelse return .unverified;
         return keys.openValue(allocator, value);
     }
 
@@ -1022,7 +1045,7 @@ pub const DeploymentCache = struct {
         self.tenant_files_lock.lock();
         defer self.tenant_files_lock.unlock();
         const slot = self.tenant_files_map.get(tenant_id) orelse return .unverified;
-        const keys = slot.keys orelse return .unverified;
+        const keys = slot.keyState() orelse return .unverified;
         return keys.openBody(allocator, sealed_body, wrap);
     }
 
@@ -1232,7 +1255,7 @@ fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*
         .blob_backend = blob_backend,
         .manifest_backend = manifest_backend,
         .current = .{ .raw = null },
-        .keys = keys,
+        .keys = .init(keys),
     };
 
     // Best-effort initial load. Read `_deploy/current` from the
@@ -1277,7 +1300,11 @@ fn freeTenantSlot(allocator: std.mem.Allocator, slot: *TenantSlot) void {
     if (slot.plan.load(.acquire)) |p| allocator.destroy(p);
     for (slot.plan_retired.items) |p| allocator.destroy(p);
     slot.plan_retired.deinit(allocator);
-    if (slot.keys) |k| k.deinit();
+    // Wait out a keyring pull in flight before freeing what it may publish
+    // into, then free whatever it did publish.
+    slot.keyring_repair.lock();
+    slot.keyring_repair.unlock();
+    if (slot.keyState()) |k| k.deinit();
     slot.manifest_backend.deinit();
     slot.blob_backend.deinit();
     allocator.free(slot.instance_id);

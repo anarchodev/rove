@@ -268,9 +268,20 @@ fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, op: bridge_mod.A
     // The proposing node did this inline at the destroy (its own entries
     // return above on `origin`), so between the two halves every node acts
     // exactly once.
+    // `_keys/minted` — the tenant minted more keys, which reached this
+    // node's disk by push and not its memory. Mark the keyring stale:
+    // lock-free here on the pump thread, and it clears completeness at
+    // once so no lookup calls a not-yet-loaded key destroyed; the keyring
+    // driver reloads from disk off this thread.
+    if (std.mem.eql(u8, key, rjs.keyring.keyspace.MINTED_KEY)) {
+        if (node.deploy.tenant_files_map.get(id_str)) |slot| {
+            if (slot.keyState()) |keys| keys.markStale();
+        }
+        return;
+    }
     if (rjs.keyring.keyspace.parseDeadSlot(key)) |key_slot| {
         if (node.deploy.tenant_files_map.get(id_str)) |slot| {
-            if (slot.keys) |keys| keys.evictAndQueue(key_slot);
+            if (slot.keyState()) |keys| keys.evictAndQueue(key_slot);
         }
         return;
     }
@@ -1296,8 +1307,27 @@ pub fn main() !void {
     // ahead of demand so binding an identity never waits on consensus.
     // Idle when no tenant has a pool, which is every cluster that has
     // not turned crypto-shredding on.
+    //
+    // It also keeps each keyring level with what this node holds on disk
+    // and with its peers: reloading after a push lands behind an open
+    // keyring, pulling for a tenant this node cannot vouch for, and
+    // adopting a keyring for a slot opened with none (rove#666). Pulling
+    // needs peers, the move secret that gates their route, and the KEK.
+    const keyring_pull: ?rjs.keyring_shard.PullConfig = blk: {
+        const kek = keyring_kek orelse break :blk null;
+        const secret = move_secret orelse break :blk null;
+        if (peer_urls.len == 0) break :blk null;
+        break :blk .{
+            .raft = bridge,
+            .self_id = bridge.config.node_id,
+            .peer_urls = peer_urls,
+            .move_secret = secret,
+            .keyring_kek = kek,
+            .data_dir = data_dir,
+        };
+    };
     var keyring_driver: rjs.keyring_pool.RefillDriver = undefined;
-    try keyring_driver.start(allocator, &node_state.deploy);
+    try keyring_driver.start(allocator, &node_state.deploy, keyring_pull);
     defer keyring_driver.deinit();
     // Continuous follower deployment loading: fire on every committed
     // `_deploy/current` write so a FOLLOWER loads each deployment as it

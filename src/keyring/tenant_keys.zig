@@ -59,6 +59,21 @@ pub const TenantKeys = struct {
     /// lookup path; `false` means a miss says nothing about erasure.
     complete: std.atomic.Value(bool) = .init(false),
 
+    /// Something changed under the in-memory key set — a shard landed on
+    /// disk behind it, or the tenant's minted watermark advanced — and
+    /// `refresh` has not caught up yet. Set with `complete` already
+    /// cleared (`markStale`), so the window reads `unverified`, never an
+    /// erasure that did not happen.
+    stale: std.atomic.Value(bool) = .init(false),
+
+    /// Earliest time (ns) the driver may pull from a peer again while this
+    /// node cannot vouch for its keys, and the current backoff — so a
+    /// tenant whose peers are all behind too costs a round trip at a
+    /// falling rate rather than every sweep. Driver-thread only, under
+    /// `claim_lock`.
+    repair_after_ns: i64 = 0,
+    repair_backoff_ns: i64 = 0,
+
     /// Minted keys ahead of demand. Null until a leader starts one.
     pool: ?crypt.pool.SlotPool = null,
     pool_ctx: ?*anyopaque = null,
@@ -151,6 +166,13 @@ pub const TenantKeys = struct {
         };
     }
 
+    /// Keys held in memory. A diagnostic, not a decision input.
+    pub fn keyCount(self: *Self) usize {
+        self.map_lock.lock();
+        defer self.map_lock.unlock();
+        return self.keyring.count();
+    }
+
     /// Open a pool body with the wrap its tape entry carries — the body
     /// twin of `openValue`, with the same three-way answer so a reader
     /// keeps "erased" and "this node cannot tell" apart. An empty wrap is
@@ -172,6 +194,103 @@ pub const TenantKeys = struct {
 
     pub fn tenantSecret(self: *Self) *const crypt.keyring.Secret {
         return self.keyring.tenantSecret();
+    }
+
+    // ── catching up with the disk ────────────────────────────────────
+
+    /// The key set may be behind what this node holds or what the tenant
+    /// minted. Clears `complete` BEFORE anything else can observe the
+    /// change, so a lookup in the window answers `unverified` rather than
+    /// calling a key it has not loaded yet destroyed. Cheap and lock-free:
+    /// callable from the pump thread and the poll loop. `refresh` does
+    /// the work, on the keyring driver.
+    pub fn markStale(self: *Self) void {
+        self.complete.store(false, .release);
+        self.stale.store(true, .release);
+    }
+
+    /// Load what is on disk now into the in-memory key set, re-derive the
+    /// destroys this node owes, and recompute completeness.
+    ///
+    /// Completeness settled once, at open, is not enough: a replica opens a
+    /// tenant's slot when the tenant is placed on it, before anything is
+    /// minted, when an empty keyring IS complete. Everything minted after
+    /// that reaches the replica's disk by push and never its memory, so a
+    /// flag nobody recomputes stays true over a set that grew stale, and a
+    /// failover onto that replica reads every sealed value as erased.
+    ///
+    /// Tombstoned slots are dropped from the fresh set BEFORE it goes live,
+    /// so a key whose shard rewrite is still queued never becomes readable
+    /// again; `reconcile` then catches a destroy that applied during the
+    /// load. Fsync-free, but it walks the tombstones — driver thread only,
+    /// under `claim_lock`, which also keeps it clear of a pool mint.
+    pub fn refresh(self: *Self) !void {
+        // Cleared first: a mark that lands while this runs asks for
+        // another pass rather than being lost.
+        self.stale.store(false, .release);
+
+        var fresh = self.keyring.snapshotFromDisk() catch |err| switch (err) {
+            // The directory went away — a deprovision's shred. Nothing to
+            // load, and nothing this node can vouch for.
+            error.NoKeyring => {
+                self.complete.store(false, .release);
+                return;
+            },
+            else => return err,
+        };
+        defer fresh.deinit();
+        try self.dropTombstoned(&fresh);
+
+        self.map_lock.lock();
+        self.keyring.adoptKeys(&fresh);
+        self.map_lock.unlock();
+
+        _ = try self.reconcile();
+        self.refreshCompleteness();
+    }
+
+    /// Remove every tombstoned slot from `kr`.
+    fn dropTombstoned(self: *Self, kr: *crypt.keyring.Keyring) !void {
+        var cursor: []const u8 = "";
+        var cursor_owned: ?[]u8 = null;
+        defer if (cursor_owned) |c| self.allocator.free(c);
+        while (true) {
+            var res = try self.app_kv.prefix(keyspace.DEAD_PREFIX, cursor, 512);
+            defer res.deinit();
+            if (res.entries.len == 0) break;
+            for (res.entries) |e| {
+                const slot = keyspace.parseDeadSlot(e.key) orelse continue;
+                kr.evict(slot);
+            }
+            if (res.entries.len < 512) break;
+            const next = try self.allocator.dupe(u8, res.entries[res.entries.len - 1].key);
+            if (cursor_owned) |c| self.allocator.free(c);
+            cursor_owned = next;
+            cursor = next;
+        }
+    }
+
+    /// Is a pull from a peer due? True while this node cannot vouch for
+    /// its keys, nothing is waiting on a refresh, and the backoff has
+    /// elapsed.
+    pub fn repairDue(self: *Self, now_ns: i64) bool {
+        return !self.complete.load(.acquire) and !self.stale.load(.acquire) and
+            now_ns >= self.repair_after_ns;
+    }
+
+    /// Record a pull's outcome: complete resets the backoff, anything else
+    /// doubles it (from `first_ns`, capped at `max_ns`).
+    pub fn noteRepair(self: *Self, now_ns: i64, first_ns: i64, max_ns: i64) void {
+        if (self.complete.load(.acquire)) {
+            self.repair_backoff_ns = 0;
+            self.repair_after_ns = 0;
+            return;
+        }
+        self.repair_backoff_ns = if (self.repair_backoff_ns == 0)
+            first_ns
+        else
+            @min(self.repair_backoff_ns * 2, max_ns);
+        self.repair_after_ns = now_ns + self.repair_backoff_ns;
     }
 
     /// The key that opens a body wrap, from the ref the wrap names.
@@ -682,4 +801,69 @@ test "one object owns what used to be eight fields on the deployment slot" {
     inline for (.{ "keyring", "pool", "pool_ctx", "complete", "pending" }) |f| {
         try testing.expect(@hasField(TK, f));
     }
+}
+
+test "refresh picks up keys that landed behind an open keyring, and never a destroyed one" {
+    // The failover bug this exists for: a replica opens a tenant's keyring
+    // at placement, before anything is minted — when an empty keyring IS
+    // complete — and every key minted after that reaches its disk by push
+    // and never its memory. Without a refresh that set stays empty and the
+    // flag stays true, so a lookup calls a live key destroyed.
+    const a = testing.allocator;
+    var path_buf: [96]u8 = undefined;
+    const seed = std.crypto.random.int(u64);
+    const db_path = try std.fmt.bufPrintZ(&path_buf, "/tmp/rove-tk-refresh-{x}.kv", .{seed});
+    var lock_buf: [128]u8 = undefined;
+    const lock_path = try std.fmt.bufPrint(&lock_buf, "{s}-lock", .{db_path});
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        std.fs.cwd().deleteFile(lock_path) catch {};
+    }
+    var dir_buf: [96]u8 = undefined;
+    const kr_dir = try std.fmt.bufPrint(&dir_buf, "/tmp/rove-tk-refresh-kr-{x}", .{seed});
+    defer std.fs.cwd().deleteTree(kr_dir) catch {};
+    var src_buf: [96]u8 = undefined;
+    const src_dir = try std.fmt.bufPrint(&src_buf, "/tmp/rove-tk-refresh-src-{x}", .{seed});
+    defer std.fs.cwd().deleteTree(src_dir) catch {};
+    const kek = "a cluster key-encryption key";
+
+    // The replica, opened at placement: nothing minted, so complete.
+    {
+        var kr = try crypt.keyring.Keyring.create(a, kr_dir, "acme", kek, [_]u8{0x5A} ** 32);
+        kr.deinit();
+    }
+    const store = try kv_mod.KvStore.open(a, db_path);
+    defer store.close();
+    const keys = (try TenantKeys.open(a, kr_dir, "acme", kek, store)).?;
+    defer keys.deinit();
+    try testing.expect(keys.complete.load(.acquire));
+
+    // The leader mints 1..3 and pushes the shard; the watermark replicates;
+    // slot 2 is destroyed through the log before this replica refreshes.
+    {
+        var leader = try crypt.keyring.Keyring.create(a, src_dir, "acme", kek, [_]u8{0x5A} ** 32);
+        defer leader.deinit();
+        try leader.mintRange(1, 3, 1);
+    }
+    const sealed = (try crypt.keyring.readSealedShard(a, src_dir, "acme", kek, 0)).?;
+    defer a.free(sealed);
+    try crypt.keyring.installSealedShard(a, kr_dir, "acme", kek, 0, sealed);
+    try store.put(keyspace.MINTED_KEY, &keyspace.encodeMinted(4));
+    const dead = try keyspace.deadKey(a, 2);
+    defer a.free(dead);
+    try store.put(dead, &keyspace.encodeDead(1));
+
+    // The watermark's apply marks the keyring stale: from here until the
+    // refresh, a miss is `unverified`, never an erasure.
+    keys.markStale();
+    try testing.expect(keys.lookup(1) == .unverified);
+
+    try keys.refresh();
+    try testing.expect(keys.lookup(1) == .key);
+    try testing.expect(keys.lookup(3) == .key);
+    // Destroyed through the log while the key was still on disk: it never
+    // becomes readable again.
+    try testing.expect(keys.lookup(2) == .shredded);
+    try testing.expect(keys.complete.load(.acquire));
+    try testing.expect(!keys.stale.load(.acquire));
 }
