@@ -61,13 +61,15 @@ rove#339 (Radar), not by degrading paying-adjacent customers.
 emails (a dashboard checkbox). Branded escalation via `email.send` is a
 fast-follow, not a launch requirement.
 
-**9. Retention downgrade hides immediately, destroys after 30 days.**
+**9. Retention downgrade hides immediately and destroys nothing.**
 The read clamp follows the plan live, so history beyond the new tier's
-retention becomes unreadable at once — but physical erasure (when it
-exists: rove#592's crypto-shredding, rove#333's sweep) must lag a plan
-drop by **30 days**, so an accidental downgrade or a support case can
-recover. This is the one destructive path in the system, and it gets
-the one warning window.
+retention becomes unreadable at once. Nothing is deleted because of a
+plan change: storage keeps every request record for the fleet-wide
+**365 days** whatever the tier (rove#333), so an upgrade within that
+period reveals the hidden history again, and an accidental downgrade or
+a support case always has at least 30 days to recover. (Decided
+2026-10-01; this rule previously required physical erasure to lag a
+plan drop by 30 days, which the 365-day model satisfies trivially.)
 
 **10. Nonpayment is never deprovision.** No automatic deletion of
 tenants or accounts, ever. The account rests on free indefinitely; data
@@ -79,7 +81,7 @@ and DPA lean on — rove#324/#326.)
 | event | plan | serving | outbound | data |
 |---|---|---|---|---|
 | `past_due` (grace) | unchanged | full | unchanged | untouched |
-| grace ends (`canceled` from Stripe) | → free | free-tier serving continues | off | untouched; retention clamp at 7d; erasure lags 30d |
+| grace ends (`canceled` from Stripe) | → free | free-tier serving continues | off | untouched; retention clamp at 7d; records kept to the 365-day purge |
 | customer cancels | unchanged until period end, then → free | uninterrupted through the boundary | off at the boundary | as above |
 | downgrade (paid → smaller paid) | → new tier at webhook | full | per new tier | over-cap kv/instances kept; creation/writes gated |
 | abuse suspension | untouched | stops (front 403) | — | untouched (reversible) |
@@ -138,12 +140,13 @@ scale. Shared tiers are never stretched to hold a whale.
   days are the sold axis and the byte capacity is derived and internal
   (`pricing-model.md` §3; `decisions.md` §11.6). The capacity-ring
   revision this line once anticipated is not coming.
-- **Say "deleted after N days", not "we keep N days"** — the deletion is
-  the half the DPA and privacy policy commit to. Two riders belong in the
-  same breath: records a customer explicitly **pins** outlive the window,
-  and a customer may set a **shorter** window than their tier's. Both are
-  exceptions to a published period, so both have to appear in the prose
-  or the claim is false the first time either is used.
+- **Say "readable for N days; kept up to 365 days", not "deleted after N
+  days"** (decided 2026-10-01, rove#333). The plan window is a read
+  filter; storage is purged at a single fleet-wide 365 days, because the
+  record objects are shared across tenants and no tenant's window
+  exceeds that age. Erasing one tenant (account closure) or one end-user
+  (`shredKey`) before then is key destruction, which reaches only what is
+  sealed (rove#994). There is no pinning.
 - Requests are not priced and not advertised as a quota — the caps exist to
   protect the node, not to meter.
 

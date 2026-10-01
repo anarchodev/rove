@@ -74,6 +74,9 @@ pub const BatchStore = struct {
             max: u32,
             allocator: std.mem.Allocator,
         ) anyerror![][]const u8,
+        /// Remove `key`. Idempotent: a key that is already gone is not an
+        /// error, because several log-servers purge the same shared store.
+        delete: *const fn (ptr: *anyopaque, key: []const u8) anyerror!void,
     };
 
     pub fn put(self: BatchStore, key: []const u8, bytes: []const u8) !void {
@@ -105,6 +108,11 @@ pub const BatchStore = struct {
         allocator: std.mem.Allocator,
     ) ![][]const u8 {
         return self.vtable.list(self.ptr, prefix, after, max, allocator);
+    }
+
+    pub fn delete(self: BatchStore, key: []const u8) !void {
+        try validateKey(key);
+        return self.vtable.delete(self.ptr, key);
     }
 };
 
@@ -153,7 +161,16 @@ pub const MemoryBatchStore = struct {
         .get = vtableGet,
         .getRange = vtableGetRange,
         .list = vtableList,
+        .delete = vtableDelete,
     };
+
+    fn vtableDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
+        const self: *MemoryBatchStore = @ptrCast(@alignCast(ptr));
+        if (self.objects.fetchRemove(key)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
+        }
+    }
 
     fn vtablePut(ptr: *anyopaque, key: []const u8, bytes: []const u8) anyerror!void {
         const self: *MemoryBatchStore = @ptrCast(@alignCast(ptr));

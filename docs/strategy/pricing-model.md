@@ -198,6 +198,14 @@ costs *us* bytes and the customer's horizon is unchanged, and that cost is
 bounded by exactly the derived ceiling above. Strictly better for the
 customer, and affordable precisely because the bound is provable.
 
+> **Decided 2026-10-01 (rove#333).** The plan window is a *read* window
+> only. Storage keeps every request record for one fleet-wide **365
+> days** and then deletes it, whatever the tier; the published period is
+> "readable for your plan's window, kept up to 365 days". **Pinning is not
+> being built**, and a customer-lowered window lowers what is readable,
+> not what is kept. The two consequences below are superseded and kept
+> as the reasoning that was weighed.
+
 Two consequences to carry into the policy text, not just the code:
 
 1. **Pinning is a stated exception.** Letting customers mark an
@@ -214,6 +222,19 @@ Two consequences to carry into the policy text, not just the code:
    on what we will keep, never a floor on what they must.
 
 ### 3.2 Implementation cost to go in eyes-open
+
+> **Decided 2026-10-01 (rove#333): no sharding, no compactor, no
+> per-tier deletion.** Because every axis-2 object is cross-tenant
+> (below), deletion runs at a single fleet-wide age that no tenant's
+> window exceeds: the log-server purges `_logs/` batches and `_pool/`
+> bodies older than 365 days by the time their keys already carry
+> (`src/log_server/purge.zig`). The window per tier is enforced by the
+> read clamp alone. Erasing one tenant or one end-user before 365 days
+> is key destruction (closure, `shredKey`), whose reach is rove#994.
+> The analysis below — sharding by retention class, the downgrade lag —
+> is what was weighed and set aside: class-at-write-time made a customer
+> who shortened their window, or a tier changed back and forth, keep
+> data on the old schedule.
 
 **Every object in axis 2 is cross-tenant.** A previous draft claimed log
 records are per-tenant prefixed at `{instance}/log-blobs/` and concluded
@@ -619,17 +640,10 @@ enforces. Mapping:
   mechanism.** The shipped Lever 3 is a read-path *time clamp* (return
   only the last N days, no GC). `retention_days` is the right billed
   axis and stays; what it lacks is the deletion behind it. The clamp
-  becomes the *read* half of a two-part lever whose *write* half is the
-  per-tenant sweep of §3.2 (rove#333) plus the body-pool compactor
-  (rove#304). Until the sweep ships, the published window is a promise
-  the storage layer does not yet keep — which is a policy exposure, not
-  merely an unpaid cost line.
-
-  The clamp keeps one job the sweep must not take over: **a downgrade
-  hides immediately but must not destroy for 30 days**
-  (`billing-policy.md`, rule 9). So the sweep's horizon is not simply the
-  current plan's `retention_days` — it lags a plan drop, and the clamp is
-  what makes the lag invisible to the reader.
+  becomes the *read* half of the lever; its *write* half is the
+  fleet-wide 365-day purge (rove#333, §3.2's decision note), which keeps
+  storage bounded at one age for every tier. A downgrade therefore hides
+  immediately and destroys nothing early (`billing-policy.md`, rule 9).
 
 No new control-plane state is required. The ring model needed per-tenant
 resident-byte accounting plus an eviction watermark; a time window needs

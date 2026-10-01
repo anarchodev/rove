@@ -90,6 +90,10 @@ pub const Config = struct {
     /// disables `/v1/{tenant}/body/...`, which then reports that the
     /// payload is unreachable rather than serving an empty body.
     content_store: ?batch_store_mod.BatchStore = null,
+    /// Run the daily retention purge (`purge.zig`): delete request records
+    /// and spilled bodies older than `purge.PURGE_AGE_NS`. Off by default —
+    /// a destructive pass over customer data is the operator's to enable.
+    purge: bool = false,
     /// Optional TLS — when set, the listener does TLS termination via
     /// rove-h2's standard path. The `rewind-logs` binary builds this
     /// from its own `--tls-cert` / `--tls-key` flags (`main.zig`); it
@@ -148,6 +152,8 @@ pub fn spawn(config: Config) !*Handle {
         .store = config.store,
         .db = config.db,
         .poll_interval_ms = config.poll_interval_ms,
+        .purge = config.purge,
+        .pool_store = config.content_store,
     });
     errdefer {
         indexer_handle.signalStop();

@@ -404,6 +404,11 @@
     "seconds": 8.1,
     "status": "pass"
   },
+  "log_purge_smoke_v2.py": {
+    "rc": 0,
+    "seconds": 5.0,
+    "status": "pass"
+  },
   "log_tenant_scope_smoke_v2.py": {
     "rc": 0,
     "seconds": 5.3,

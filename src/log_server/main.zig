@@ -24,6 +24,10 @@
 //!                                `--data-dir/log-batches/`.
 //!   LOG_S3_KEY_PREFIX            prepended to every batch-store key
 //!                                when BLOB_BACKEND=s3 (default ``).
+//!   REWIND_LOG_PURGE=1           run the daily retention purge: delete
+//!                                request records and spilled bodies older
+//!                                than the published retention period
+//!                                (`purge.zig`). Off when unset.
 //!
 //! Usage:
 //!   rewind-logs --data-dir <path> --listen <host:port> \
@@ -307,6 +311,10 @@ pub fn main() !void {
         .jwt_secret = jwt_secret,
         .cors_origin = cli.cors_origin,
         .poll_interval_ms = cli.poll_interval_ms,
+        // `REWIND_LOG_PURGE=1` turns on the daily retention purge: records
+        // and spilled bodies older than the published retention period are
+        // deleted. Any other value, or unset, leaves storage untouched.
+        .purge = if (std.posix.getenv("REWIND_LOG_PURGE")) |v| std.mem.eql(u8, v, "1") else false,
     });
     defer handle.shutdown();
 
