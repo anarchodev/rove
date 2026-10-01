@@ -557,8 +557,11 @@ makes the entry fit.
   - **timestamp** — the per-request `timestamp_ns` scalar; a clock read is
     genuinely external, neither generative nor referential. `Date.now()` /
     `new Date()` are pinned per-request (arenajs `JS_SetDateNow`).
-  - **seed** — one per-request PRNG seed; `Math.random` / `crypto.*` draws
-    are recomputed by re-seeding (`JS_SetRandomSeed`), not recorded per-draw.
+  - **seed** — one per-request PRNG seed; `Math.random` draws are
+    recomputed by re-seeding (`JS_SetRandomSeed`), not recorded per-draw.
+    `crypto.*` is the exception (2026-10-01): its draws come from the OS
+    CSPRNG and are recorded, sealed, on the tape's `random` channel, because
+    a recorded seed is the whole secret of every value derived from it.
     Safe because the WASM replay engine runs rove's *own* JS host compiled to
     WASM, so the same PRNG executes in lockstep (engine/PRNG version pinned on
     the tape header).

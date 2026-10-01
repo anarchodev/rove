@@ -17,10 +17,12 @@
 
 /**
  * Cryptographic primitives. Random sources (`getRandomValues`,
- * `randomUUID`, `randomBytes`) are replay-deterministic — captured
- * to the request tape and re-issued identically on replay. Hash and
- * signature-verify operations are pure functions of their inputs and
- * are not taped.
+ * `randomUUID`, `randomBytes`) draw from the operating system's
+ * cryptographically secure generator. Each draw is recorded on the
+ * request's tape, encrypted like a request body, so replay re-issues
+ * the same bytes. `Math.random()` is different: it is replayed from a
+ * seed and is not for secrets. Hash and signature-verify operations
+ * are pure functions of their inputs and are not taped.
  *
  * Two signature families, named by their KEY FORMAT — don't mix
  * them: `verifyEcdsa` / `verifyRsa` take a JWK (the JOSE world:

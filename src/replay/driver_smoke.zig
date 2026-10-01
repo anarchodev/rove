@@ -337,6 +337,66 @@ fn runSealed(a: std.mem.Allocator) !void {
     std.debug.print("SEALED OK — a sealed value refuses instead of replaying as ciphertext\n", .{});
 }
 
+const DRAWS_HANDLER =
+    \\export default function () {
+    \\  const id = crypto.randomUUID();
+    \\  const b = crypto.getRandomValues(new Uint8Array(4));
+    \\  return { id, b: Array.from(b).join(",") };
+    \\}
+;
+
+/// `crypto.*` replays the draws the capture RECORDED, byte for byte and in
+/// order — never values re-derived from the seed, which drives
+/// `Math.random` alone. The world's `random` list holds one 20-byte run:
+/// 16 bytes become the UUID (with prod's v4 version/variant bits) and the
+/// next 4 fill the typed array.
+fn runDraws(a: std.mem.Allocator) !void {
+    var world = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
+    const w = &aw.writer;
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",\"captured\":true,");
+    try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"ex.test\"},\"seed\":1,");
+    try w.writeAll("\"random\":[{\"draw\":\"00112233445566778899aabbccddeeff01020304\"}],");
+    try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(DRAWS_HANDLER, .{}, w);
+    try w.writeAll("}]}");
+    world = aw.toArrayList();
+
+    var out = std.ArrayList(u8){};
+    try root.runWorld(a, world.items, null, &out);
+    const stdout = std.fs.File.stdout();
+    try stdout.writeAll("DRAWS: ");
+    try stdout.writeAll(out.items);
+    try stdout.writeAll("\n");
+    // bytes[6] 0x66 → 0x46, bytes[8] 0x88 → 0x88 (variant bits already 10).
+    check(out.items, &.{
+        "00112233-4455-4677-8899-aabbccddeeff", "\"b\":\"1,2,3,4\"", "\"ok\":true",
+    }, &.{"divergence"}, "RECORDED DRAWS (crypto.* replays the tape, byte-exact)");
+
+    // The same handler against a record that holds too little: a draw the
+    // capture never recorded refuses the run instead of inventing bytes.
+    var short = std.ArrayList(u8){};
+    var sw = std.Io.Writer.Allocating.fromArrayList(a, &short);
+    const w2 = &sw.writer;
+    try w2.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",\"captured\":true,");
+    try w2.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/\",\"host\":\"ex.test\"},\"seed\":1,");
+    try w2.writeAll("\"random\":[{\"draw\":\"00112233445566778899aabbccddeeff\"}],");
+    try w2.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(DRAWS_HANDLER, .{}, w2);
+    try w2.writeAll("}]}");
+    short = sw.toArrayList();
+
+    var out2 = std.ArrayList(u8){};
+    try root.runWorld(a, short.items, null, &out2);
+    try stdout.writeAll("SHORT DRAWS: ");
+    try stdout.writeAll(out2.items);
+    try stdout.writeAll("\n");
+    check(out2.items, &.{
+        "\"divergence\":", "crypto randomness", "never recorded", "\"ok\":false",
+    }, &.{}, "SHORT DRAWS (a draw past the record refuses the run)");
+    std.debug.print("DRAWS OK — crypto.* replays recorded draws and refuses past them\n", .{});
+}
+
 /// A handler whose CUMULATIVE allocation (~256 MiB) far exceeds the sim's
 /// 100 MiB request arena while its peak live set stays ~1 MiB — it can only
 /// complete because the GC arena reclaims the dead strings mid-run. Same shape
@@ -423,6 +483,7 @@ pub fn main() !void {
     if (args.len > 1 and std.mem.eql(u8, args[1], "elided")) {
         try runElided(a);
         try runSealed(a);
+        try runDraws(a);
         return;
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "packages")) {

@@ -133,6 +133,12 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         if (entries.len == 0 or entries[0].inline_bytes.len == 0) break :blk null;
         break :blk entries[0].inline_bytes;
     };
+    // The activation's crypto.* draws (the `random` tape), in drawn order.
+    const random_entries: []const decode.RandomEntry = blk: {
+        const b64 = if (tapes) |t| jStr(t, "random_b64") else null;
+        const s = b64 orelse break :blk &.{};
+        break :blk try decode.decodeRandom(a, try b64decode(a, s));
+    };
     const seed = jStr(obj, "seed");
     const ts_ns = jStr(obj, "timestamp_ns");
     // The engine word's high bit = the request COMPLETED under the GC
@@ -557,6 +563,23 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     // (`request.body`, `on.*`) so pinned old deployments replay; authored
     // worlds (no flag) mirror the live surface (world.zig `captured`).
     try w.writeAll(",\n  \"captured\": true");
+    // Always present on a captured world, empty when nothing was drawn, so a
+    // replay that draws where the capture did not is a divergence rather than
+    // a silent fall-back to the seed.
+    try w.writeAll(",\n  \"random\": [");
+    for (random_entries, 0..) |e, i| {
+        if (i > 0) try w.writeAll(", ");
+        switch (e.kind) {
+            // Still sealed (a bundle not pulled through the logs door) or
+            // dropped at capture: the bytes are not here to replay.
+            .draw => if (e.inline_bytes.len == 0 or e.body_key.len > 0)
+                try w.print("{{\"unkept\": {d}}}", .{e.len})
+            else
+                try w.print("{{\"draw\": \"{x}\"}}", .{e.inline_bytes}),
+            .elided => try w.print("{{\"elided\": {d}}}", .{e.len}),
+        }
+    }
+    try w.writeAll("]");
     if (deployment_hex) |dh| {
         // Hex STRING, not a JSON number: a dep id is a 64-bit hash, above
         // what a JS reader of world.json can hold in a number.
@@ -847,6 +870,71 @@ test "transcode: kv reads → closed-world map; not-found is omitted" {
     try testing.expect(kvm.get("user/ghost") == null);
     try testing.expectEqual(@as(i64, 42), wo.get("seed").?.integer);
     try testing.expectEqual(@as(i64, 1700000000000), wo.get("now_ms").?.integer);
+}
+
+test "transcode: the random tape becomes the world's ordered draw list" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Three entries: a kept run, a run not kept (still sealed: a bundle not
+    // pulled through the logs door), and the elided marker.
+    const Rec = struct { kind: u8, len: u32, bytes: []const u8, key: []const u8 };
+    const recs = [_]Rec{
+        .{ .kind = 0, .len = 2, .bytes = "\xAB\x01", .key = "" },
+        .{ .kind = 0, .len = 3, .bytes = "xyz", .key = "wrap" },
+        .{ .kind = 2, .len = 9, .bytes = "", .key = "" },
+    };
+    var buf = std.ArrayList(u8){};
+    var hdr: [12]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], decode.MAGIC, .big);
+    std.mem.writeInt(u16, hdr[4..6], decode.VERSION, .big);
+    std.mem.writeInt(u16, hdr[6..8], @intFromEnum(decode.Channel.random), .big);
+    std.mem.writeInt(u32, hdr[8..12], recs.len, .big);
+    try buf.appendSlice(a, &hdr);
+    for (recs) |r| {
+        var ent = std.ArrayList(u8){};
+        try ent.append(a, r.kind);
+        var l4: [4]u8 = undefined;
+        std.mem.writeInt(u32, &l4, r.len, .big);
+        try ent.appendSlice(a, &l4);
+        try putLen(&ent, a, r.bytes);
+        try putLen(&ent, a, r.key);
+        std.mem.writeInt(u32, &l4, @intCast(ent.items.len), .big);
+        try buf.appendSlice(a, &l4);
+        try buf.appendSlice(a, ent.items);
+    }
+    const enc = std.base64.standard.Encoder;
+    const b64 = try a.alloc(u8, enc.calcSize(buf.items.len));
+    _ = enc.encode(b64, buf.items);
+
+    const fixture = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"inbound",
+        \\   "request": {{ "method":"GET", "path":"/", "host":"h" }},
+        \\   "seed":"7", "timestamp_ns":"1700000000000000000",
+        \\   "tapes": {{ "random_b64":"{s}" }}, "sources":[] }}
+    , .{b64});
+    var out = std.ArrayList(u8){};
+    try transcode(a, fixture, &out);
+
+    const wp = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    const draws = wp.value.object.get("random").?.array.items;
+    try testing.expectEqual(@as(usize, 3), draws.len);
+    try testing.expectEqualStrings("ab01", draws[0].object.get("draw").?.string);
+    try testing.expectEqual(@as(i64, 3), draws[1].object.get("unkept").?.integer);
+    try testing.expectEqual(@as(i64, 9), draws[2].object.get("elided").?.integer);
+
+    // A captured record that drew nothing still gets the (empty) list, so a
+    // replay that draws is a divergence, not a quiet fall-back to the seed.
+    const none = try std.fmt.allocPrint(a,
+        \\{{ "entry":"index.mjs", "activation":"inbound",
+        \\   "request": {{ "method":"GET", "path":"/", "host":"h" }},
+        \\   "seed":"7", "timestamp_ns":"1700000000000000000", "sources":[] }}
+    , .{});
+    var out2 = std.ArrayList(u8){};
+    try transcode(a, none, &out2);
+    const wp2 = try std.json.parseFromSlice(std.json.Value, a, out2.items, .{});
+    try testing.expectEqual(@as(usize, 0), wp2.value.object.get("random").?.array.items.len);
 }
 
 test "transcode: a wake_batch's activation tape -> request.activation.wakes (issue #62)" {

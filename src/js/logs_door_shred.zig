@@ -272,7 +272,7 @@ fn openInPlace(
 // A payload small enough to ride a tape inline is sealed in place the same
 // way a pool body is — under a data key of its own, wrapped for the tenant
 // or the identity the activation named — with the wrap on the entry beside
-// it (`body_key`). So the three payload-carrying tapes a record carries are
+// it (`body_key`). So the payload-carrying tapes a record carries are
 // opened here on the way out, exactly as the kv tape is.
 
 /// The record fields whose tapes carry payloads. Written by
@@ -281,6 +281,7 @@ const PAYLOAD_FIELDS = [_][]const u8{
     "\"trigger_payload_tape_b64\"",
     "\"fetch_responses_tape_b64\"",
     "\"activation_tape_b64\"",
+    "\"random_tape_b64\"",
 };
 
 /// Open every sealed inline payload in a logs-door response, and strip
@@ -375,6 +376,7 @@ fn openPayloadField(
             .trigger_payload => |*t| .{ .bytes = &t.inline_bytes, .key = &t.body_key },
             .fetch_responses => |*f| .{ .bytes = &f.inline_bytes, .key = &f.body_key },
             .activation => |*a| .{ .bytes = &a.inline_bytes, .key = &a.body_key },
+            .random => |*r| .{ .bytes = &r.inline_bytes, .key = &r.body_key },
             else => continue,
         };
         if (slots.key.len == 0) continue;

@@ -240,6 +240,9 @@ const epilogue = buildRequestEpilogue({
     // make sense for a world that actually happened — strict read-your-tape,
     // the admin grant, the retired `request.body` alias (rove#436).
     captured: world.captured === true,
+    // Recorded crypto.* draws, as `world.zig` reads them: the recorders replay
+    // these in order instead of deriving crypto.* from the seed.
+    random: world.random ?? null,
     ctx: world.ctx,
     middlewarePath,
     tenant: req.tenant ?? null,

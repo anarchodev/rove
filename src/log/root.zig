@@ -252,10 +252,10 @@ pub const TapePayloads = struct {
     /// Seed-not-draws (`docs/effect-algebra.md`, the four-primitive
     /// effect model). The PRNG seed
     /// used to initialize arenajs's per-context xorshift64star for
-    /// this request's `Math.random` / `crypto.*` draws. Replay
-    /// seeds the same value via `arena_set_random_seed` before
-    /// running the handler — the scalar IS the entire input for
-    /// random (no per-draw tape entries). Zero is the default for
+    /// this request's `Math.random`. Replay seeds the same value via
+    /// `arena_set_random_seed` before running the handler. `crypto.*` is
+    /// not seeded — its draws ride `random_tape_bytes`, so this scalar
+    /// reveals nothing a handler minted with them. Zero is the default for
     /// non-handler paths that build payloads without a Readset
     /// (early-error records, paths still being wired).
     seed: u64 = 0,
@@ -316,6 +316,10 @@ pub const TapePayloads = struct {
     /// bytes — over the inline cap the entry keeps the LENGTH, so absence
     /// is never silently an empty payload.
     activation_tape_bytes: []const u8 = &.{},
+    /// The activation's `crypto.*` draws (the readset's `random` channel),
+    /// sealed like the payload tapes. Replay feeds them back in order; the
+    /// `seed` above drives `Math.random` alone.
+    random_tape_bytes: []const u8 = &.{},
     /// The **resolved export** the activation dispatched to (a callback's
     /// `{on}` override / `onFetchResult`/`Chunk`/`Done`), when it isn't
     /// derivable from the activation kind alone. Lets replay invoke the SAME
@@ -349,6 +353,7 @@ pub const TapePayloads = struct {
         if (self.trigger_payload_tape_bytes.len != 0) allocator.free(self.trigger_payload_tape_bytes);
         if (self.request_reads_tape_bytes.len != 0) allocator.free(self.request_reads_tape_bytes);
         if (self.activation_tape_bytes.len != 0) allocator.free(self.activation_tape_bytes);
+        if (self.random_tape_bytes.len != 0) allocator.free(self.random_tape_bytes);
         if (self.kv_write_keys_bytes.len != 0) allocator.free(self.kv_write_keys_bytes);
         self.* = .{};
     }
@@ -1004,6 +1009,7 @@ fn estimateRecordBytes(r: *const LogRecord) usize {
     n += r.tapes.fetch_responses_tape_bytes.len;
     n += r.tapes.trigger_payload_tape_bytes.len;
     n += r.tapes.activation_tape_bytes.len;
+    n += r.tapes.random_tape_bytes.len;
     return n;
 }
 

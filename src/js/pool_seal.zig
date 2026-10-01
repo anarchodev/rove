@@ -151,7 +151,7 @@ pub fn sealWithKeys(
         break :blk .{ .key = body_seal.tenantKey(keys.tenantSecret()), .ref = crypt.TENANT_REF, .slot = null };
     };
     var dropped: usize = 0;
-    for ([_]*tape_mod.Tape{ &readset.trigger_payload, &readset.fetch_responses, &readset.activation }) |tape| {
+    for ([_]*tape_mod.Tape{ &readset.trigger_payload, &readset.fetch_responses, &readset.activation, &readset.random }) |tape| {
         for (tape.entries.items, 0..) |*e, i| {
             if (!sealEntry(allocator, keys_opt, target, readset.shred_slot != null, tape, e, i)) dropped += 1;
         }
@@ -160,6 +160,32 @@ pub fn sealWithKeys(
         "rove-js payload seal: {d} recorded payload(s) DROPPED — {s}; the record keeps their lengths and no bytes",
         .{ dropped, if (keys_opt == null) "this node holds no keyring for the tenant" else "the named identity's key is destroyed or unverified here" },
     );
+}
+
+/// Seal entry `i`'s inline bytes under `target`, or drop them (keeping the
+/// recorded length) when there is no key or the seal fails — never leave
+/// them in plaintext. False when dropped.
+fn sealInline(
+    allocator: std.mem.Allocator,
+    target: ?Target,
+    tape: *tape_mod.Tape,
+    bytes: []const u8,
+    i: usize,
+) bool {
+    const t = target orelse {
+        dropInline(tape, i);
+        return false;
+    };
+    var s = body_seal.seal(allocator, bytes, t.key, t.ref, keyring_mod.seal.KEY_VERSION) catch {
+        dropInline(tape, i);
+        return false;
+    };
+    defer s.deinit(allocator);
+    tape.sealInlinePayload(i, s.body, &s.wrapped_key) catch {
+        dropInline(tape, i);
+        return false;
+    };
+    return true;
 }
 
 /// Seal one entry. False when its payload had to be dropped.
@@ -172,6 +198,12 @@ fn sealEntry(
     e: *tape_mod.Entry,
     i: usize,
 ) bool {
+    // `crypto.*` draws ride inline only — no pool body to re-wrap.
+    if (e.* == .random) {
+        const r = &e.random;
+        if (r.inline_bytes.len == 0 or r.body_key.len > 0) return true;
+        return sealInline(allocator, target, tape, r.inline_bytes, i);
+    }
     const slots: struct { ref: *bodies_mod.BodyRef, bytes: *[]const u8, key: *[]const u8 } = switch (e.*) {
         .trigger_payload => |*t| .{ .ref = &t.body_ref, .bytes = &t.inline_bytes, .key = &t.body_key },
         .fetch_responses => |*f| .{ .ref = &f.body_ref, .bytes = &f.inline_bytes, .key = &f.body_key },
@@ -180,20 +212,7 @@ fn sealEntry(
     };
     if (slots.bytes.len > 0) {
         if (slots.key.len > 0) return true; // already sealed
-        const t = target orelse {
-            dropInline(tape, i);
-            return false;
-        };
-        var s = body_seal.seal(allocator, slots.bytes.*, t.key, t.ref, keyring_mod.seal.KEY_VERSION) catch {
-            dropInline(tape, i);
-            return false;
-        };
-        defer s.deinit(allocator);
-        tape.sealInlinePayload(i, s.body, &s.wrapped_key) catch {
-            dropInline(tape, i);
-            return false;
-        };
-        return true;
+        return sealInline(allocator, target, tape, slots.bytes.*, i);
     }
     // A pool body: sealed at submit under the tenant, and moved only when
     // an identity was named. With none named, its tenant wrap is the right
@@ -382,4 +401,34 @@ test "a payload that cannot be sealed as asked is dropped, never recorded in pla
     try rs2.trigger_payload.appendTriggerPayload(bodies_mod.BodyRef.carried(6), "secret", "");
     sealWithKeys(a, null, &rs2);
     try testing.expectEqual(@as(usize, 0), rs2.trigger_payload.entries.items[0].trigger_payload.inline_bytes.len);
+}
+
+test "crypto draws are sealed like any payload, and dropped to their length without a key" {
+    const a = testing.allocator;
+    var tk: TestKeys = .{};
+    try tk.init(a);
+    defer tk.deinit();
+
+    var rs = tape_mod.Readset.init(a, 0, 0);
+    defer rs.deinit();
+    try rs.random.appendRandomDraw("\x01\x02\x03\x04");
+    sealWithKeys(a, tk.keys, &rs);
+
+    const r = rs.random.entries.items[0].random;
+    try testing.expect(!std.mem.eql(u8, r.inline_bytes, "\x01\x02\x03\x04"));
+    try testing.expect(try body_seal.isTenantWrapped(r.body_key));
+    try testing.expectEqual(@as(u32, 4), r.len);
+    const opened = try tk.keys.openBody(a, r.inline_bytes, r.body_key);
+    defer a.free(opened.opened);
+    try testing.expectEqualSlices(u8, "\x01\x02\x03\x04", opened.opened);
+
+    // No keyring: the draws are dropped, never kept in plaintext, and the
+    // length stays so replay reports them as not kept.
+    var rs2 = tape_mod.Readset.init(a, 0, 0);
+    defer rs2.deinit();
+    try rs2.random.appendRandomDraw("\x05\x06");
+    sealWithKeys(a, null, &rs2);
+    const r2 = rs2.random.entries.items[0].random;
+    try testing.expectEqual(@as(usize, 0), r2.inline_bytes.len);
+    try testing.expectEqual(@as(u32, 2), r2.len);
 }

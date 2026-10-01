@@ -64,7 +64,9 @@ expect(req).toHaveFetched(/stripe/);
   local-time `Date` methods (`getHours`, `getTimezoneOffset`, `toString`) run in
   UTC regardless of your machine's timezone, matching production (UTC servers) —
   so a date-formatting test can't green offline and shift in prod.
-- `seed` — the deterministic seed for `Math.random()` / `crypto.randomUUID()`.
+- `seed` — the deterministic seed for `Math.random()`, and for `crypto.*` in a
+  scenario. (In production `crypto.*` draws from a secure generator and its
+  bytes are recorded; replaying a captured request uses those recorded bytes.)
 - `sourceDir` — where handler code resolves from (defaults to the app dir you
   ran `rewind test` in). Use it to point a scenario at a different tree.
 - `entry` — the handler module (defaults to `index.mjs`).

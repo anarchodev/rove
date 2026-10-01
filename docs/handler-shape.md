@@ -114,7 +114,7 @@ parameter. Pure computation and web-platform standards stay global.
 | `kv`, `http`, `blob`, `platform` | the ES intrinsics |
 | `after`, `next`, `stream`, `webhook` | `TextEncoder`/`TextDecoder`, `URLSearchParams` |
 | `request`, `response` | `atob`/`btoa`, `base64url`, `hex`, `time` |
-| `tag`, `unmaskedIp`, `shredKey` | `crypto` — pure, and seeded for replay |
+| `tag`, `unmaskedIp`, `shredKey` | `crypto` — pure, and its draws are recorded for replay |
 
 The last row moved off `request`. Each is an effect that had been sitting
 on a data shape: `tag` writes a durable exported record against a shared

@@ -175,7 +175,7 @@ test "registry dump renders all format lines without error" {
     const out = w.buffered();
     // A couple of anchors so a dropped line is caught.
     try std.testing.expect(std.mem.indexOf(u8, out, "js_engine_version") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "readset              v11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "readset              v12") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "request_id           req_<16hex>") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "bundle_lockfile      v1") != null);
     // The keyring's KV values, whose version byte is the one this

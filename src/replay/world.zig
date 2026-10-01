@@ -103,6 +103,11 @@ pub const World = struct {
     /// Reads whose values the capture's kv budget dropped. Replay refuses
     /// them rather than resolving them (see `KvElided`).
     kv_elided: []const KvElided = &.{},
+    /// The captured activation's `crypto.*` draws as JSON text: an ordered
+    /// array of `{draw:"<hex>"}` / `{unkept:n}` / `{elided:n}` entries
+    /// (`export_fixture` writes it from the record's `random` tape). Null for
+    /// an authored world, whose `crypto.*` draws from the seeded stand-in.
+    random_json: ?[]const u8 = null,
     /// Optional `expected` output — a PARTIAL, order-independent assertion over
     /// the produced bundle (response.status / writes / cmds / disposition). When
     /// present, `runWorld` appends a `verify` result. Stored as JSON text.
@@ -204,7 +209,7 @@ const TOP_KEYS = [_][]const u8{
     "entry",   "activation", "export",  "source_dir", "ctx",     "seed",
     "now_ms",  "arena_gc",   "captured", "deployment_id", "request", "kv", "expected",
     "sources", "app_imports", "packages", "triggers", "kv_refusals",
-    "kv_elided",
+    "kv_elided", "random",
 };
 /// The full set of `request.*` keys (same strictness rationale).
 const REQ_KEYS = [_][]const u8{
@@ -399,6 +404,9 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
     }
 
     // ── reads the capture's kv budget elided (refused on replay) ──
+    if (obj.get("random")) |rv| {
+        if (rv != .null) w.random_json = try jsonText(a, rv);
+    }
     if (obj.get("kv_elided")) |ev| {
         if (ev != .array) return Error.BadWorld;
         var es = std.ArrayList(KvElided){};
