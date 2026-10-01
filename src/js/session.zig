@@ -77,9 +77,15 @@ pub const Resolved = struct {
 };
 
 /// Read `__Host-rove_sid` from the request; if absent or malformed,
-/// mint a fresh 64-hex sid from `rng` and signal the caller to set a
-/// cookie on the response.
-pub fn resolve(hdrs: ?h2.ReqHeaders, rng: std.Random) Resolved {
+/// mint a fresh 64-hex sid and signal the caller to set a cookie on the
+/// response.
+///
+/// The mint draws from the OS CSPRNG and takes no randomness from the
+/// caller. The sid is a bearer credential — the RP session record
+/// (`_rp/sess/{sid}`) is keyed by it — so it must be unguessable even to
+/// someone who knows everything about the request, its arrival time
+/// included. A caller-supplied generator is how a seeded PRNG gets in.
+pub fn resolve(hdrs: ?h2.ReqHeaders) Resolved {
     if (hdrs) |h| {
         if (auth.findCookie(h, COOKIE_NAME)) |existing| {
             if (existing.len == SID_LEN and isAllHex(existing)) {
@@ -95,7 +101,7 @@ pub fn resolve(hdrs: ?h2.ReqHeaders, rng: std.Random) Resolved {
     }
 
     var raw: [SID_LEN / 2]u8 = undefined;
-    rng.bytes(&raw);
+    std.crypto.random.bytes(&raw);
     const hex = std.fmt.bytesToHex(raw, .lower);
     return .{ .sid = hex, .mint_set_cookie = true };
 }
@@ -124,15 +130,13 @@ fn isAllHex(s: []const u8) bool {
 const testing = std.testing;
 
 test "resolve: mints when no cookie header" {
-    var prng = std.Random.DefaultPrng.init(0xdead_beef);
-    const r = resolve(null, prng.random());
+    const r = resolve(null);
     try testing.expect(r.mint_set_cookie);
     try testing.expectEqual(SID_LEN, r.sid.len);
     try testing.expect(isAllHex(&r.sid));
 }
 
 test "resolve: mints when cookie absent" {
-    var prng = std.Random.DefaultPrng.init(1);
     var fields = [_]h2.HeaderField{
         .{
             .name = "cookie".ptr,
@@ -145,12 +149,24 @@ test "resolve: mints when cookie absent" {
         .fields = @ptrCast(&fields),
         .count = fields.len,
     };
-    const r = resolve(hdrs, prng.random());
+    const r = resolve(hdrs);
     try testing.expect(r.mint_set_cookie);
 }
 
+test "resolve: back-to-back mints never repeat" {
+    // Two mints for requests identical in every observable — same (absent)
+    // headers, same instant — must still differ: nothing about the request
+    // may determine the sid.
+    var seen: [64][SID_LEN]u8 = undefined;
+    for (&seen, 0..) |*slot, i| {
+        const r = resolve(null);
+        try testing.expect(r.mint_set_cookie);
+        for (seen[0..i]) |prev| try testing.expect(!std.mem.eql(u8, &prev, &r.sid));
+        slot.* = r.sid;
+    }
+}
+
 test "resolve: returns existing valid cookie" {
-    var prng = std.Random.DefaultPrng.init(2);
     const known = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     var cookie_hdr_buf: [128]u8 = undefined;
     const cookie_value = std.fmt.bufPrint(&cookie_hdr_buf, "{s}={s}", .{ COOKIE_NAME, known }) catch unreachable;
@@ -166,13 +182,12 @@ test "resolve: returns existing valid cookie" {
         .fields = @ptrCast(&fields),
         .count = fields.len,
     };
-    const r = resolve(hdrs, prng.random());
+    const r = resolve(hdrs);
     try testing.expect(!r.mint_set_cookie);
     try testing.expectEqualSlices(u8, known, &r.sid);
 }
 
 test "resolve: re-mints when cookie has wrong length" {
-    var prng = std.Random.DefaultPrng.init(3);
     var cookie_hdr_buf: [128]u8 = undefined;
     const cookie_value = std.fmt.bufPrint(&cookie_hdr_buf, "{s}=tooshort", .{COOKIE_NAME}) catch unreachable;
     var fields = [_]h2.HeaderField{
@@ -187,12 +202,11 @@ test "resolve: re-mints when cookie has wrong length" {
         .fields = @ptrCast(&fields),
         .count = fields.len,
     };
-    const r = resolve(hdrs, prng.random());
+    const r = resolve(hdrs);
     try testing.expect(r.mint_set_cookie);
 }
 
 test "resolve: re-mints when cookie has non-hex char" {
-    var prng = std.Random.DefaultPrng.init(4);
     const bad = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeZ";
     var cookie_hdr_buf: [128]u8 = undefined;
     const cookie_value = std.fmt.bufPrint(&cookie_hdr_buf, "{s}={s}", .{ COOKIE_NAME, bad }) catch unreachable;
@@ -208,7 +222,7 @@ test "resolve: re-mints when cookie has non-hex char" {
         .fields = @ptrCast(&fields),
         .count = fields.len,
     };
-    const r = resolve(hdrs, prng.random());
+    const r = resolve(hdrs);
     try testing.expect(r.mint_set_cookie);
 }
 
@@ -221,19 +235,17 @@ test "cross-host isolation: tenant A cookie not seen on tenant B request" {
     // (that's enforced by the user agent), but we CAN model what
     // the worker sees: a tenant-B request arrives without the
     // tenant-A cookie, so resolve() mints a fresh sid for tenant B.
-    var prng_a = std.Random.DefaultPrng.init(1);
-    var prng_b = std.Random.DefaultPrng.init(2);
 
     // Tenant A's request — mints sid_a. Browser stores it as a
     // host-bound cookie for tenant-A's subdomain.
-    const r_a = resolve(null, prng_a.random());
+    const r_a = resolve(null);
     try testing.expect(r_a.mint_set_cookie);
 
     // Tenant B's request from the same browser. The `__Host-`
     // prefix forced host-only scope, so the browser does NOT
     // include tenant A's cookie — request arrives with no Cookie
     // header. resolve() mints a fresh sid for tenant B.
-    const r_b = resolve(null, prng_b.random());
+    const r_b = resolve(null);
     try testing.expect(r_b.mint_set_cookie);
 
     // Different sids — confirms the two tenants' sessions are
@@ -256,7 +268,6 @@ test "cross-host isolation: malformed cross-host cookie is rejected and remints"
     // store, so a spoof produces a write nobody reads. The session
     // resolve here just needs to be deterministic — accept valid
     // sids regardless of which tenant they're sent to.
-    var prng = std.Random.DefaultPrng.init(0);
     const sid_a = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111";
     var cookie_buf: [128]u8 = undefined;
     const cookie_value = std.fmt.bufPrint(&cookie_buf, "{s}={s}", .{ COOKIE_NAME, sid_a }) catch unreachable;
@@ -272,7 +283,7 @@ test "cross-host isolation: malformed cross-host cookie is rejected and remints"
         .fields = @ptrCast(&fields),
         .count = fields.len,
     };
-    const r = resolve(hdrs, prng.random());
+    const r = resolve(hdrs);
     try testing.expect(!r.mint_set_cookie);
     try testing.expectEqualSlices(u8, sid_a, &r.sid);
     // The defense lives at the kv-scope layer: the handler on the

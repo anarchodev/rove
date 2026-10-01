@@ -1242,8 +1242,10 @@ pub const Readset = struct {
     /// `Math.random` + `crypto.getRandomValues` +
     /// `crypto.randomUUID` all draw from this single state, so the
     /// scalar IS the entire input for random (the seed-not-draws contract).
-    /// Production callers derive it from `timestamp_ns`; tests pass
-    /// a fixed value for determinism.
+    /// Production callers draw it from the OS CSPRNG (`initLive`), so
+    /// nothing observable about the request — its arrival time least of
+    /// all — predicts what a handler mints; tests pass a fixed value for
+    /// determinism. Replay reads the recorded value, never re-derives it.
     seed: u64,
     /// The JS engine version (`qjs/version.zig` `JS_ENGINE_VERSION`)
     /// that executed this request — the authoritative per-request
@@ -1336,6 +1338,14 @@ pub const Readset = struct {
     fn clearWriteKeys(self: *Readset) void {
         for (self.kv_write_keys.items) |k| self.kv.allocator.free(k);
         self.kv_write_keys.clearRetainingCapacity();
+    }
+
+    /// A live activation's readset: `timestamp_ns` pins its clock and the
+    /// random seed comes from the OS CSPRNG. Handlers mint credentials
+    /// (session tokens, OAuth codes) from this seed's stream, so it must be
+    /// unguessable from anything about the request.
+    pub fn initLive(allocator: std.mem.Allocator, timestamp_ns: i64) Readset {
+        return init(allocator, timestamp_ns, std.crypto.random.int(u64));
     }
 
     pub fn init(
@@ -3243,4 +3253,16 @@ test "serializeForEntry drops the channels rather than build an entry nobody can
     try testing.expectEqual(@as(u64, 7), parsed.seed);
     // And the tape kept its entry for the LogRecord copy.
     try testing.expectEqual(@as(usize, 1), rs.trigger_payload.entries.items.len);
+}
+
+test "initLive: two activations at the same instant draw different seeds" {
+    // The seed is the whole input to a handler's random stream, so two
+    // activations that agree on every observable — the timestamp included —
+    // must still disagree on it.
+    var a = Readset.initLive(testing.allocator, 1_700_000_000_000_000_000);
+    defer a.deinit();
+    var b = Readset.initLive(testing.allocator, 1_700_000_000_000_000_000);
+    defer b.deinit();
+    try testing.expectEqual(a.timestamp_ns, b.timestamp_ns);
+    try testing.expect(a.seed != b.seed);
 }
