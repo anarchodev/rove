@@ -285,6 +285,39 @@ pub const IndexDb = struct {
         return setMetaInTxn(self.db, key, value);
     }
 
+    /// Delete every index row for a record received before `cutoff_ns`, and
+    /// every batch whose newest record was. One transaction, so a reader
+    /// never sees a record's `log_index` row without its tags or the reverse.
+    ///
+    /// Rows go by RECEIVE time and the purge deletes objects by their FLUSH
+    /// time, which is never earlier, so a row is pruned no later than the
+    /// object it points into: no surviving row names a deleted object.
+    /// Returns the number of `log_index` rows removed.
+    pub fn pruneBefore(self: *IndexDb, cutoff_ns: i64) Error!u64 {
+        if (c.sqlite3_exec(self.db, "BEGIN IMMEDIATE;", null, null, null) != c.SQLITE_OK)
+            return Error.Sqlite;
+        errdefer _ = c.sqlite3_exec(self.db, "ROLLBACK;", null, null, null);
+        const stmts = [_][:0]const u8{
+            "DELETE FROM log_index WHERE received_ns < ?",
+            "DELETE FROM log_tags WHERE received_ns < ?",
+            "DELETE FROM log_sagas WHERE last_received_ns < ?",
+            "DELETE FROM batches WHERE last_received_ns < ?",
+        };
+        var removed: u64 = 0;
+        for (stmts, 0..) |sql, i| {
+            var st: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, sql.ptr, -1, &st, null) != c.SQLITE_OK)
+                return Error.Sqlite;
+            defer _ = c.sqlite3_finalize(st);
+            _ = c.sqlite3_bind_int64(st, 1, cutoff_ns);
+            if (c.sqlite3_step(st) != c.SQLITE_DONE) return Error.Sqlite;
+            if (i == 0) removed = @intCast(c.sqlite3_changes(self.db));
+        }
+        if (c.sqlite3_exec(self.db, "COMMIT;", null, null, null) != c.SQLITE_OK)
+            return Error.Sqlite;
+        return removed;
+    }
+
     /// True if `(node_id, batch_id)` is already recorded in `batches`. The
     /// indexer's cursor-lag buffer re-LISTs a trailing clock-skew window each
     /// poll; this PK lookup lets it skip re-GETting a batch it already indexed,

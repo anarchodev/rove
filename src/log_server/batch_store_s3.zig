@@ -157,7 +157,23 @@ pub const S3BatchStore = struct {
         .get = vGet,
         .getRange = vGetRange,
         .list = vList,
+        .delete = vDelete,
     };
+
+    fn vDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
+        const self: *S3BatchStore = @ptrCast(@alignCast(ptr));
+        const resp = try self.requestAlloc(.DELETE, key, "", "", null, self.allocator);
+        defer if (resp.body) |b| self.allocator.free(b);
+        // S3 answers 204 whether or not the key existed; 404 is accepted
+        // from stores that report the miss.
+        if (resp.status != 204 and resp.status != 200 and resp.status != 404) {
+            std.log.warn(
+                "log s3: DELETE {s}/{s}{s} → {d} body={s}",
+                .{ self.config.bucket, self.config.key_prefix, key, resp.status, resp.bodySnippet() },
+            );
+            return Error.Io;
+        }
+    }
 
     // ── vtable impls ─────────────────────────────────────────────────
 

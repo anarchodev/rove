@@ -1844,6 +1844,16 @@ storage decisions that section assumes. (The customer-logs-vs-operator-signals
   incidentally shielded by the admin app in front of it.
 
 ### 11.6 Replay retention is a sold time window; capacity is derived (2026-08-17)
+- **Amended 2026-10-01 (rove#333)**: the sold window is a **read** window.
+  Storage keeps every record for one fleet-wide **365 days** and then deletes
+  it, whatever the tier — the objects are cross-tenant, and an age no tenant's
+  window exceeds is the one deletion rule that needs no sharding, compaction
+  or per-tenant accounting (`architecture/deployment-and-logs.md`, the
+  retention purge). The published period is "readable for N days, kept up to
+  365 days". Sharding the flush by retention class (below) was rejected: a
+  class fixed at write time keeps a shortened or downgraded tenant's data on
+  its old schedule. Pinning is not built. Erasure before 365 days is key
+  destruction, whose reach is rove#994.
 - **Decision**: axis 2 sells **days**, and records past the window are
   **deleted**. The byte capacity is derived, internal, and never quoted:
   `capacity = log_refill_bytes_per_sec × 86400 × retention_days + log_burst_bytes`.

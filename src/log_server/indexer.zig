@@ -260,7 +260,7 @@ fn laggedCursor(allocator: std.mem.Allocator, node_prefix: []const u8, max_key: 
 
 /// The `_meta` key under which a node's catch-up cursor is persisted.
 /// Caller frees.
-fn cursorMetaKey(allocator: std.mem.Allocator, node_prefix: []const u8) Error![]u8 {
+pub fn cursorMetaKey(allocator: std.mem.Allocator, node_prefix: []const u8) Error![]u8 {
     return std.fmt.allocPrint(allocator, "cursor:{s}", .{node_prefix}) catch
         return Error.OutOfMemory;
 }
@@ -294,7 +294,7 @@ fn prefixUpperBound(allocator: std.mem.Allocator, prefix: []const u8) Error![]u8
 /// (`prefixUpperBound`), repeat. O(nodes) LISTs of max=1, using only the
 /// `list` primitive (no backend delimiter support needed). Caller frees
 /// with `batch_store_mod.freeListResult`.
-fn listNodePrefixes(
+pub fn listNodePrefixes(
     allocator: std.mem.Allocator,
     store: batch_store_mod.BatchStore,
 ) Error![][]const u8 {
@@ -429,6 +429,12 @@ pub const Config = struct {
     /// override to something smaller so they finish quickly.
     poll_interval_ms: u32 = 5_000,
     page_size: u32 = 256,
+    /// Run the retention purge (`purge.zig`) once per `PURGE_INTERVAL_NS`
+    /// on this thread, which owns the index's writer connection. Off unless
+    /// the operator turns it on.
+    purge: bool = false,
+    /// Where `_pool/` lives (the content store). Null skips the pool half.
+    pool_store: ?batch_store_mod.BatchStore = null,
 };
 
 pub const Handle = struct {
@@ -477,6 +483,9 @@ fn threadMain(h: *Handle) void {
 
 fn runLoop(h: *Handle) !void {
     std.log.info("log-indexer: started", .{});
+    if (h.config.purge and h.config.pool_store == null)
+        std.log.warn("log-purge: no content store configured — `_pool/` bodies will NOT be purged", .{});
+    var last_purge_ns: i64 = 0;
     while (!h.stop_flag.load(.acquire)) {
         if (pollOnce(h.config.allocator, h.config.store, h.config.db, h.config.page_size)) |stats| {
             metrics_mod.Metrics.add(&metrics_mod.global.batches_indexed, stats.batches_indexed);
@@ -487,6 +496,17 @@ fn runLoop(h: *Handle) !void {
             std.log.warn("log-indexer: pass error: {s}", .{@errorName(err)});
             metrics_mod.Metrics.inc(&metrics_mod.global.poll_errors);
         }
+        // After the poll, so the first pass on a fresh start runs against
+        // the cursors this server just persisted.
+        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+        if (h.config.purge and now_ns - last_purge_ns >= purge_mod.PURGE_INTERVAL_NS) {
+            last_purge_ns = now_ns;
+            if (purge_mod.purgeOnce(h.config.allocator, h.config.store, h.config.pool_store, h.config.db, now_ns, purge_mod.PURGE_AGE_NS)) |ps| {
+                std.log.info("log-purge: pruned {d} index row(s); deleted {d} batch(es), {d} pool object(s); {d} fenced", .{ ps.rows_pruned, ps.batches_deleted, ps.pool_deleted, ps.fenced });
+            } else |err| {
+                std.log.warn("log-purge: pass error: {s}", .{@errorName(err)});
+            }
+        }
         metrics_mod.Metrics.inc(&metrics_mod.global.poll_cycles);
         _ = h.passes_completed.fetchAdd(1, .release);
         std.Thread.sleep(@as(u64, h.config.poll_interval_ms) * std.time.ns_per_ms);
@@ -495,6 +515,8 @@ fn runLoop(h: *Handle) !void {
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
+
+const purge_mod = @import("purge.zig");
 
 const testing = std.testing;
 

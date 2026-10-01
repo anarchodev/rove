@@ -192,7 +192,8 @@ pub const PlanLimits = struct {
     /// load (Lever 2, sibling of max_body_bytes).
     max_resident_html_bytes: u32,
     /// Tape/log read-window in days — list/query clamp to the last N days
-    /// (Lever 3; a read-path clamp, not GC).
+    /// (Lever 3; a read-path clamp, not GC). Never above
+    /// `MAX_RETENTION_DAYS`, the age storage keeps anything for.
     retention_days: u32,
     /// Ceiling on a tenant's durable KV bytes — the plan-derived form of the
     /// LMDB map size each tenant's `app.db` is opened at. KV is deliberate
@@ -411,7 +412,9 @@ pub fn effective(tier: Tier, ov: Overrides) PlanLimits {
     if (ov.log_refill_bytes_per_sec) |v| p.rate.log_refill_bytes_per_sec = v;
     if (ov.max_body_bytes) |v| p.max_body_bytes = v;
     if (ov.max_resident_html_bytes) |v| p.max_resident_html_bytes = v;
-    if (ov.retention_days) |v| p.retention_days = v;
+    // Capped: a window past what storage keeps would advertise history the
+    // retention purge has already deleted.
+    if (ov.retention_days) |v| p.retention_days = @min(v, MAX_RETENTION_DAYS);
     if (ov.max_kv_bytes) |v| p.max_kv_bytes = v;
     if (ov.max_stored_bytes) |v| p.max_stored_bytes = v;
     if (ov.max_receive_bytes) |v| p.max_receive_bytes = v;
@@ -447,6 +450,12 @@ pub fn parseBlob(allocator: std.mem.Allocator, instance_id: []const u8, blob: []
     const tier = if (parsed.value.tier) |t| Tier.parse(t) else defaultTierFor(instance_id);
     return effective(tier, parsed.value.overrides);
 }
+
+/// The longest any request record is kept, for every tenant: the retention
+/// purge (`log_server/purge.zig`) deletes records older than this, and no
+/// plan's read window may exceed it (docs/architecture/deployment-and-logs.md,
+/// the retention purge).
+pub const MAX_RETENTION_DAYS: u32 = 365;
 
 /// Seconds of retention for a resolved plan — the read-clamp floor is
 /// `now_ns - retentionNs(plan)` (docs/architecture/control-plane.md Lever 3).
@@ -650,4 +659,11 @@ test "plan: parseBlob fails toward the free tier" {
 test "plan: retentionNs scales days to ns" {
     try testing.expectEqual(@as(i64, 7) * std.time.ns_per_day, retentionNs(table(.free)));
     try testing.expectEqual(@as(i64, 365) * std.time.ns_per_day, retentionNs(table(.enterprise)));
+}
+
+test "plan: a retention override is capped at what storage keeps" {
+    try testing.expectEqual(MAX_RETENTION_DAYS, effective(.enterprise, .{ .retention_days = 400 }).retention_days);
+    try testing.expectEqual(@as(u32, 90), effective(.pro, .{ .retention_days = 90 }).retention_days);
+    // No tier's own window exceeds it either.
+    inline for (.{ Tier.free, Tier.pro, Tier.enterprise }) |t| try testing.expect(table(t).retention_days <= MAX_RETENTION_DAYS);
 }
