@@ -442,11 +442,18 @@ pub fn derivedContentType(path: []const u8) []const u8 {
         .{ ".json", "application/json" },              .{ ".svg", "image/svg+xml" },
         .{ ".wasm", "application/wasm" },              .{ ".png", "image/png" },
         .{ ".ico", "image/x-icon" },                   .{ ".woff2", "font/woff2" },
+        .{ ".txt", "text/plain; charset=utf-8" },
     };
     inline for (map) |pair| {
         if (std.mem.eql(u8, ext, pair[0])) return pair[1];
     }
     return "application/octet-stream";
+}
+
+test "derivedContentType: .txt is text/plain" {
+    // `/.well-known/security.txt` must be served as text/plain (RFC 9116).
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", derivedContentType("_static/.well-known/security.txt"));
+    try std.testing.expectEqualStrings("application/octet-stream", derivedContentType("_static/data.bin"));
 }
 
 test "classifyPath: the four classes, by prefix and extension" {
