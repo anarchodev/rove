@@ -324,6 +324,7 @@ pub fn contentType(path: []const u8) []const u8 {
         .{ ".json", "application/json" },               .{ ".svg", "image/svg+xml" },
         .{ ".wasm", "application/wasm" },               .{ ".png", "image/png" },
         .{ ".ico", "image/x-icon" },                    .{ ".woff2", "font/woff2" },
+        .{ ".txt", "text/plain; charset=utf-8" },
     };
     inline for (map) |pair| {
         if (std.mem.eql(u8, ext, pair[0])) return pair[1];
@@ -431,6 +432,10 @@ pub fn jsonObjectField(doc: []const u8, key: []const u8) ?[]const u8 {
         return null;
     }
     return null;
+}
+
+test "contentType: .txt is text/plain, matching the server's derived type" {
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", contentType("_static/.well-known/security.txt"));
 }
 
 test "jsonObjectField: extracts a nested object verbatim" {
