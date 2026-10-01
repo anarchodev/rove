@@ -272,9 +272,9 @@
       // digests alike. The ordinary kv wrapper carries it; this one did
       // not, which is what made an admin replay disagree with capture
       // while the store's prefix scan agreed (rove#487).
-      get: function(k){ var v = globalThis.kv.get(P + k); var present = v !== undefined && v !== null; push(present ? { kind: "read", store: tag, key: k, present: true, value: v } : { kind: "read", store: tag, key: k, present: false }); return v; },
-      set: function(k, val){ push({ kind: "write", store: tag, key: k, value: val }); return globalThis.kv.set(P + k, val); },
-      delete: function(k){ push({ kind: "delete", store: tag, key: k }); return globalThis.kv.delete(P + k); },
+      get: function(k){ var v = globalThis.__rove.caps.kv.get(P + k); var present = v !== undefined && v !== null; push(present ? { kind: "read", store: tag, key: k, present: true, value: v } : { kind: "read", store: tag, key: k, present: false }); return v; },
+      set: function(k, val){ push({ kind: "write", store: tag, key: k, value: val }); return globalThis.__rove.caps.kv.set(P + k, val); },
+      delete: function(k){ push({ kind: "delete", store: tag, key: k }); return globalThis.__rove.caps.kv.delete(P + k); },
       // The digest folds a cross-store prefix as `p <namespaced> <found>
       // <count> <rowsfold>` (interaction_digest.zig kvPrefix), where the
       // rows-fold is `key=<valuehash>;` per returned row IN ORDER, over the
@@ -283,8 +283,9 @@
       // gets a scalar. Folding 0/0 instead (what this used to push) makes
       // every prefix scan digest alike, which is a false AGREEMENT, not
       // merely a mismatch.
+      forEach: function(fn){ var rows = globalThis.__rove.caps.kv.prefix(P, "", 100000) || []; for (var i = 0; i < rows.length; i++) fn(rows[i].value, rows[i].key.slice(P.length)); },
       prefix: function(p, cursor, limit){
-        var r = globalThis.kv.prefix(P + (p || ""), cursor, limit) || [];
+        var r = globalThis.__rove.caps.kv.prefix(P + (p || ""), cursor, limit) || [];
         var acc = "";
         for (var i = 0; i < r.length; i++) acc += r[i].key + "=" + globalThis.__interactionDigest.foldValue(r[i].value) + ";";
         push({ kind: "read", op: "prefix", store: tag, key: (p || ""), count: r.length,
@@ -307,7 +308,7 @@
   // "platform is only available on the admin handler" (docs/architecture/
   // replay-and-sim.md, the privileged-surface section).
   var GATE_MSG = "platform is only available on the admin handler";
-  var gate = function(fn){ return function(){ if (!globalThis.__rove_captured && globalThis.kv.get(NS_STORE + "admin") !== "1") throw new TypeError(GATE_MSG); return fn.apply(null, arguments); }; };
+  var gate = function(fn){ return function(){ if (!globalThis.__rove_captured && globalThis.__rove.caps.kv.get(NS_STORE + "admin") !== "1") throw new TypeError(GATE_MSG); return fn.apply(null, arguments); }; };
   var rootStore_r = storeKv(NS_STORE + "r/", "r");
   // Fetch/subscribe recorder. Ids are unique per run (`ftch_<seq>` — the
   // epilogue resets the counter each activation), NOT prod's ftch_<64hex>:
@@ -344,7 +345,7 @@
     // `targetsInternalDoor` (bindings/http.zig) — they aren't third-party
     // egress.
     var __isInternal = (function(u){ var s = String(u || "").indexOf("://"); if (s < 0) return false; var a = String(u).slice(s + 3); var h = a.split(/[\/:?#]/)[0]; return h.slice(-9) === ".internal"; })(url);
-    var __ob = __isInternal ? null : globalThis.kv.get("__rove_store/email_budget");
+    var __ob = __isInternal ? null : globalThis.__rove.caps.kv.get("__rove_store/email_budget");
     if (__ob !== undefined && __ob !== null) {
       var __n = Number(__ob);
       if (Number.isFinite(__n)) {
@@ -485,7 +486,7 @@
           // Same admin predicate as the platform.* gate above: authored
           // worlds opt in via `scenario({admin:true})`; a captured world is
           // proof the call was admitted live.
-          if (!globalThis.__rove_captured && globalThis.kv.get(NS_STORE + "admin") !== "1") throw new TypeError("blob presign: scoped presign is admin-only");
+          if (!globalThis.__rove_captured && globalThis.__rove.caps.kv.get(NS_STORE + "admin") !== "1") throw new TypeError("blob presign: scoped presign is admin-only");
           return "https://sim.invalid/" + target + "/" + subdir + "/" + hash + (ttl != null ? "?ttl=" + ttl : "");
         }
         return "https://sim.invalid/" + (subdir === "app-blobs" ? "blob/" : subdir + "/") + hash + (ttl != null ? "?ttl=" + ttl : "");
@@ -550,7 +551,7 @@
         // The exists marker is harness-seeded, so a CAPTURED tape (which
         // carries no scenario) skips the resolve check — the tape already
         // proves the instance resolved live.
-        if (!globalThis.__rove_captured && globalThis.kv.get(NS_STORE + "exists/i/" + id) !== "1") { var e = new Error("instance not found"); e.code = "InstanceNotFound"; throw e; }
+        if (!globalThis.__rove_captured && id !== "__root__" && globalThis.__rove.caps.kv.get(NS_STORE + "exists/i/" + id) !== "1") { var e = new Error("instance not found"); e.code = "InstanceNotFound"; throw e; }
         push({ kind: "platform", op: "scope", id: id });
         return { kv: storeKv(NS_STORE + "i/" + id + "/", "i/" + id), blob: {} };
       }),
@@ -638,7 +639,7 @@
             q.more = false;
           }
           if (typeof msg.instance === "string" && msg.instance.length > 0) {
-            q.instance_exists = rootStore_r.get("instance/" + msg.instance) !== undefined;
+            q.instance_exists = rootStore_r.get("instance/" + msg.instance) != null;
           }
           if (msg.domains) {
             var dom = [];
@@ -651,7 +652,7 @@
           }
           if (typeof msg.domain === "string" && msg.domain.length > 0) {
             var dv = rootStore_r.get("domain/" + msg.domain);
-            q.domain_owner = dv === undefined ? null : dv;
+            q.domain_owner = dv == null ? null : dv;
           }
           body = JSON.stringify(q);
         } else if (module === "__system/root_kv_install") {
@@ -665,7 +666,7 @@
           var rq = Array.isArray(msg.requires) ? msg.requires : [];
           var rfail = null;
           for (var rk = 0; rk < rq.length; rk++) {
-            if (rootStore_r.get(rq[rk]) === undefined) { rfail = rq[rk]; break; }
+            if (rootStore_r.get(rq[rk]) == null) { rfail = rq[rk]; break; }
           }
           if (rfail !== null) {
             status = 409;
@@ -680,29 +681,27 @@
         } else {
           throw new TypeError("platform.dispatch: no offline model for " + module);
         }
-        // The result row + marker resolve, exactly the writeset
-        // `__system/dispatch_result` commits live — recorded
-        // (store-untagged = the origin's own store) so it folds forward.
+        // The result row + marker resolve + watchdog cancel — the same ops
+        // `__system/dispatch_result` performs live, in the same order,
+        // through the handler's own kv. The binding records each one
+        // exactly once (store-untagged = the origin's own store) and they
+        // land where the handler's next `kv.get` reads, which is what lets a
+        // "harvest if resolved, else park" driver answer in one activation.
+        var okv = globalThis.__rove.caps.kv;
         if (marker.no_result !== true) {
-          var row = JSON.stringify({ v: 1, status: status, overflow: false, body: body });
-          push({ kind: "write", key: "_dispatch/result/" + id, value: row });
-          globalThis.kv.set("_dispatch/result/" + id, row);
+          okv.set("_dispatch/result/" + id, JSON.stringify({ v: 1, status: status, overflow: false, body: body }));
         }
-        push({ kind: "delete", key: "_dispatch/owed/" + id });
-        globalThis.kv.delete("_dispatch/owed/" + id);
+        okv.delete("_dispatch/owed/" + id);
         // Cancel the watchdog pair the shim armed (same derivation as the
         // scheduler contract: keyed id = sha256b64url of the key).
         var sid = crypto.sha256b64url("_dispatch/" + id);
-        var brec = globalThis.kv.get("_sched/by_id/" + sid);
+        var brec = okv.get("_sched/by_id/" + sid);
         if (brec !== null && brec !== undefined) {
           try {
             var pr = JSON.parse(brec);
-            var bt = "_sched/by_time/" + String(BigInt(pr.when_ns)).padStart(20, "0") + "/" + sid;
-            push({ kind: "delete", key: bt });
-            globalThis.kv.delete(bt);
+            okv.delete("_sched/by_time/" + String(BigInt(pr.when_ns)).padStart(20, "0") + "/" + sid);
           } catch (_e) { /* corrupt prior — by_id drop below still lands */ }
-          push({ kind: "delete", key: "_sched/by_id/" + sid });
-          globalThis.kv.delete("_sched/by_id/" + sid);
+          okv.delete("_sched/by_id/" + sid);
         }
       },
       instances: { deployStarter: gate(function(name){ push({ kind: "platform", op: "instances.deployStarter", name: name }); }) },
