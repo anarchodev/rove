@@ -310,6 +310,14 @@
   var GATE_MSG = "platform is only available on the admin handler";
   var gate = function(fn){ return function(){ if (!globalThis.__rove_captured && globalThis.__rove.caps.kv.get(NS_STORE + "admin") !== "1") throw new TypeError(GATE_MSG); return fn.apply(null, arguments); }; };
   var rootStore_r = storeKv(NS_STORE + "r/", "r");
+  // A per-instance platform read (`platform.instances.*`): the hidden row the
+  // harness seeds, or InstanceNotFound — the native's answer for an unknown
+  // name. Read through the per-run kv, where `__rove_store/` is unrecorded.
+  var instanceRow = function(ns, name){
+    var v = globalThis.__rove.caps.kv.get(NS_STORE + ns + name);
+    if (v === null || v === undefined) { var e = new Error("instance not found"); e.code = "InstanceNotFound"; throw e; }
+    return v;
+  };
   // Fetch/subscribe recorder. Ids are unique per run (`ftch_<seq>` — the
   // epilogue resets the counter each activation), NOT prod's ftch_<64hex>:
   // determinism over realism, but distinct so a handler can correlate the
@@ -704,7 +712,21 @@
           okv.delete("_sched/by_id/" + sid);
         }
       },
-      instances: { deployStarter: gate(function(name){ push({ kind: "platform", op: "instances.deployStarter", name: name }); }) },
+      instances: {
+        deployStarter: gate(function(name){ push({ kind: "platform", op: "instances.deployStarter", name: name }); }),
+        // jsPlatformInstancesIncarnation / jsPlatformInstancesUsage: store
+        // reads at `inc/{name}` and `usage/{name}`. The harness seeds both
+        // for every declared instance and a captured tape carries the live
+        // read, so an absent row is exactly prod's InstanceNotFound.
+        incarnation: gate(function(name){
+          if (name === undefined) throw new TypeError("platform.instances.incarnation requires (name)");
+          return instanceRow("inc/", String(name));
+        }),
+        usage: gate(function(name){
+          if (name === undefined) throw new TypeError("platform.instances.usage requires (name)");
+          return JSON.parse(instanceRow("usage/", String(name)));
+        }),
+      },
       // No `auth` verb: the operator-root verdict is `request.rewind.isRoot`,
       // supplied by the world (scenario({ isRoot })) and folded from the
       // root_verdict tape entry — never a call taking the bearer. A token the

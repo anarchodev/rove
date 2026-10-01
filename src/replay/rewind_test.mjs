@@ -21,6 +21,10 @@ const WORLD_KEY = "\x00rt/world";
 const RUN_KEY = "\x00rt/run";
 const ASSERT_KEY = "\x00rt/assert";
 const SNAP_PREFIX = "\x00rt/snap/";
+// The incarnation a declared instance reports when its scenario names none —
+// minted-token shaped (16 lowercase hex), so it reads like a live value and
+// never like the `"legacy"` sentinel.
+const DEFAULT_INCARNATION = "0000000000000000";
 const UPDATE_KEY = "\x00rt/update";
 
 const UPDATE = kv.get(UPDATE_KEY) === "1";
@@ -399,7 +403,7 @@ class Scenario {
     // Per-instance / root store seeds (read by platform.scope(id).kv /
     // platform.root). Seeded into the closed-world map under the same
     // `__rove_store/{tag}/` layout the base facades + host use at runtime.
-    this.instances = cfg.instances || {}; // { "<id>": { kv: {…} } }
+    this.instances = cfg.instances || {}; // { "<id>": { kv: {…}, incarnation?, usage? } }
     this.rootKv = (cfg.root && cfg.root.kv) || {};
     // Did this request arrive with a valid operator root token? Prod computes
     // the verdict in the engine and exposes it as `request.rewind.isRoot`; the
@@ -479,6 +483,19 @@ class Scenario {
       // InstanceNotFound (like prod's eager resolve) for any id not declared
       // here or created via platform.instances.create in the run.
       kv["__rove_store/exists/i/" + id] = "1";
+      // `platform.instances.incarnation(id)` — the declared token, or a fixed
+      // one. Re-seeding the same id with a different token is how a scenario
+      // models a deprovision + re-provision under one name.
+      const inc = this.instances[id] && this.instances[id].incarnation;
+      kv["__rove_store/inc/" + id] = inc != null ? String(inc) : DEFAULT_INCARNATION;
+      // `platform.instances.usage(id)` — the declared figures, zeros when
+      // absent; `capBytes` null (no cap known) unless the scenario names one.
+      const u = (this.instances[id] && this.instances[id].usage) || {};
+      kv["__rove_store/usage/" + id] = JSON.stringify({
+        usedBytes: u.usedBytes || 0, durableBytes: u.durableBytes || 0,
+        overlayBytes: u.overlayBytes || 0, entries: u.entries || 0,
+        capBytes: u.capBytes != null ? u.capBytes : null,
+      });
     }
     for (const k of Object.keys(this.rootKv)) kv["__rove_store/r/" + k] = this.rootKv[k];
     if (this.admin) kv["__rove_store/admin"] = "1";

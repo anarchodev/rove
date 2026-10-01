@@ -11,6 +11,7 @@ export default function ({ platform }) {
     catch (e) { out[name] = String((e && e.message) || e); }
   };
   probe("scope", () => platform.scope("acme").kv.get("x"));
+  probe("incarnation", () => platform.instances.incarnation("acme"));
   // No `root` probe: `platform.root` is GONE (rove#852), and an absent
   // name is not a gate — root reads are dispatched queries against
   // `__root__`, gated like any other platform.dispatch (below).

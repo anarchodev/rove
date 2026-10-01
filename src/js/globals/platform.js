@@ -313,6 +313,51 @@ __rove_factories.platform = function (caps) {
       deployStarter(name) {
         return sys.instances.deployStarter(name);
       },
+
+      /**
+       * The instance's storage incarnation — a token naming this tenant
+       * LIFETIME. Deprovisioning a name and provisioning it again yields a
+       * different token, so state keyed by name (ownership) should record
+       * the incarnation beside it and compare before trusting it. An
+       * instance keyed by name alone (provisioned before incarnations
+       * existed) returns `"legacy"`. Recorded on the tape, so replay sees
+       * the value the live run saw. Throws `Error{code:"InstanceNotFound"}`
+       * if `name` doesn't resolve.
+       *
+       * @param {string} name - Target instance id.
+       * @returns {string}
+       * @example
+       * export default ({ kv, platform }) => {
+       *   const id = "acme-prod";
+       *   const owned = kv.get("instance/" + id + "/incarnation") ===
+       *     platform.instances.incarnation(id);
+       *   return { owned };
+       * };
+       */
+      incarnation(name) {
+        return sys.instances.incarnation(name);
+      },
+
+      /**
+       * This node's kv footprint for one instance. `usedBytes` is the
+       * figure the plan's `max_kv_bytes` cap is enforced against, and
+       * `capBytes` is that cap as the worker enforces it now (`null` when
+       * the instance is uncapped or its cap is unknown on this node), so a
+       * dashboard showing them shows exactly what enforcement reads.
+       * Recorded on the tape, like {@link platform.instances.incarnation}.
+       * Throws `Error{code:"InstanceNotFound"}` if `name` doesn't resolve.
+       *
+       * @param {string} name - Target instance id.
+       * @returns {{usedBytes:number, durableBytes:number, overlayBytes:number, entries:number, capBytes:(number|null)}}
+       * @example
+       * export default ({ platform }) => {
+       *   const { usedBytes, capBytes } = platform.instances.usage("acme-prod");
+       *   return { usedBytes, capBytes };
+       * };
+       */
+      usage(name) {
+        return sys.instances.usage(name);
+      },
     },
 
     /**

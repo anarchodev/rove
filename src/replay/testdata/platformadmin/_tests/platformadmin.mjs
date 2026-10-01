@@ -6,7 +6,7 @@ import { scenario, expect } from "rewind:test";
 // `root` is not in this list: `platform.root` is GONE (rove#852), and an
 // absent name is not a gate — root reads are dispatched queries against
 // `__root__`, gated through `dispatch` like every other platform verb.
-const GATED = ["scope", "dispatch"];
+const GATED = ["scope", "incarnation", "dispatch"];
 const NOT_ADMIN = /only available on the admin handler/;
 
 // Non-admin (default): the gated methods throw, compile still emits.

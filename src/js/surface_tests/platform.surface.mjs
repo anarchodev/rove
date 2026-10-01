@@ -23,6 +23,14 @@ export default function ({ platform }) {
     throws(() => platform.instances.deployStarter("acme"), NOT_ADMIN);
   });
 
+  check("platform.instances.incarnation", () => {
+    throws(() => platform.instances.incarnation("acme"), NOT_ADMIN);
+  });
+
+  check("platform.instances.usage", () => {
+    throws(() => platform.instances.usage("acme"), NOT_ADMIN);
+  });
+
   check("platform.dispatch", () => {
     // The gate here is worth stating, because this verb is composed rather
     // than native: `dispatch` writes a `_dispatch/owed/` marker and arms a
