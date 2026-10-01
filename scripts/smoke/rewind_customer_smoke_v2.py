@@ -139,12 +139,26 @@ def main() -> int:
         # The customer OWNS `custapp` (provision it + seed the ownership row the
         # handler keys on — account/{sha256(sub)}/instances/{id}). They do NOT
         # own `other`.
-        c.provision("custapp")
+        rp = c.provision("custapp")
         c.provision("other")
-        # The ownership row the handler keys on: a precondition for every
-        # authz check below, so a refused write must not pass silently.
-        c.admin_kv_seed("__admin__",
-                        "account/" + sha256_hex(CUSTOMER) + "/instances/custapp", "")
+        # The ownership rows the dashboard's access check keys on — a
+        # precondition for every authz check below, so a refused write must not
+        # pass silently. Ownership is bound to the tenant's CURRENT incarnation
+        # (a reborn name must not inherit its previous owner), so the binding
+        # carries the incarnation the CP minted at provision — read from its
+        # reply, never invented. A personal account's id is its owner's hash.
+        try:
+            incarnation = json.loads(rp.body).get("incarnation") or ""
+        except (ValueError, AttributeError):
+            incarnation = ""
+        check("provision reply carries the tenant's incarnation", bool(incarnation),
+              f"got {rp.status} {rp.body!r}")
+        aid = sha256_hex(CUSTOMER)
+        c.admin_kv_seed("__admin__", "instance/custapp/owner", aid)
+        c.admin_kv_seed("__admin__", "instance/custapp/incarnation", incarnation)
+        c.admin_kv_seed("__admin__", "account/" + aid + "/members/" + aid, "owner")
+        c.admin_kv_seed("__admin__", "user/" + aid + "/accounts/" + aid, "owner")
+        c.admin_kv_seed("__admin__", "account/" + aid + "/instances/custapp", "")
 
         # Readiness.
         r = None
