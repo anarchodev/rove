@@ -461,6 +461,7 @@ pub const Engine = struct {
             .middleware_path = if (is_trust_boundary) mw_path else null,
             .result = result,
             .captured = wv.captured,
+            .random_json = wv.random_json,
             .warnings = header_warnings.items,
             .triggers = trigs,
         });

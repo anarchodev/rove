@@ -113,12 +113,11 @@ comptime {
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 /// Per-tape wire version. The channel set: `.kv`, `.module`,
 /// `.fetch_responses`, `.trigger_payload`, `.request_reads`,
-/// `.activation`. There
-/// are no `.math_random` / `.crypto_random` / `.date` channels —
-/// `Math.random`, `crypto.*`, and `Date.now` are seeded from the two
-/// readset-header scalars (`seed`, `timestamp_ns`), not taped
-/// (the four-primitive effect model, `docs/effect-algebra.md`: the
-/// minimal kv read set + seed-not-draws). The parser accepts exactly this version and
+/// `.activation`, `.random`. `Math.random` and `Date.now` are seeded from
+/// the two readset-header scalars (`seed`, `timestamp_ns`), not taped (the
+/// four-primitive effect model, `docs/effect-algebra.md`: the minimal kv
+/// read set + seed-not-draws); `crypto.*` randomness is taped as draws on
+/// `.random`, because a seed is the whole secret of everything it derives. The parser accepts exactly this version and
 /// rejects anything else loudly — the version byte is a format guard,
 /// not a compatibility band; no older tapes need to remain readable.
 /// v5 → v6: `fetch_responses` entries gained a trailing content-hash, so a
@@ -169,7 +168,11 @@ pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 /// too — its Msg (a WS frame, a wake bag) is flushed on the record's
 /// `activation` tape instead of a plaintext side field. A v11 reader takes sealed
 /// inline bytes for the payload itself, so the bump is again a guard.
-pub const VERSION: u16 = 12;
+/// v12 -> v13: the `random` channel. `crypto.*` draws come from the OS CSPRNG
+/// and are recorded (sealed like any payload) instead of derived from the
+/// readset seed; a v12 reader would replay them from the seed and produce
+/// different bytes, so the bump is a guard.
+pub const VERSION: u16 = 13;
 
 /// Wire width of a `BodyRef`: stamp(8) + digest(16) + offset(4) + len(4).
 /// Lockstep-asserted against the offline decoder above.
@@ -218,7 +221,7 @@ fn readBodyRef(bytes: []const u8, cur: *usize) ParseError!bodies_mod.BodyRef {
 /// the wrong-magic check at the decoder.
 pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// Whole-Readset wire version. The header carries the `timestamp_ns`
-/// + `seed` + `js_engine_version` scalars, then the 6 channel blobs in
+/// + `seed` + `js_engine_version` scalars, then the 7 channel blobs in
 /// fixed order, then a trailing `[u32 log_header_len][log_header_bytes]`
 /// section so any node can rebuild the customer LogRecord from the raft
 /// entry alone — including the request's `received_ns`, so a rebuilt record
@@ -238,23 +241,24 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// so a `wake_batch` / `ws_message` hop's Msg and every kind's resolved
 /// export ride the raft entry instead of only the flushed record, which is
 /// what a promotion walker needs to rebuild the record faithfully.
+/// The `random` channel joins as the seventh blob — v12 — so a rebuilt
+/// record carries the `crypto.*` draws its replay consumes.
 /// The parser accepts exactly this version
 /// and rejects anything else loudly — the version byte is a format
 /// guard, not a compatibility band. This version rides in the durable
 /// raft log (type-0 envelopes carry the readset): when the format
 /// changes, bump this and delete the old shape in the same change (and
 /// wipe the data dir) — do not add a min-supported fallback.
-pub const READSET_VERSION: u16 = 11;
-pub const READSET_CHANNEL_COUNT: usize = 6;
+pub const READSET_VERSION: u16 = 12;
+pub const READSET_CHANNEL_COUNT: usize = 7;
 
 /// Wire ids are contiguous and stable — the per-tape decoder rejects
 /// mismatched ids against the inner-blob channel header, so a wire id
 /// can never be reused for a different channel without a VERSION bump.
-/// There are no `math_random` / `crypto_random` / `date` channels:
-/// `Math.random` / `crypto.*` / `Date.now()` are seeded from the
-/// per-request scalars (`Readset.seed` + `Readset.timestamp_ns`) in
-/// the readset header (the four-primitive effect model,
-/// `docs/effect-algebra.md`).
+/// There are no `math_random` / `date` channels: `Math.random` and
+/// `Date.now()` are seeded from the per-request scalars (`Readset.seed` +
+/// `Readset.timestamp_ns`) in the readset header (the four-primitive effect
+/// model, `docs/effect-algebra.md`). `crypto.*` draws ride `.random`.
 pub const Channel = enum(u16) {
     kv = 0,
     module = 1,
@@ -305,7 +309,40 @@ pub const Channel = enum(u16) {
     /// that lost it replays through the CONVENTIONAL export, which is a
     /// different handler run wearing the same request id.
     activation = 5,
+    /// The activation's `crypto.*` randomness, in the order it was drawn
+    /// (`crypto.getRandomValues` / `randomBytes` / `randomUUID`). Each call
+    /// draws from the OS CSPRNG and its bytes are appended here, so the
+    /// stream is unpredictable from anything else in the record — the
+    /// readset seed included — and replay feeds the same bytes back.
+    ///
+    /// Entries are typed by `RandomKind`. Consecutive draws coalesce into
+    /// one `draw` entry (a run of bytes consumed in order), so a loop of
+    /// `randomUUID` calls costs one entry. Past `RANDOM_RECORD_CAP` bytes
+    /// an `elided` marker records how much more was drawn and nothing after
+    /// it is kept; replay refuses when it reaches one. The bytes are sealed
+    /// at capture like the other payload channels.
+    random = 6,
 };
+
+/// What a `random` channel entry is. The byte is on the wire so later kinds
+/// can share the channel's single ordering; a kind a reader doesn't know is
+/// rejected, never skipped, because skipping it would replay later draws at
+/// the wrong offsets.
+pub const RandomKind = enum(u8) {
+    /// A run of drawn bytes, consumed in order on replay.
+    draw = 0,
+    /// Reserved: a secret-handle mint descriptor (#559's minting slice).
+    /// Not produced or accepted at this tape version.
+    mint = 1,
+    /// `len` more bytes were drawn past `RANDOM_RECORD_CAP` and not kept.
+    /// Terminal: nothing is appended after it.
+    elided = 2,
+};
+
+/// Per-activation cap on recorded `crypto.*` draw bytes. One maximal
+/// `crypto.randomBytes(65536)` fits; past it the draws are elided rather
+/// than growing the record and the raft entry without bound.
+pub const RANDOM_RECORD_CAP: usize = 64 * 1024;
 
 /// Outcome of a kv operation as captured on the tape. `NotFound` is
 /// common enough to be a first-class variant rather than an error
@@ -440,6 +477,7 @@ pub const Entry = union(Channel) {
     trigger_payload: TriggerPayloadEntry,
     request_reads: RequestReadEntry,
     activation: ActivationEntry,
+    random: RandomEntry,
 
     pub const KvEntry = struct {
         op: KvOp,
@@ -653,6 +691,21 @@ pub const Entry = union(Channel) {
         /// The data key `inline_bytes` is sealed under, wrapped under key
         /// material a destroy can reach (`keyring.body_seal`). Empty when
         /// the bytes are plaintext. See `TriggerPayloadEntry.body_key`.
+        body_key: []const u8 = "",
+    };
+
+    /// One `random` channel entry (see `Channel.random`).
+    /// - `draw`: `inline_bytes` is the run of drawn bytes and `len` its
+    ///   length. A seal replaces the bytes with their sealed form; a drop
+    ///   (no key to seal under) empties them and keeps `len`, which replay
+    ///   reports as draws not kept rather than as no draws.
+    /// - `elided`: `len` bytes drawn past the cap; no bytes, no key.
+    pub const RandomEntry = struct {
+        kind: RandomKind,
+        len: u32,
+        inline_bytes: []const u8,
+        /// The data key `inline_bytes` is sealed under, wrapped
+        /// (`keyring.body_seal`). Empty when plaintext.
         body_key: []const u8 = "",
     };
 };
@@ -1082,8 +1135,54 @@ pub const Tape = struct {
         self.owned_bytes += export_copy.len + inline_copy.len;
     }
 
+    /// Record one `crypto.*` draw. Extends the trailing `draw` run when there
+    /// is one, so consecutive draws cost one entry. Once the activation has
+    /// recorded `RANDOM_RECORD_CAP` bytes the rest is counted on a terminal
+    /// `elided` marker instead of kept.
+    pub fn appendRandomDraw(self: *Tape, bytes: []const u8) !void {
+        std.debug.assert(self.channel == .random);
+        if (bytes.len == 0) return;
+        if (self.entries.items.len > 0) {
+            const last = &self.entries.items[self.entries.items.len - 1].random;
+            if (last.kind == .elided) {
+                last.len +|= @intCast(@min(bytes.len, std.math.maxInt(u32)));
+                return;
+            }
+        }
+        const room = RANDOM_RECORD_CAP -| self.owned_bytes;
+        const kept = bytes[0..@min(bytes.len, room)];
+        if (kept.len > 0) {
+            const tail = if (self.entries.items.len > 0) &self.entries.items[self.entries.items.len - 1].random else null;
+            if (tail != null and tail.?.kind == .draw and tail.?.body_key.len == 0) {
+                const t = tail.?;
+                const grown = try self.allocator.alloc(u8, t.inline_bytes.len + kept.len);
+                @memcpy(grown[0..t.inline_bytes.len], t.inline_bytes);
+                @memcpy(grown[t.inline_bytes.len..], kept);
+                self.allocator.free(t.inline_bytes);
+                t.inline_bytes = grown;
+                t.len = @intCast(grown.len);
+            } else {
+                const copy = try self.allocator.dupe(u8, kept);
+                errdefer self.allocator.free(copy);
+                try self.entries.append(self.allocator, .{ .random = .{
+                    .kind = .draw,
+                    .len = @intCast(copy.len),
+                    .inline_bytes = copy,
+                } });
+            }
+            self.owned_bytes += kept.len;
+        }
+        if (kept.len < bytes.len) {
+            try self.entries.append(self.allocator, .{ .random = .{
+                .kind = .elided,
+                .len = @intCast(@min(bytes.len - kept.len, std.math.maxInt(u32))),
+                .inline_bytes = "",
+            } });
+        }
+    }
+
     /// Replace entry `i`'s inline payload with its sealed form and the
-    /// wrapped data key that opens it (`keyring.body_seal`). Only the three
+    /// wrapped data key that opens it (`keyring.body_seal`). Only the
     /// payload-carrying channels have one; anything else is a caller bug.
     /// Owned bytes are swapped, never aliased, so the entry stays freeable
     /// by `freeEntry` whatever happened before.
@@ -1096,6 +1195,7 @@ pub const Tape = struct {
             .trigger_payload => |*t| .{ .bytes = &t.inline_bytes, .key = &t.body_key },
             .fetch_responses => |*f| .{ .bytes = &f.inline_bytes, .key = &f.body_key },
             .activation => |*a| .{ .bytes = &a.inline_bytes, .key = &a.body_key },
+            .random => |*r| .{ .bytes = &r.inline_bytes, .key = &r.body_key },
             else => unreachable,
         };
         self.owned_bytes -= slots.bytes.len + slots.key.len;
@@ -1115,6 +1215,7 @@ pub const Tape = struct {
             .trigger_payload => |*t| .{ .bytes = &t.inline_bytes, .key = &t.body_key },
             .fetch_responses => |*f| .{ .bytes = &f.inline_bytes, .key = &f.body_key },
             .activation => |*a| .{ .bytes = &a.inline_bytes, .key = &a.body_key },
+            .random => |*r| .{ .bytes = &r.inline_bytes, .key = &r.body_key },
             else => unreachable,
         };
         self.owned_bytes -= slots.bytes.len + slots.key.len;
@@ -1298,6 +1399,9 @@ pub const Readset = struct {
     /// walker-recovered writing hop replays through the same export,
     /// against the same wakes bag / frame the handler saw.
     activation: Tape,
+    /// The activation's `crypto.*` draws (see `Channel.random`). Appended by
+    /// the crypto bindings as the handler runs.
+    random: Tape,
     /// The lazily-recorded request-surface reads (see
     /// `Channel.request_reads`). The JS getters in
     /// `globals.installRequest` append here on first access.
@@ -1362,6 +1466,7 @@ pub const Readset = struct {
             .trigger_payload = Tape.init(allocator, .trigger_payload),
             .request_reads = Tape.init(allocator, .request_reads),
             .activation = Tape.init(allocator, .activation),
+            .random = Tape.init(allocator, .random),
         };
     }
 
@@ -1374,6 +1479,7 @@ pub const Readset = struct {
         self.trigger_payload.deinit();
         self.request_reads.deinit();
         self.activation.deinit();
+        self.random.deinit();
     }
 
     /// Clear everything a dispatch ATTEMPT records — the arena-OOM
@@ -1389,6 +1495,9 @@ pub const Readset = struct {
         self.kv.reset();
         self.module.reset();
         self.request_reads.reset();
+        // A retried attempt draws afresh; the record keeps the draws of
+        // the attempt that ran.
+        self.random.reset();
         self.body_read = false;
         // Per-attempt like the kv tape: the GC rerun re-records the
         // retried attempt's writes.
@@ -1487,6 +1596,7 @@ pub const Readset = struct {
             &self.trigger_payload,
             &self.request_reads,
             &self.activation,
+            &self.random,
         };
         for (channels) |t| {
             const blob = if (bound) |b| switch (b) {
@@ -1913,6 +2023,10 @@ fn freeEntry(allocator: std.mem.Allocator, e: *Entry) void {
             allocator.free(a.inline_bytes);
             allocator.free(a.body_key);
         },
+        .random => |*r| {
+            allocator.free(r.inline_bytes);
+            allocator.free(r.body_key);
+        },
     }
 }
 
@@ -2012,6 +2126,14 @@ fn encodeEntry(
             try appendBodyRef(allocator, buf, a.body_ref);
             try appendLenPrefixed(allocator, buf, a.inline_bytes);
             try appendLenPrefixed(allocator, buf, a.body_key);
+        },
+        .random => |r| {
+            try buf.append(allocator, @intFromEnum(r.kind));
+            var len_be: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len_be, r.len, .big);
+            try buf.appendSlice(allocator, &len_be);
+            try appendLenPrefixed(allocator, buf, r.inline_bytes);
+            try appendLenPrefixed(allocator, buf, r.body_key);
         },
     }
 }
@@ -2154,6 +2276,29 @@ fn decodeEntry(
             return .{ .activation = .{
                 .export_name = export_name,
                 .body_ref = body_ref,
+                .inline_bytes = inline_bytes,
+                .body_key = body_key,
+            } };
+        },
+        .random => {
+            if (cur + 5 > bytes.len) return ParseError.Truncated;
+            // Only the kinds this version produces. A mint is a later
+            // version's; skipping it would replay later draws at the wrong
+            // offsets, so it is rejected like any unknown kind.
+            const kind: RandomKind = switch (bytes[cur]) {
+                @intFromEnum(RandomKind.draw) => .draw,
+                @intFromEnum(RandomKind.elided) => .elided,
+                else => return ParseError.UnknownChannel,
+            };
+            cur += 1;
+            const len = std.mem.readInt(u32, bytes[cur..][0..4], .big);
+            cur += 4;
+            const inline_bytes = try readLenPrefixed(bytes, &cur);
+            const body_key = try readLenPrefixed(bytes, &cur);
+            if (cur != bytes.len) return ParseError.Truncated;
+            return .{ .random = .{
+                .kind = kind,
+                .len = len,
                 .inline_bytes = inline_bytes,
                 .body_key = body_key,
             } };
@@ -2339,6 +2484,7 @@ test "readset: serialize + parseReadset roundtrip" {
         .trigger_payload,
         .request_reads,
         .activation,
+        .random,
     };
     for (parsed.blobs, 0..) |blob, idx| {
         var p = try parse(testing.allocator, blob);
@@ -3265,4 +3411,60 @@ test "initLive: two activations at the same instant draw different seeds" {
     defer b.deinit();
     try testing.expectEqual(a.timestamp_ns, b.timestamp_ns);
     try testing.expect(a.seed != b.seed);
+}
+
+test "random: consecutive draws coalesce, the cap elides the rest, and the tape round-trips" {
+    const a = testing.allocator;
+    var t = Tape.init(a, .random);
+    defer t.deinit();
+    try t.appendRandomDraw("\xAA\xBB");
+    try t.appendRandomDraw("\xCC");
+    try testing.expectEqual(@as(usize, 1), t.entries.items.len);
+    try testing.expectEqualSlices(u8, "\xAA\xBB\xCC", t.entries.items[0].random.inline_bytes);
+    try testing.expectEqual(@as(u32, 3), t.entries.items[0].random.len);
+
+    // Past the cap: what fits is kept, the rest is counted on one terminal
+    // elided marker, and later draws only grow that count.
+    const big = try a.alloc(u8, RANDOM_RECORD_CAP);
+    defer a.free(big);
+    @memset(big, 0x11);
+    try t.appendRandomDraw(big);
+    try t.appendRandomDraw("\x01\x02\x03\x04\x05");
+    try testing.expectEqual(@as(usize, 2), t.entries.items.len);
+    try testing.expectEqual(@as(usize, RANDOM_RECORD_CAP), t.entries.items[0].random.inline_bytes.len);
+    const el = t.entries.items[1].random;
+    try testing.expectEqual(RandomKind.elided, el.kind);
+    try testing.expectEqual(@as(u32, 3 + 5), el.len);
+
+    const bytes = try t.serialize(a);
+    defer a.free(bytes);
+    var p = try parse(a, bytes);
+    defer p.deinit();
+    try testing.expectEqual(Channel.random, p.channel);
+    try testing.expectEqual(@as(usize, 2), p.entries.len);
+    try testing.expectEqual(RandomKind.draw, p.entries[0].random.kind);
+    try testing.expectEqual(RandomKind.elided, p.entries[1].random.kind);
+    try testing.expectEqual(@as(u32, 8), p.entries[1].random.len);
+
+    // The offline decoder reads the same bytes.
+    const dec = try tape_decode.decodeRandom(a, bytes);
+    defer a.free(dec);
+    try testing.expectEqual(@as(usize, 2), dec.len);
+    try testing.expectEqual(@as(u32, 8), dec[1].len);
+}
+
+test "random: a kind this version does not produce is rejected, never skipped" {
+    const a = testing.allocator;
+    var t = Tape.init(a, .random);
+    defer t.deinit();
+    try t.appendRandomDraw("\x01");
+    const bytes = try t.serialize(a);
+    defer a.free(bytes);
+    // Rewrite the entry's kind byte to the reserved `mint` kind. Framing:
+    // [u32 magic][u16 version][u16 channel][u32 count][u32 len][entry...].
+    const forged = try a.dupe(u8, bytes);
+    defer a.free(forged);
+    forged[16] = @intFromEnum(RandomKind.mint);
+    try testing.expectError(ParseError.UnknownChannel, parse(a, forged));
+    try testing.expectError(tape_decode.Error.BadEnum, tape_decode.decodeRandom(a, forged));
 }

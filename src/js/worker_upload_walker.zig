@@ -197,6 +197,8 @@ fn buildLogRecord(
     tapes.fetch_responses_tape_bytes = try allocator.dupe(u8, channel_blobs[fetch_idx]);
     tapes.trigger_payload_tape_bytes = try allocator.dupe(u8, channel_blobs[trigger_idx]);
     tapes.request_reads_tape_bytes = try allocator.dupe(u8, channel_blobs[request_reads_idx]);
+    // `crypto.*` draws, copied verbatim (sealed as the leader sealed them).
+    tapes.random_tape_bytes = try allocator.dupe(u8, channel_blobs[@intFromEnum(tape_mod.Channel.random)]);
     // The activation channel is the reason a rebuilt resume hop replays as the
     // same run: it carries the Msg of a `wake_batch` (the drained wakes bag) or
     // a `ws_message` (the frame), and the resolved `{on}` target. The tape is

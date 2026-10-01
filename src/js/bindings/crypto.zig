@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Core `crypto.*` JS bindings: randomness + hashing.
 //!
-//! Randomness draws from arenajs's per-context xorshift64star via
-//! `JS_FillRandomBytes` — seeded once per request from `readset.seed`
-//! in `globals.installRequest` (seed-not-draws). Replay reproduces
-//! the same byte sequence by reseeding the PRNG with the captured
-//! request's seed; no per-draw tape entries. Hashes are pure (no
-//! readset capture needed) and use Zig std.crypto — no OpenSSL.
+//! Randomness draws from the OS CSPRNG on every call and records the
+//! bytes on the readset's `random` channel (`draw`), which is sealed at
+//! capture like any payload. Replay feeds the recorded bytes back, so the
+//! values are reproducible for an authorized reader and unpredictable
+//! from anything else in the record — the readset seed included, which
+//! drives `Math.random` alone. Hashes are pure (no readset capture
+//! needed) and use Zig std.crypto — no OpenSSL.
 //!
 //! The OpenSSL-backed signature surfaces live in sibling modules:
 //! `crypto_jose.zig` (RSA/ECDSA JWS verify + OIDC keys) and
@@ -22,6 +23,20 @@ const globals = @import("../globals.zig");
 
 const js_exception = globals.js_exception;
 
+/// Fill `out` from the OS CSPRNG and record the bytes as this activation's
+/// next draw. A failed record leaves the bytes unrecorded, which replay
+/// reports as a divergence rather than reproducing silently wrong values.
+fn draw(ctx: ?*c.JSContext, out: []u8) void {
+    std.crypto.random.bytes(out);
+    // Outside an activation (no dispatch state) there is nothing to record.
+    const opaque_ptr = c.JS_GetContextOpaque(ctx) orelse return;
+    const state: *globals.DispatchState = @ptrCast(@alignCast(opaque_ptr));
+    const rs = state.readset orelse return;
+    rs.random.appendRandomDraw(out) catch |err| {
+        std.log.warn("rove-js crypto: recording a {d}-byte draw failed: {s}", .{ out.len, @errorName(err) });
+    };
+}
+
 pub fn jsCryptoGetRandomValues(
     ctx: ?*c.JSContext,
     _: c.JSValue,
@@ -29,7 +44,6 @@ pub fn jsCryptoGetRandomValues(
     argv: [*c]c.JSValue,
 ) callconv(.c) c.JSValue {
     if (argc < 1) return js_exception;
-    const state = globals.getState(ctx);
 
     // The Web Crypto API expects a typed array. We reach into the
     // ArrayBuffer directly via JS_GetArrayBuffer. Non-typed-array
@@ -38,14 +52,7 @@ pub fn jsCryptoGetRandomValues(
     const buf_ptr = c.JS_GetUint8Array(ctx, &byte_len, argv[0]);
     if (buf_ptr == null) return js_exception;
 
-    // seed-not-draws (`docs/effect-algebra.md`) — bytes come from arenajs's per-
-    // request xorshift64star state (seeded once per request via
-    // JS_SetRandomSeed). Same PRNG Math.random draws from, so replay
-    // reproduces by re-seeding with the recorded request seed. No
-    // tape entry — the seed scalar on the readset header is the
-    // entire "tape" for random.
-    _ = state;
-    c.JS_FillRandomBytes(ctx, buf_ptr, byte_len);
+    draw(ctx, @as([*]u8, @ptrCast(buf_ptr))[0..byte_len]);
     // Spec says return the input typed array.
     return c.JS_DupValue(ctx, argv[0]);
 }
@@ -133,9 +140,7 @@ pub fn jsCryptoRandomUuid(
     _: [*c]c.JSValue,
 ) callconv(.c) c.JSValue {
     var raw: [16]u8 = undefined;
-    // seed-not-draws: bytes from arenajs's per-request PRNG, same stream as
-    // Math.random + crypto.*. Replay reproduces by re-seeding.
-    c.JS_FillRandomBytes(ctx, &raw, raw.len);
+    draw(ctx, &raw);
     // RFC 4122 v4: set the version and variant bits.
     raw[6] = (raw[6] & 0x0f) | 0x40;
     raw[8] = (raw[8] & 0x3f) | 0x80;
@@ -156,10 +161,7 @@ pub fn jsCryptoRandomUuid(
 }
 
 /// `crypto.randomBytes(n) → Uint8Array` — n cryptographically random
-/// bytes drawn from the per-context PRNG (xorshift64star, seeded
-/// once per request from `readset.seed`). Replay reproduces the
-/// same sequence by reseeding before the handler runs
-/// (seed-not-draws — no per-draw tape entries).
+/// bytes from the OS CSPRNG, recorded as a draw (see `draw`).
 ///
 /// `n` must be a non-negative integer ≤ 65536 (Web Crypto's typical
 /// per-call cap). Throws RangeError otherwise.
@@ -189,8 +191,7 @@ pub fn jsCryptoRandomBytes(
     };
     defer state.allocator.free(bytes);
 
-    // seed-not-draws: same xorshift64star state as Math.random.
-    c.JS_FillRandomBytes(ctx, bytes.ptr, bytes.len);
+    draw(ctx, bytes);
 
     return c.JS_NewUint8ArrayCopy(ctx, bytes.ptr, bytes.len);
 }

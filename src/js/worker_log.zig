@@ -315,6 +315,8 @@ pub fn captureTapes(
         // The activation's Msg (a WS frame, a wake bag) rides this tape on the
         // record as on the raft entry, sealed like every other payload.
         .{ .tape = &readset.activation, .out = &payloads.activation_tape_bytes },
+        // `crypto.*` draws, sealed like the payloads above.
+        .{ .tape = &readset.random, .out = &payloads.random_tape_bytes },
     };
 
     for (channels) |ch| {

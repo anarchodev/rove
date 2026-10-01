@@ -1117,6 +1117,8 @@ fn cmdPull(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []
             .{ "fetch_responses_tape_b64", "fetch_responses_b64" },
             .{ "trigger_payload_tape_b64", "trigger_payload_b64" },
             .{ "activation_tape_b64", "activation_b64" },
+            // The activation's crypto.* draws, which replay feeds back in order.
+            .{ "random_tape_b64", "random_b64" },
         };
         for (map) |m| {
             if (jStrM(t, m[0])) |b64| {

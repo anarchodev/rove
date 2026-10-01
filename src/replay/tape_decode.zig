@@ -19,7 +19,7 @@
 const std = @import("std");
 
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
-pub const VERSION: u16 = 12; // lockstep-asserted against src/tape/root.zig
+pub const VERSION: u16 = 13; // lockstep-asserted against src/tape/root.zig
 /// The oldest layout this reader still understands.
 ///
 /// A range is only sound while every version in it can be told apart by
@@ -48,6 +48,8 @@ pub const Channel = enum(u16) {
     /// `ws_message`'s `[opcode][data]` frame). Rides the raft entry and the
     /// flushed record alike (`decodeActivation`).
     activation = 5,
+    /// The activation's `crypto.*` draws, in drawn order (`decodeRandom`).
+    random = 6,
 };
 
 pub const KvOp = enum(u8) { get = 0, set = 1, delete = 2, prefix = 3 };
@@ -474,6 +476,41 @@ pub fn decodeActivation(a: std.mem.Allocator, bytes: []const u8) Error![]Activat
             .inline_bytes = inline_bytes,
             .body_key = body_key,
         });
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// What a `random` entry is (`src/tape/root.zig` `RandomKind`). Only the
+/// kinds this version produces decode; anything else is `BadEnum`, never
+/// skipped, because skipping would replay later draws at wrong offsets.
+pub const RandomKind = enum(u8) { draw = 0, elided = 2 };
+
+/// One `random` entry (`src/tape/root.zig` `RandomEntry`).
+pub const RandomEntry = struct {
+    kind: RandomKind,
+    /// `draw`: the run's length (also when the bytes were not kept);
+    /// `elided`: how many bytes were drawn past the recording cap.
+    len: u32,
+    /// The drawn bytes; empty when not kept. Sealed when `body_key` is set
+    /// (a bundle pulled through the logs door arrives opened).
+    inline_bytes: []const u8,
+    body_key: []const u8 = "",
+};
+
+/// Decode the random channel. Slices borrow `bytes`.
+pub fn decodeRandom(a: std.mem.Allocator, bytes: []const u8) Error![]RandomEntry {
+    var r = try Reader.init(bytes, .random);
+    var out = std.ArrayList(RandomEntry){};
+    errdefer out.deinit(a);
+    while (try r.nextRaw()) |e| {
+        if (e.len < 5) return Error.Truncated;
+        const kind = std.meta.intToEnum(RandomKind, e[0]) catch return Error.BadEnum;
+        var cur: usize = 5;
+        const len = std.mem.readInt(u32, e[1..5], .big);
+        const inline_bytes = try readLenPrefixed(e, &cur);
+        const body_key = try readLenPrefixed(e, &cur);
+        if (cur != e.len) return Error.Truncated;
+        try out.append(a, .{ .kind = kind, .len = len, .inline_bytes = inline_bytes, .body_key = body_key });
     }
     return out.toOwnedSlice(a);
 }

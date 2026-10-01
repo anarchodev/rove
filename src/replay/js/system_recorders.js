@@ -29,10 +29,40 @@
 // The host must seed the per-run state these recorders read before each
 // activation: `__rove_effects`, `__rove_fetch_seq`, `__rove_stream_bytes`,
 // `__rove_blob_receive_used`, `__rove_activation_kind`, `__rove_captured`,
-// `__rove_email_sends`.
+// `__rove_email_sends`, `__rove_random` (+ its cursor `__rove_random_pos` /
+// `__rove_random_off`).
 
 ;(function(){
   var nat = globalThis.crypto;
+  // The recorded `crypto.*` draws of a captured activation: an ordered list of
+  // `{draw:"<hex>"}` runs, `{unkept:n}` (drawn but not kept — sealed under a
+  // key this reader cannot open, or no keyring), and `{elided:n}` (drawn past
+  // the recording cap). Null for an authored world, which has no record.
+  var replayingDraws = function(){ return Array.isArray(globalThis.__rove_random); };
+  var drawMiss = function(what, out){
+    if (globalThis.__rove_poison) globalThis.__rove_poison(what);
+    return out;
+  };
+  var replayDraws = function(n){
+    var tape = globalThis.__rove_random, out = new Uint8Array(n), got = 0;
+    while (got < n) {
+      var pos = globalThis.__rove_random_pos | 0, e = tape[pos];
+      if (!e) return drawMiss("crypto randomness (" + n + " bytes) the capture never recorded", out);
+      if (e.unkept !== undefined) return drawMiss("crypto randomness the capture did not keep (sealed under a destroyed key, or recorded without a keyring)", out);
+      if (e.elided !== undefined) return drawMiss("crypto randomness past the per-activation recording cap (" + e.elided + " bytes not kept)", out);
+      if (!e.bytes) {
+        e.bytes = new Uint8Array(e.draw.length >> 1);
+        for (var i = 0; i < e.bytes.length; i++) e.bytes[i] = parseInt(e.draw.substr(i * 2, 2), 16);
+      }
+      var off = globalThis.__rove_random_off | 0, take = Math.min(n - got, e.bytes.length - off);
+      out.set(e.bytes.subarray(off, off + take), got);
+      got += take;
+      off += take;
+      if (off >= e.bytes.length) { globalThis.__rove_random_pos = pos + 1; off = 0; }
+      globalThis.__rove_random_off = off;
+    }
+    return out;
+  };
   var no = function(n){ return function(){ throw new Error("crypto." + n + " is not available in `rewind test` (the offline sim has SHA-256/HMAC + random only — no streaming sha, RSA or ECDSA)"); }; };
   // A verify path reached an alg/curve the offline sim doesn't implement.
   // THROW (a loud, declared gap) rather than return a silent `valid:false`
@@ -410,10 +440,30 @@
       next: function(target, o){ return { __rove_disposition: "next", target: (target ? target : null), fn: (o && typeof o.fn === "string") ? o.fn : null, ctx: (o && o.ctx !== undefined) ? o.ctx : null }; },
     },
     crypto: {
-      getRandomValues: function(a){ return nat.getRandomValues(a); },
+      // bindings/crypto.zig draws every `crypto.*` byte from the OS CSPRNG and
+      // records it on the `random` tape. A captured world replays those draws
+      // in order (`replayDraws`); an authored world has none and uses the
+      // seeded stand-in.
+      getRandomValues: function(a){
+        if (!replayingDraws()) return nat.getRandomValues(a);
+        var view = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+        view.set(replayDraws(view.length));
+        return a;
+      },
       // jsCryptoRandomBytes (bindings/crypto.zig): ToInt32(n) ∈ [0, 65536].
-      randomBytes: function(n){ var v = Number(n) | 0; if (v < 0 || v > 65536) throw new RangeError("crypto.randomBytes: n must be in [0, 65536]"); return nat.randomBytes(v); },
-      randomUUID: function(){ return nat.randomUUID(); },
+      randomBytes: function(n){ var v = Number(n) | 0; if (v < 0 || v > 65536) throw new RangeError("crypto.randomBytes: n must be in [0, 65536]"); return replayingDraws() ? replayDraws(v) : nat.randomBytes(v); },
+      // jsCryptoRandomUuid: 16 drawn bytes, RFC 4122 v4 version/variant bits.
+      randomUUID: function(){
+        if (!replayingDraws()) return nat.randomUUID();
+        var r = replayDraws(16), h = "";
+        r[6] = (r[6] & 0x0f) | 0x40;
+        r[8] = (r[8] & 0x3f) | 0x80;
+        for (var i = 0; i < 16; i++) {
+          if (i === 4 || i === 6 || i === 8 || i === 10) h += "-";
+          h += (r[i] < 16 ? "0" : "") + r[i].toString(16);
+        }
+        return h;
+      },
       sha256: function(d){ return nat.sha256(d); },
       hmacSha256: function(k,d){ return nat.hmacSha256(k,d); },
       sha256Init: function(){ return shaInit(); },

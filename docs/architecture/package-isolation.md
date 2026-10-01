@@ -110,7 +110,7 @@ authority is `__rove.caps` in `installStatic`, asserted by identity in
 | `next`, `platform`, `stream`, `webhook` | `TextEncoder`/`TextDecoder`, `URLSearchParams` |
 | `request`, `response` (per-activation) | `atob`/`btoa`, `base64url`, `hex` |
 | `tag`, `unmaskedIp`, `shredKey` (§3.4) | `time` — pure ns coercion |
-| | `crypto` — pure + seeded, reaches nothing outside |
+| | `crypto` — pure + recorded for replay, reaches nothing outside |
 | | `console` — see §3.5 |
 
 `crypto` stays ambient deliberately: `sha256`/`hmac` are pure, and

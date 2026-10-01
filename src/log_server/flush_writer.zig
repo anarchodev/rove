@@ -412,8 +412,8 @@ fn writeTapePayloads(
     // Replay reseeds the per-context PRNG
     // with `seed` and pins `Date.now()` to
     // `@divTrunc(timestamp_ns, ns_per_ms)` so `Math.random` /
-    // `crypto.*` / `Date.now()` / `new Date()` reproduce the
-    // captured sequences — no per-draw or per-call tape entries.
+    // `Date.now()` / `new Date()` reproduce the captured sequences.
+    // `crypto.*` is not seeded: its draws ride `random_tape_b64`.
     //
     // Both emitted as JSON strings so the consumer can BigInt()
     // them without precision loss: production values derive from
@@ -444,6 +444,7 @@ fn writeTapePayloads(
     try writeBytesField(allocator, w, "trigger_payload_tape_b64", t.trigger_payload_tape_bytes, false);
     try writeBytesField(allocator, w, "request_reads_tape_b64", t.request_reads_tape_bytes, false);
     try writeBytesField(allocator, w, "activation_tape_b64", t.activation_tape_bytes, false);
+    try writeBytesField(allocator, w, "random_tape_b64", t.random_tape_bytes, false);
     // Resolved export ({on} / onFetch*) — a plain name, emitted only when set
     // (replay uses it verbatim so an overridden callback replays faithfully).
     if (t.export_name.len != 0) {

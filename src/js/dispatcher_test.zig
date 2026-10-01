@@ -2350,7 +2350,7 @@ test "dispatch: a batch-mate's write is a FOREIGN read for the next activation (
     try testing.expectEqual(@as(usize, 2), ws.ops.items.len);
 }
 
-test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
+test "dispatch: Date.now + Math.random replay from the scalars; crypto.* draws are recorded" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -2358,15 +2358,15 @@ test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
         cleanupTempKv(&buf);
     }
 
-    // §9 + fold-in: every non-deterministic source in the handler
-    // is reduced to two scalars in the readset header.
-    //  - `seed` → arenajs's per-context xorshift64star
+    // Two non-deterministic sources reduce to scalars in the readset header:
+    //  - `seed` → arenajs's per-context xorshift64star, for `Math.random`
     //  - `timestamp_ns` → arenajs's per-context `date_now_pinned`
     //    (Date.now() and new Date() (no args) return the same
     //    `@divTrunc(timestamp_ns, ns_per_ms)` for every call in
     //    one request, same posture as Cloudflare Workers /
     //    Lambda SnapStart)
-    // No dedicated tape channels for any of them.
+    // `crypto.*` is the exception: its bytes come from the OS CSPRNG and
+    // ride the `random` channel, so the seed predicts none of them.
     const fixed_ts: i64 = 1_700_000_000_000_000_000; // arbitrary, in ns
     var readset = tape_mod.Readset.init(testing.allocator, fixed_ts, 42);
     defer readset.deinit();
@@ -2415,8 +2415,11 @@ test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
         body_1 = try testing.allocator.dupe(u8, resp.body);
     }
 
-    // Two scalars: ZERO tape entries on any random / date channel —
-    // those channels don't exist.
+    // The crypto draws are on the tape: getRandomValues' 4 bytes, then
+    // randomUUID's 16, coalesced into one run in call order.
+    try testing.expectEqual(@as(usize, 1), readset.random.entries.items.len);
+    const run = readset.random.entries.items[0].random;
+    try testing.expectEqual(@as(u32, 20), run.len);
 
     // Date.now is pinned. Both `Date.now()` calls AND
     // `(new Date()).getTime()` should return the same ms scalar
@@ -2434,9 +2437,18 @@ test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
     try testing.expectEqualStrings(expected_ms_s, got_t2);
     try testing.expectEqualStrings(expected_ms_s, got_t3);
 
-    // Same seed + same timestamp → bit-identical output sequence
-    // (no need to strip a prefix anymore — every field is now
-    // deterministic).
+    // The UUID is the last 16 recorded bytes with the v4 bits set — what
+    // replay rebuilds from the tape.
+    var uuid_raw: [16]u8 = run.inline_bytes[4..20].*;
+    uuid_raw[6] = (uuid_raw[6] & 0x0f) | 0x40;
+    uuid_raw[8] = (uuid_raw[8] & 0x3f) | 0x80;
+    const hex = std.fmt.bytesToHex(uuid_raw, .lower);
+    var uuid_buf: [36]u8 = undefined;
+    _ = try std.fmt.bufPrint(&uuid_buf, "{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] });
+    try testing.expect(std.mem.endsWith(u8, body_1, &uuid_buf));
+
+    // Same seed + same timestamp → the same clock and Math.random fields,
+    // and a DIFFERENT uuid: the seed is not an input to crypto.*.
     var readset2 = tape_mod.Readset.init(testing.allocator, fixed_ts, 42);
     defer readset2.deinit();
 
@@ -2458,7 +2470,10 @@ test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
         body_2 = try testing.allocator.dupe(u8, resp2.body);
     }
 
-    try testing.expectEqualStrings(body_1, body_2);
+    const cut1 = std.mem.lastIndexOfScalar(u8, body_1, '|').?;
+    const cut2 = std.mem.lastIndexOfScalar(u8, body_2, '|').?;
+    try testing.expectEqualStrings(body_1[0..cut1], body_2[0..cut2]);
+    try testing.expect(!std.mem.eql(u8, body_1[cut1..], body_2[cut2..]));
 }
 
 test "dispatch: tight loop hits budget and returns Interrupted" {

@@ -938,9 +938,8 @@ pub fn throwKvError(ctx: ?*c.JSContext, message: []const u8, code: []const u8) c
 // Neither has a per-call tape channel. arenajs's native
 // implementations service them via per-context state set by the
 // dispatcher in `installRequest`:
-//   - `Math.random` / crypto.* → `JS_SetRandomSeed(ctx, seed)`,
-//     reading from `js_random_state_active(ctx)`. crypto.* draws
-//     through `JS_FillRandomBytes`.
+//   - `Math.random` → `JS_SetRandomSeed(ctx, seed)`, reading from
+//     `js_random_state_active(ctx)`.
 //   - `Date.now()` / `new Date()` (no args) → `JS_SetDateNow(ctx,
 //     start_time_ms)`, reading from `ctx->date_now_pinned`. Every
 //     clock read in one request returns the same value — same
@@ -950,13 +949,16 @@ pub fn throwKvError(ctx: ?*c.JSContext, message: []const u8, code: []const u8) c
 // captured values (`arena_set_random_seed` + `arena_set_date_now`
 // reactor exports for the WASM build, direct API calls for the
 // server build).
+//
+// `crypto.*` is NOT seeded: it draws from the OS CSPRNG and records each
+// draw on the readset's `random` channel (`bindings/crypto.zig`), because a
+// seed is the whole secret of everything derived from it.
 
 // Within-activation non-determinism replay
 // (`docs/architecture/replay-and-sim.md`): arenajs's native `js_math_random`
 // runs against the per-request
 // xorshift64star state (seeded once per request via
-// `JS_SetRandomSeed` in `installRequest`). crypto.* draws from the
-// same state via `JS_FillRandomBytes`. Replay reproduces by
+// `JS_SetRandomSeed` in `installRequest`). Replay reproduces by
 // calling `arena_set_random_seed` with the recorded request seed
 // from the readset header — no per-draw tape entries, no JS port.
 

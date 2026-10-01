@@ -79,6 +79,9 @@ pub const Opts = struct {
     /// pinned (`session` null / `tenant` / `sagaId` ""), the ip
     /// channels default to null, and the retired surfaces don't exist.
     captured: bool = false,
+    /// The captured activation's recorded `crypto.*` draws, as JSON text
+    /// (world.zig `random_json`). Null replays `crypto.*` from the seed.
+    random_json: ?[]const u8 = null,
     /// World-build warnings (e.g. an authored header the prod filter would
     /// strip, root.zig's authored-header hygiene) — surfaced as
     /// `{kind:"log", level:"warn"}` entries at the head of the bundle's
@@ -280,6 +283,8 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     try jsonStr(w, opts.activation);
     try w.writeAll(",\"captured\":");
     try w.writeAll(if (opts.captured) "true" else "false");
+    try w.writeAll(",\"random\":");
+    try w.writeAll(opts.random_json orelse "null");
     try w.writeAll("};\n");
 
     // ── the fixed reconstruction + invoke + side-channel capture ──
@@ -441,6 +446,10 @@ const EPILOGUE_BODY_HEAD =
     \\  // Captured tapes replay trust-the-tape: recorder checks that depend on
     \\  // harness-seeded state (platform.scope's exists marker) stand down.
     \\  globalThis.__rove_captured = D.captured;
+    \\  // Recorded crypto.* draws (system_recorders.js replayDraws) and their cursor.
+    \\  globalThis.__rove_random = D.random;
+    \\  globalThis.__rove_random_pos = 0;
+    \\  globalThis.__rove_random_off = 0;
     \\  globalThis.__rove_email_sends = 0;
     \\  // Prod's console formatter (globals/console.js `fmt`) — byte-identical
     \\  // here so a log assertion transfers between a bundle and a live request
