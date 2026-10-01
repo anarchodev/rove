@@ -344,6 +344,13 @@ pub const ShredCaps = struct {
 
 pub const PlatformCaps = struct {
     ctx: *anyopaque,
+    /// `platform.instances.usage(name).capBytes`: the `max_kv_bytes` the
+    /// worker enforces for `target_id` right now — the tenant slot's
+    /// installed plan, the same read the write-path cap check makes, so a
+    /// dashboard shows exactly what enforcement uses (including between a
+    /// plan change and its push). Null when the tenant is uncapped (the
+    /// admin tenant) or unknown here.
+    kv_cap: ?*const fn (ctx: *anyopaque, target_id: []const u8) ?u64 = null,
     /// `platform.instances.deployStarter(name)`: deploy the embedded
     /// starter into the target tenant's manifest_backend + propose
     /// `_deploy/current = 1` through raft envelope 0.
@@ -1434,6 +1441,7 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     .{ .path = &.{ "_system", "platform", "instances" }, .fns = &.{
         .{ .name = "deployStarter", .cfunc = platform_bindings.jsPlatformInstancesDeployStarter, .argc = 1 },
         .{ .name = "usage", .cfunc = platform_bindings.jsPlatformInstancesUsage, .argc = 1 },
+        .{ .name = "incarnation", .cfunc = platform_bindings.jsPlatformInstancesIncarnation, .argc = 1 },
     } },
     // No `_system.platform.auth`: the operator-root verdict is engine-computed
     // and reaches the handler as `request.rewind.isRoot`, never as a native

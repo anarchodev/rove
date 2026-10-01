@@ -1013,10 +1013,13 @@ const Router = struct {
             if (self.public_suffix.len == 0) break :blk "";
             break :blk std.fmt.allocPrint(a, "{s}.{s}", .{ tenant, self.public_suffix }) catch "";
         };
+        // `incarnation` names this tenant LIFETIME: a caller that keys state on
+        // the tenant (dashboard ownership) records it so a later tenant reborn
+        // under the same name does not inherit that state.
         const msg = std.fmt.allocPrint(
             a,
-            "{{\"tenant\":\"{s}\",\"cluster\":\"{s}\",\"host\":\"{s}\"}}",
-            .{ tenant, cluster, primary_host },
+            "{{\"tenant\":\"{s}\",\"cluster\":\"{s}\",\"host\":\"{s}\",\"incarnation\":\"{s}\"}}",
+            .{ tenant, cluster, primary_host, incarnation },
         ) catch {
             // The provision COMMITTED and only the report failed. 204 also
             // means placed, so the caller must not read this as a failure and

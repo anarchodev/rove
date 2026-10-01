@@ -4888,6 +4888,136 @@ test "dispatch: a cross-store scope read is taped under __rove_store/, keyed by 
     }
 }
 
+test "dispatch: platform.instances.incarnation and usage answer per lifetime, and are taped" {
+    // Ownership the admin app keys by name is only safe if it can tell a
+    // reborn tenant from the one it recorded, so incarnation must name the
+    // LIFETIME: a token for a minted instance, the legacy sentinel for one
+    // keyed by name alone. An authorization decision branches on it, so it is
+    // taped like any other cross-store read; so is `usage`.
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var pf = try PlatformFixture.init(testing.allocator);
+    defer pf.deinit();
+    try pf.tenant.createInstanceWithIncarnation("acme", .{ .token = "aaaa1111aaaa1111" });
+    try pf.tenant.createInstance("old");
+
+    var rs = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer rs.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const code = (f) => { try { f(); return "no throw"; } catch (e) { return e.code; } };
+        \\const u = platform.instances.usage("acme");
+        \\return [
+        \\  platform.instances.incarnation("acme"),
+        \\  platform.instances.incarnation("old"),
+        \\  code(() => platform.instances.incarnation("ghost")),
+        \\  code(() => platform.instances.usage("ghost")),
+        \\  typeof u.usedBytes, String(u.usedBytes === u.durableBytes + u.overlayBytes),
+        \\].join("|");
+    ,
+        .{
+            .method = "GET",
+            .path = "/",
+            .trace = .{ .readset = &rs },
+            .admin = .{ .platform = pf.tenant },
+        },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("aaaa1111aaaa1111|legacy|InstanceNotFound|InstanceNotFound|number|true", resp.body);
+
+    const inc = tapedKv(&rs, "__rove_store/inc/acme") orelse return error.IncarnationNotTaped;
+    try testing.expectEqualStrings("aaaa1111aaaa1111", inc.value);
+    const legacy = tapedKv(&rs, "__rove_store/inc/old") orelse return error.LegacyNotTaped;
+    try testing.expectEqualStrings("legacy", legacy.value);
+    const ghost = tapedKv(&rs, "__rove_store/inc/ghost") orelse return error.GhostNotTaped;
+    try testing.expectEqual(tape_mod.KvOutcome.not_found, ghost.outcome);
+    const usage = tapedKv(&rs, "__rove_store/usage/acme") orelse return error.UsageNotTaped;
+    try testing.expect(std.mem.startsWith(u8, usage.value, "{\"usedBytes\":"));
+    // No worker caps here, so no enforced cap is known.
+    try testing.expect(std.mem.endsWith(u8, usage.value, ",\"capBytes\":null}"));
+}
+
+const KvCapStub = struct {
+    fn trampoline(_: *anyopaque, target_id: []const u8) ?u64 {
+        return if (std.mem.eql(u8, target_id, "acme")) 4096 else null;
+    }
+};
+
+test "dispatch: platform.instances.usage reports the cap the worker enforces" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var pf = try PlatformFixture.init(testing.allocator);
+    defer pf.deinit();
+    try pf.tenant.createInstance("acme");
+    try pf.tenant.createInstance("free");
+
+    var rs = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer rs.deinit();
+    var dummy: u8 = 0;
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\return [
+        \\  platform.instances.usage("acme").capBytes,
+        \\  platform.instances.usage("free").capBytes,
+        \\].join("|");
+    ,
+        .{
+            .method = "GET",
+            .path = "/",
+            .trace = .{ .readset = &rs },
+            .admin = .{
+                .platform = pf.tenant,
+                .platform_caps = .{ .ctx = &dummy, .kv_cap = &KvCapStub.trampoline },
+            },
+        },
+    );
+    defer resp.deinit(testing.allocator);
+    // A known cap is a number; an unknown one is null (joins as "").
+    try testing.expectEqualStrings("4096|", resp.body);
+    const usage = tapedKv(&rs, "__rove_store/usage/acme") orelse return error.UsageNotTaped;
+    try testing.expect(std.mem.endsWith(u8, usage.value, ",\"capBytes\":4096}"));
+}
+
+test "dispatch: platform.instances.incarnation throws on non-admin handler" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\try { platform.instances.incarnation("acme"); return "no throw"; }
+        \\catch (e) { return "threw: " + e.message; }
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "admin handler") != null);
+}
+
 test "dispatch: a platform write obeys the same kv rules a customer write does" {
     // The privileged surface writes the target writeset directly rather
     // than through `rove-binding`, so it has its own call into the one

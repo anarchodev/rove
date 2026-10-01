@@ -2557,7 +2557,20 @@ pub fn Worker(comptime opts: Options) type {
                 .ctx = @ptrCast(self),
                 .deploy_starter = &Self.deployStarterTrampoline,
                 .scope_kv_write = &Self.scopeKvWriteTrampoline,
+                .kv_cap = &Self.kvCapTrampoline,
             };
+        }
+
+        /// `platform.instances.usage(name).capBytes` — the cap `kvCapRefusal`
+        /// enforces for `target_id`, read from the same tenant slot. Null for
+        /// the admin tenant (exempt from the cap) and for a name this node
+        /// cannot resolve or open.
+        pub fn kvCapTrampoline(ctx: *anyopaque, target_id: []const u8) ?u64 {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, target_id, tenant_mod.ADMIN_INSTANCE_ID)) return null;
+            const inst = (self.node.tenant.getInstance(target_id) catch return null) orelse return null;
+            const slot = getOrOpenTenantSlot(self, inst) catch return null;
+            return slot.effectivePlan().max_kv_bytes;
         }
 
         /// `platform.scope(t).deploy.stampManifest(entries)` submit door

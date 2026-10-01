@@ -279,12 +279,13 @@ fn scopeTag(allocator: std.mem.Allocator, id: []const u8) ![]u8 {
 
 /// `platform.instances.usage(name)` — admin-only. This node's KV
 /// footprint for one instance: `{usedBytes, durableBytes,
-/// overlayBytes, entries}`. `usedBytes` (durable LMDB pages +
+/// overlayBytes, entries, capBytes}`. `capBytes` is the `max_kv_bytes` the
+/// worker enforces for it now (null when uncapped or unknown here). `usedBytes` (durable LMDB pages +
 /// committed overlay) is the same conservative figure the plan cap
 /// (`max_kv_bytes`) is enforced against and the `kv_store_used_bytes`
 /// gauge exports, so the dashboard renders exactly what enforcement
-/// reads. O(1) — an mdb_stat, no scan. Untaped, like every
-/// `platform.*` read. Throws `Error{code:"InstanceNotFound"}` for an
+/// reads. O(1) — an mdb_stat, no scan. Taped as a store read at
+/// `__rove_store/usage/{name}`, so replay sees the figures prod saw. Throws `Error{code:"InstanceNotFound"}` for an
 /// unknown instance. Values are JS numbers — exact far beyond any
 /// sellable ceiling.
 pub fn jsPlatformInstancesUsage(
@@ -306,11 +307,27 @@ pub fn jsPlatformInstancesUsage(
     const name = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
     defer state.allocator.free(name);
 
-    const inst = scopeResolve(state, name) orelse return jsThrowInstanceNotFound(ctx);
+    const inst = scopeResolve(state, name) orelse {
+        recordStoreGet(state, USAGE_TAG, name, "", .not_found, true);
+        return jsThrowInstanceNotFound(ctx);
+    };
     const u = inst.kv.usage() catch |err| {
         state.pending_kv_error = err;
         return js_null;
     };
+    // Taped as a store read so a captured replay sees the figures prod saw;
+    // the JSON is the recorded form, the object below is the same values.
+    const cap: ?u64 = if (state.platform_caps) |pc|
+        (if (pc.kv_cap) |f| f(pc.ctx, name) else null)
+    else
+        null;
+    var cap_buf: [24]u8 = undefined;
+    const cap_text = if (cap) |v| std.fmt.bufPrint(&cap_buf, "{d}", .{v}) catch unreachable else "null";
+    var json_buf: [256]u8 = undefined;
+    const json = std.fmt.bufPrint(&json_buf, "{{\"usedBytes\":{d},\"durableBytes\":{d},\"overlayBytes\":{d},\"entries\":{d},\"capBytes\":{s}}}", .{
+        u.durable_bytes + u.overlay_bytes, u.durable_bytes, u.overlay_bytes, u.durable_entries, cap_text,
+    }) catch unreachable;
+    recordStoreGet(state, USAGE_TAG, name, json, .ok, true);
 
     const obj = c.JS_NewObject(ctx);
     if (c.JS_IsException(obj)) return obj;
@@ -318,7 +335,62 @@ pub fn jsPlatformInstancesUsage(
     _ = c.JS_SetPropertyStr(ctx, obj, "durableBytes", c.JS_NewFloat64(ctx, @floatFromInt(u.durable_bytes)));
     _ = c.JS_SetPropertyStr(ctx, obj, "overlayBytes", c.JS_NewFloat64(ctx, @floatFromInt(u.overlay_bytes)));
     _ = c.JS_SetPropertyStr(ctx, obj, "entries", c.JS_NewFloat64(ctx, @floatFromInt(u.durable_entries)));
+    _ = c.JS_SetPropertyStr(ctx, obj, "capBytes", if (cap) |v| c.JS_NewFloat64(ctx, @floatFromInt(v)) else js_null);
     return obj;
+}
+
+/// The tape tag `platform.instances.incarnation` reads under. A store of its
+/// own rather than a key inside `i/{id}`, so the read can never alias a row
+/// of the tenant's kv.
+pub const INCARNATION_TAG = "inc";
+
+/// The tape tag `platform.instances.usage` reads under.
+pub const USAGE_TAG = "usage";
+
+/// What `platform.instances.incarnation` returns for an instance keyed by
+/// name alone. A minted token is lowercase hex, so this cannot collide.
+pub const LEGACY_INCARNATION = "legacy";
+
+/// `platform.instances.incarnation(name)` — admin-only. The instance's
+/// storage incarnation: the token the CP minted for this tenant LIFETIME,
+/// or `"legacy"` for an instance keyed by name alone. A deprovision and
+/// re-provision under the same name yields a different token, so state the
+/// admin app keys by name (ownership) records this beside it and compares
+/// before trusting it.
+///
+/// Taped as a store read at `__rove_store/inc/{name}` — an authorization
+/// decision branches on it, so replay has to see the value prod saw. An
+/// unknown instance is taped as `not_found` and throws
+/// `Error{code:"InstanceNotFound"}`.
+pub fn jsPlatformInstancesIncarnation(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) {
+        _ = c.JS_ThrowTypeError(ctx, "platform.instances.incarnation requires (name)");
+        return js_exception;
+    }
+    const state = getState(ctx);
+    if (state.platform == null) {
+        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
+        return js_exception;
+    }
+
+    const name = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(name);
+
+    const inst = scopeResolve(state, name) orelse {
+        recordStoreGet(state, INCARNATION_TAG, name, "", .not_found, true);
+        return jsThrowInstanceNotFound(ctx);
+    };
+    const value: []const u8 = switch (inst.storage.incarnation) {
+        .legacy => LEGACY_INCARNATION,
+        .token => |t| t,
+    };
+    recordStoreGet(state, INCARNATION_TAG, name, value, .ok, true);
+    return c.JS_NewStringLen(ctx, value.ptr, value.len);
 }
 
 /// `platform.instances.deployStarter(name)` — admin-only. Writes

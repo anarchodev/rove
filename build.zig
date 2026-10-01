@@ -2059,6 +2059,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/roottoken", // platform.auth.checkRootToken validates the configured token
         "src/replay/testdata/platformadmin", // platform.* admin-only gating (fail-closed)
         "src/replay/testdata/dispatchresolve", // offline eager dispatch: result visible same-activation, __root__ resolves, root models read absence as absence
+        "src/replay/testdata/instanceincarnation", // platform.instances.incarnation: declared/default/legacy token, InstanceNotFound, name reuse
         "src/replay/testdata/upload", // headers-first onHeaders + blob.receive → onStored continuation
         "src/replay/testdata/deploydoor", // result-in-ctx bound doors: platform.compile → onFileStaged / stampManifest → onCut
         "src/replay/testdata/concurrent", // whenConcurrent: cross-order fetch interleavings + invariant
