@@ -2239,7 +2239,7 @@ fn resumeContinuation(
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    var readset = tape_mod.Readset.initLive(allocator, now_ns);
     readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
     defer readset.deinit();
     const request_id: u64 = worker_mod.mintRequestId(worker, inst);
@@ -2435,7 +2435,7 @@ pub fn resumeBoundFetchChain(
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    var readset = tape_mod.Readset.initLive(allocator, now_ns);
     readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
     defer readset.deinit();
     const request_id: u64 = worker_mod.mintRequestId(worker, inst);
@@ -3449,7 +3449,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    var readset = tape_mod.Readset.initLive(allocator, now_ns);
     readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
     defer readset.deinit();
     const request_id: u64 = worker_mod.mintRequestId(worker, inst);

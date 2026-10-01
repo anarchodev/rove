@@ -2380,7 +2380,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // `txn` is open. Run the handler under its own savepoint so a
         // JS exception or CPU-budget kill rolls back only this handler's
         // writes without poisoning the rest of the batch.
-        var readset = tape_mod.Readset.init(allocator, received_ns, @bitCast(received_ns));
+        var readset = tape_mod.Readset.initLive(allocator, received_ns);
         readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
         defer readset.deinit();
 
@@ -2570,8 +2570,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // browser sent no `__Host-rove_sid` (or sent a malformed one),
         // we mint a fresh sid and append a `Set-Cookie` to the response
         // below. See SSE / server-sent events (`docs/architecture/routing-and-ingress.md`).
-        var sid_prng = std.Random.DefaultPrng.init(@bitCast(received_ns));
-        const session_resolved = session_mod.resolve(rh, sid_prng.random());
+        const session_resolved = session_mod.resolve(rh);
 
         // Per-saga id (streaming handlers;
         // `docs/architecture/routing-and-ingress.md`).
