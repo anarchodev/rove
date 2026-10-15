@@ -501,7 +501,13 @@ fn cmdRun(a: std.mem.Allocator, args: Args) !u8 {
     defer a.free(mkey);
     target.store.blobStore().put(mkey, manifest.items) catch |e|
         fatal("manifest write failed: {s}", .{@errorName(e)});
-    std.debug.print("run {s}: complete\n{s}\n", .{ run_id, run_id });
+    std.debug.print("run {s}: complete\n", .{run_id});
+    // The run id on STDOUT, alone: it is the command's one machine-readable
+    // result, which the nightly driver captures to hand to `mirror` and
+    // `verify`. Progress and diagnostics stay on stderr, so a capture of
+    // stdout is exactly the id.
+    var out = std.fs.File.stdout().writer(&.{});
+    out.interface.print("{s}\n", .{run_id}) catch {};
     return 0;
 }
 
