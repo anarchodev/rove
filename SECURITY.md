@@ -11,8 +11,9 @@ before you write.
 **Do not open a public issue, pull request or discussion.**
 
 Write to **[security@loop46.com](mailto:security@loop46.com)** (Loop46,
-Inc. — the company that operates rewind.js).
-> **[DECISION]** if GitHub private vulnerability reporting is enabled on this repository, add: "or use GitHub's private reporting at https://github.com/anarchodev/rove/security/advisories/new. Email is canonical; both reach the same person."
+Inc. — the company that operates rewind.js). You can also use GitHub's private reporting at
+<https://github.com/anarchodev/rove/security/advisories/new>. Email is
+canonical; both reach the same person.
 
 Include what you found, how to reproduce it, what an attacker gains, and
 whether you have accessed anyone else's data in the process. A proof of
@@ -21,11 +22,10 @@ concept against your own tenant is ideal.
 ## What to expect
 
 - We acknowledge within **2 working days**.
-- We tell you within **[DECISION] 7 days** whether we accept the
-  report and how severe we think it is.
-- We aim to fix critical issues in production within
-  **[DECISION] 7 days** and others within
-  **[DECISION] 90 days**, and keep you updated as we go.
+- We tell you within **7 days** whether we accept the report and how severe
+  we think it is.
+- We aim to fix critical issues in production within **7 days** and others
+  within **90 days**, and keep you updated as we go.
 - We coordinate disclosure with you. Our default is to publish an advisory
   once a fix is deployed, and no later than **90 days** after your report
   unless we agree otherwise.
@@ -68,7 +68,6 @@ scanner output without a working proof.
 
 ## Safe harbour
 
-> **[DECISION]** safe-harbour wording; counsel to review.
 If you research and report in good faith and follow this policy, we will
 not pursue or support legal action against you for it, including under
 anti-hacking or anti-circumvention laws or our Terms of Service, and we
