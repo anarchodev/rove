@@ -92,9 +92,14 @@ def main() -> int:
         r = c.wait_for_handler(TENANT, "/")
         check("the handler serves", "mirrored" in r.body, f"{r.status} {r.body[:80]!r}")
 
-        rc, _ = backup_tool("run", "--nodes", c.node_url(0), "--tenants", TENANT,
-                            "--run-id", RUN_ID, "--cp", f"http://127.0.0.1:{c.cp_port}")
-        check("backup run", rc == 0)
+        # STDOUT alone, the way the nightly driver captures it
+        # (`run_id=$(rewind-backup run …)`): it must be exactly the run id,
+        # or `mirror` and `verify` run against an empty one.
+        p = subprocess.run([BACKUP_BIN, "run", "--nodes", c.node_url(0), "--tenants", TENANT,
+                            "--run-id", RUN_ID, "--cp", f"http://127.0.0.1:{c.cp_port}"],
+                           capture_output=True, text=True, timeout=600)
+        check("backup run", p.returncode == 0, (p.stderr or "")[-300:])
+        check("stdout is exactly the run id", p.stdout.strip() == RUN_ID, f"stdout={p.stdout!r}")
 
         rc, out = backup_tool("show", "--run", RUN_ID)
         manifest = json.loads(next(l for l in out.splitlines() if l.startswith("{")))
