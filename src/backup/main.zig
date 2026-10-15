@@ -275,10 +275,31 @@ fn moveSecret(a: std.mem.Allocator) []u8 {
 
 const ObjectFacts = struct { bytes: u64, sha_hex: []u8 };
 
+/// How long a read-back of a just-written object keeps trying: 15 attempts,
+/// 2 s apart — about half a minute.
+const READBACK_ATTEMPTS: u32 = 15;
+const READBACK_SPACING_MS: u64 = 2_000;
+
 /// Read an object back and describe what is actually there. A manifest that
 /// recorded what we *sent* would certify an upload that silently truncated.
+///
+/// The read retries for a bounded window. The objects a run checks were just
+/// written — by a worker, under the worker's own upload-only key — and an
+/// object store need not make a fresh object readable to a different key at
+/// once: the first read can be refused for a few seconds after a write that
+/// succeeded. Failing the whole run on that would turn a propagation delay
+/// into a missing night of backups. A read that still fails at the end of the
+/// window is a real failure and is reported as one.
 fn describeObject(a: std.mem.Allocator, store: *blob.S3BlobStore, key: []const u8) !ObjectFacts {
-    const got = try store.blobStore().get(key, a);
+    const got = blk: {
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            if (store.blobStore().get(key, a)) |bytes| break :blk bytes else |e| {
+                if (attempt + 1 >= READBACK_ATTEMPTS) return e;
+                std.Thread.sleep(READBACK_SPACING_MS * std.time.ns_per_ms);
+            }
+        }
+    };
     defer a.free(got);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(got, &digest, .{});
