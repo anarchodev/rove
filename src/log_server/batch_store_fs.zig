@@ -52,7 +52,18 @@ pub const FsBatchStore = struct {
         .get = vtableGet,
         .getRange = vtableGetRange,
         .list = vtableList,
+        .delete = vtableDelete,
     };
+
+    fn vtableDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
+        const self: *FsBatchStore = @ptrCast(@alignCast(ptr));
+        const path = try self.fullPath(key, self.allocator);
+        defer self.allocator.free(path);
+        std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
 
     fn fullPath(self: *FsBatchStore, key: []const u8, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.base_dir, key });

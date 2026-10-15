@@ -222,6 +222,39 @@ records are lost without a bump, and kept with one.
   the customer-facing replay store; operator signals go
   to Grafana Cloud — the two-sink split is decisions.md §7.
 
+### Retention purge
+
+What a customer can **read** is bounded by their plan's window — the read
+clamp in the query surface. What is **kept** is bounded by the retention
+purge (`src/log_server/purge.zig`): every request-log batch (`_logs/`) and
+spilled body (`_pool/`) older than **365 days** is deleted, for every tenant
+alike. The objects are cross-tenant, so a single age that no tenant's window
+exceeds is the one deletion rule that never removes a record some tenant can
+still read, and it needs no sharding, compaction or per-tenant accounting.
+
+- **Cheap by construction.** Both families lead their keys with time
+  (`_logs/{node}/{flush_ns:020}-…`, `_pool/{written_ms:0>13}-…`), so a pass
+  LISTs each prefix oldest-first and stops at the first object young enough
+  to keep. It costs about what it deletes and persists no cursor.
+- **Two stores.** `_logs/` sits under the log prefix and `_pool/` under the
+  content prefix the body route reads, so the pass takes both.
+- **Never ahead of the indexer.** A batch above this log-server's persisted
+  cursor for its node is left for a later pass; a node with no cursor here is
+  skipped.
+- **Rows before objects.** The pass prunes the index first, by receive time,
+  and deletes objects by flush or write time, which is never earlier, so no
+  surviving index row names a deleted object.
+- **Idempotent and per-server.** Each log-server runs it on its indexer
+  thread (the index's writer) once a day after a poll; deleting an object
+  another server already deleted is a no-op.
+- **Off unless enabled.** `REWIND_LOG_PURGE=1` turns it on — a destructive
+  pass over customer data is the operator's decision.
+
+Erasing one tenant or one end-user before 365 days is not this; it is key
+destruction (account closure, `shredKey`), and it reaches only what is
+sealed. `scripts/smoke/log_purge_smoke_v2.py` runs the pass against real
+object storage.
+
 ### The serve-side shred gate
 
 A kv value written by an activation that named an identity
@@ -402,8 +435,8 @@ that window.
 
 ## Known limitations (as-built)
 
-- **No log retention/GC compactor** yet (design locked, operator-policy default
-  for now); same for an orphan-batch janitor.
+- **Retention is age-only** (the retention purge above): there is no
+  per-tenant byte eviction from a shared object, and no orphan-batch janitor.
 - **`TenantSlot` has no live refcount** — dropping a tenant mid-flight is restart-
   required (a Phase-5 follow-up).
 - **`BytecodeCache` has no eviction policy / memory cap** — deferred until

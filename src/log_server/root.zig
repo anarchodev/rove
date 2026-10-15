@@ -28,6 +28,7 @@
 
 pub const sidecar = @import("sidecar.zig");
 pub const batch_store = @import("batch_store.zig");
+pub const purge = @import("purge.zig");
 pub const batch_store_s3 = @import("batch_store_s3.zig");
 pub const batch_store_fs = @import("batch_store_fs.zig");
 pub const index_db = @import("index_db.zig");
@@ -45,6 +46,7 @@ test {
     _ = batch_store_fs;
     _ = index_db;
     _ = indexer;
+    _ = purge;
     _ = standalone;
     _ = flush_writer;
     _ = @import("metrics.zig");
