@@ -27,6 +27,9 @@ Proof legs:
      re-uploading a terabyte.
   D. `verify` distinguishes a run WITH an object mirror from one without,
      rather than reporting the same "verified" for both.
+  E. `verify` checks the mirrored OBJECTS, not just the run's record of
+     them: deleting one from the backup store, or truncating one, fails
+     verify and names the key; re-running `mirror` restores it.
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 """
@@ -52,6 +55,22 @@ SRC = (
     '  return "mirrored\\n";\n'
     '}\n'
 )
+
+
+def s3_backup(method, key, data=None):
+    """Raw request against the BACKUP store, for planting the damage leg E
+    checks for. `key` is relative to the backup prefix base."""
+    url = (f"{os.environ['BACKUP_S3_ENDPOINT'].rstrip('/')}/{os.environ['BACKUP_S3_BUCKET']}/"
+           f"{os.environ['BACKUP_S3_KEY_PREFIX_BASE']}{key}")
+    cmd = ["curl", "-sS", "-X", method, "--max-time", "30",
+           "--aws-sigv4", f"aws:amz:{os.environ['S3_REGION']}:s3",
+           "--user", f"{os.environ['BACKUP_AWS_ACCESS_KEY_ID']}:{os.environ['BACKUP_AWS_SECRET_ACCESS_KEY']}",
+           "-o", "-", "-w", "\n%{http_code}", url]
+    if data is not None:
+        cmd += ["--data-binary", "@-"]
+    r = subprocess.run(cmd, input=data or b"", capture_output=True)
+    body, _, code = r.stdout.rpartition(b"\n")
+    return int(code), body
 
 
 def backup_tool(*args):
@@ -150,6 +169,32 @@ def main() -> int:
         rc, out = backup_tool("verify", "--run", RUN_ID)
         check("verify", rc == 0)
         check("and says the objects were mirrored", "objects mirrored" in out)
+
+        print("leg E: verify checks the mirrored objects themselves")
+        code, page = s3_backup("GET", f"{RUN_ID}/mirror-keys/000000")
+        check("the run recorded its key list", code == 200, f"{code}")
+        recorded = [ln.split("\t", 2) for ln in page.decode().splitlines() if ln.startswith("K\t")]
+        check("with keys in it", len(recorded) > 0, f"{len(recorded)}")
+        _, size, victim = recorded[0]
+        code, _ = s3_backup("DELETE", victim)
+        check("delete one mirrored object from the backup store", code in (200, 204), f"{code}")
+        rc, out = backup_tool("verify", "--run", RUN_ID)
+        check("verify FAILS on the missing object", rc != 0)
+        check("and names it", victim in out and "missing from the backup store" in out)
+
+        rc, out = backup_tool("mirror", "--run", RUN_ID)
+        check("re-running mirror restores it", rc == 0 and "1 object(s) copied" in out)
+        rc, out = backup_tool("verify", "--run", RUN_ID)
+        check("verify passes again", rc == 0)
+
+        if int(size) > 1:
+            code, body = s3_backup("GET", victim)
+            s3_backup("PUT", victim, body[: int(size) // 2])
+            rc, out = backup_tool("verify", "--run", RUN_ID)
+            check("a truncated object fails verify on its size", rc != 0 and victim in out and "bytes in the backup" in out)
+            s3_backup("PUT", victim, body)
+            rc, out = backup_tool("verify", "--run", RUN_ID)
+            check("and verify passes once it's whole", rc == 0)
 
         rc, out = backup_tool("run", "--nodes", c.node_url(0), "--tenants", TENANT,
                               "--run-id", f"{RUN_ID}-nomirror",

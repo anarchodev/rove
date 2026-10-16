@@ -630,11 +630,14 @@ pub const S3BlobStore = struct {
     /// `deleteObjects` wants.
     pub const ListPage = struct {
         keys: [][]u8,
+        /// `sizes[i]` is the byte size S3 reports for `keys[i]`.
+        sizes: []u64 = &.{},
         next_token: ?[]u8,
 
         pub fn deinit(self: *ListPage, a: std.mem.Allocator) void {
             for (self.keys) |k| a.free(k);
             a.free(self.keys);
+            a.free(self.sizes);
             if (self.next_token) |t| a.free(t);
             self.* = undefined;
         }
@@ -697,6 +700,8 @@ pub const S3BlobStore = struct {
             for (keys.items) |k| a.free(k);
             keys.deinit(a);
         }
+        var sizes = std.ArrayList(u64){};
+        errdefer sizes.deinit(a);
         // Walk `<Contents>` blocks rather than every `<Key>` in the document:
         // a `<CommonPrefixes>` entry also carries a key-shaped child, and the
         // listing echoes the request `<Prefix>` at the top level.
@@ -710,6 +715,8 @@ pub const S3BlobStore = struct {
             const end = std.mem.indexOfPos(u8, body, start, "</Contents>") orelse break;
             if (extractXmlText(body[start..end], "Key")) |k| {
                 try keys.append(a, try xmlUnescapeAlloc(a, k));
+                const size_text = extractXmlText(body[start..end], "Size") orelse "0";
+                try sizes.append(a, std.fmt.parseInt(u64, size_text, 10) catch 0);
             }
             cursor = end + "</Contents>".len;
         }
@@ -726,7 +733,9 @@ pub const S3BlobStore = struct {
                 next_token = try xmlUnescapeAlloc(a, t);
             }
         }
-        return ListPage{ .keys = try keys.toOwnedSlice(a), .next_token = next_token };
+        const sizes_owned = try sizes.toOwnedSlice(a);
+        errdefer a.free(sizes_owned);
+        return ListPage{ .keys = try keys.toOwnedSlice(a), .sizes = sizes_owned, .next_token = next_token };
     }
 
     /// Delete a batch of FULLY-QUALIFIED keys (ones that already include
