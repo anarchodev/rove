@@ -586,7 +586,9 @@ fn cmdVerify(a: std.mem.Allocator, args: Args) !u8 {
     defer a.free(rkey);
     if (target.store.blobStore().get(rkey, a)) |rec| {
         defer a.free(rec);
-        std.debug.print("  ok objects mirrored: {s}\n", .{std.mem.trim(u8, rec, "\n")});
+        // The record is the run's CLAIM; the objects are checked against it,
+        // because a record outlives the objects it describes.
+        bad += verifyMirror(a, &target.store, run_id, rec);
     } else |_| {
         std.debug.print("  NOTE no object mirror in this run — KV, keyring and directory only\n", .{});
     }
@@ -791,7 +793,11 @@ fn cmdPrune(a: std.mem.Allocator, args: Args) !u8 {
 
     var removed: usize = 0;
     for (doomed.items) |run| {
-        const n = target.store.deletePrefix(run) catch |e| {
+        // The trailing slash bounds the delete to THIS run: a bare prefix
+        // would also match every run whose id merely starts with this one.
+        const run_dir = std.fmt.allocPrint(a, "{s}/", .{run}) catch @panic("OOM");
+        defer a.free(run_dir);
+        const n = target.store.deletePrefix(run_dir) catch |e| {
             std.debug.print("  FAILED {s}: {s}\n", .{ run, @errorName(e) });
             return 1;
         };
@@ -845,6 +851,158 @@ fn listRuns(a: std.mem.Allocator, store: *blob.S3BlobStore, key_prefix: []const 
     return runs.toOwnedSlice(a);
 }
 
+// ── verify: the object mirror ────────────────────────────────────────
+
+/// Walks one prefix of the backup store in key order, a page at a time.
+const BackupCursor = struct {
+    a: std.mem.Allocator,
+    store: *blob.S3BlobStore,
+    prefix: []const u8,
+    page: ?blob.S3BlobStore.ListPage = null,
+    idx: usize = 0,
+    token: ?[]u8 = null,
+    done: bool = false,
+
+    /// The next key under the prefix (without the store's own key prefix)
+    /// and its size, or null at the end.
+    fn next(self: *BackupCursor) !?struct { key: []const u8, size: u64 } {
+        while (true) {
+            if (self.page) |*p| {
+                if (self.idx < p.keys.len) {
+                    const full = p.keys[self.idx];
+                    const size = if (self.idx < p.sizes.len) p.sizes[self.idx] else 0;
+                    self.idx += 1;
+                    const own = self.store.config.key_prefix;
+                    const key = if (std.mem.startsWith(u8, full, own)) full[own.len..] else full;
+                    return .{ .key = key, .size = size };
+                }
+                const nt = p.next_token;
+                p.next_token = null;
+                p.deinit(self.a);
+                self.page = null;
+                if (self.token) |t| self.a.free(t);
+                self.token = nt;
+                if (nt == null) self.done = true;
+            }
+            if (self.done) return null;
+            self.page = try self.store.listPrefix(self.a, self.prefix, self.token);
+            self.idx = 0;
+        }
+    }
+
+    fn deinit(self: *BackupCursor) void {
+        if (self.page) |*p| p.deinit(self.a);
+        if (self.token) |t| self.a.free(t);
+    }
+};
+
+/// Check every object a run's mirror recorded against the backup store:
+/// present, at the recorded size. The recorded keys and the backup listing
+/// are both in key order per prefix, so this is a merge walk — LISTs, not a
+/// HEAD per object — holding one key-list page and one listing page at a
+/// time. Returns the number of failures; each names its key.
+fn verifyMirror(a: std.mem.Allocator, store: *blob.S3BlobStore, run_id: []const u8, rec: []const u8) usize {
+    const parsed = std.json.parseFromSlice(std.json.Value, a, rec, .{}) catch {
+        std.debug.print("  FAIL mirror record: not JSON\n", .{});
+        return 1;
+    };
+    defer parsed.deinit();
+    const pages_v = parsed.value.object.get("key_pages") orelse {
+        std.debug.print(
+            "  FAIL objects: this run's mirror predates key lists, so its mirrored objects cannot be checked — re-run `mirror --run {s}`\n",
+            .{run_id},
+        );
+        return 1;
+    };
+    const pages: u32 = @intCast(pages_v.integer);
+    const want_keys: u64 = if (parsed.value.object.get("keys")) |k| @intCast(k.integer) else 0;
+
+    var bad: usize = 0;
+    var checked: u64 = 0;
+    var cursor: ?BackupCursor = null;
+    defer if (cursor) |*c| c.deinit();
+    var cur_prefix: []u8 = &.{};
+    defer a.free(cur_prefix);
+    // The last backup key the cursor yielded and not yet matched.
+    var held: ?struct { key: []u8, size: u64 } = null;
+    defer if (held) |h| a.free(h.key);
+
+    var n: u32 = 0;
+    while (n < pages) : (n += 1) {
+        const pkey = std.fmt.allocPrint(a, "{s}/mirror-keys/{d:0>6}", .{ run_id, n }) catch @panic("OOM");
+        defer a.free(pkey);
+        const page = store.blobStore().get(pkey, a) catch |e| {
+            std.debug.print("  FAIL objects: key-list page {s} unreadable: {s}\n", .{ pkey, @errorName(e) });
+            return bad + 1;
+        };
+        defer a.free(page);
+        var lines = std.mem.splitScalar(u8, page, '\n');
+        while (lines.next()) |line| {
+            if (line.len < 2) continue;
+            if (line[0] == 'P') {
+                const prefix = line[2..];
+                if (std.mem.eql(u8, prefix, cur_prefix)) continue; // a page continuing the prefix
+                if (cursor) |*c| c.deinit();
+                if (held) |h| a.free(h.key);
+                held = null;
+                a.free(cur_prefix);
+                cur_prefix = a.dupe(u8, prefix) catch @panic("OOM");
+                cursor = .{ .a = a, .store = store, .prefix = cur_prefix };
+                continue;
+            }
+            // K\t{size}\t{key}
+            var f = std.mem.splitScalar(u8, line[2..], '\t');
+            const size = std.fmt.parseInt(u64, f.next() orelse "", 10) catch {
+                std.debug.print("  FAIL objects: malformed key-list line in {s}\n", .{pkey});
+                bad += 1;
+                continue;
+            };
+            const key = f.rest();
+            checked += 1;
+            if (cursor == null) {
+                std.debug.print("  FAIL objects: key {s} listed before any prefix in {s}\n", .{ key, pkey });
+                bad += 1;
+                continue;
+            }
+            const c = &cursor.?;
+            // Advance the backup listing to the first key >= `key`.
+            while (true) {
+                if (held == null) {
+                    const nx = c.next() catch |e| {
+                        std.debug.print("  FAIL objects: listing {s} failed: {s}\n", .{ cur_prefix, @errorName(e) });
+                        return bad + 1;
+                    };
+                    const got = nx orelse break;
+                    held = .{ .key = a.dupe(u8, got.key) catch @panic("OOM"), .size = got.size };
+                }
+                if (std.mem.order(u8, held.?.key, key) == .lt) {
+                    a.free(held.?.key);
+                    held = null;
+                    continue;
+                }
+                break;
+            }
+            if (held != null and std.mem.eql(u8, held.?.key, key)) {
+                if (held.?.size != size) {
+                    std.debug.print("  FAIL object {s}: {d} bytes in the backup, {d} when mirrored\n", .{ key, held.?.size, size });
+                    bad += 1;
+                }
+                a.free(held.?.key);
+                held = null;
+            } else {
+                std.debug.print("  FAIL object {s}: mirrored by this run, missing from the backup store\n", .{key});
+                bad += 1;
+            }
+        }
+    }
+    if (checked != want_keys) {
+        std.debug.print("  FAIL objects: the key list holds {d} key(s), the mirror record says {d}\n", .{ checked, want_keys });
+        bad += 1;
+    }
+    if (bad == 0) std.debug.print("  ok objects mirrored: {d} object(s) present at their recorded size\n", .{checked});
+    return bad;
+}
+
 // ── mirror ────────────────────────────────────────────────────────────
 
 /// Open the LIVE object store — the one the cluster writes to — at the
@@ -877,6 +1035,58 @@ fn openLiveStore(a: std.mem.Allocator) struct { owned: blob.env.BlobBackendOwned
 
 const MirrorStats = struct { copied: u64 = 0, skipped: u64 = 0, bytes: u64 = 0 };
 
+/// Lines per key-list page. Bounds what `mirror` buffers and what `verify`
+/// holds at once, whatever the size of the mirror.
+const KEY_PAGE_LINES: usize = 20_000;
+
+/// The record of which objects a run's mirror covers: every key it walked,
+/// copied or already present, with its size, in pages at
+/// `{run}/mirror-keys/{n:06}`. `verify` checks the backup store against it.
+///
+/// A page is lines of `P\t{prefix}` (the prefix the following keys were
+/// listed under) and `K\t{size}\t{key}`, keys in listing order. Every page
+/// opens with the prefix it continues, so each is read on its own.
+const KeyListWriter = struct {
+    a: std.mem.Allocator,
+    store: *blob.S3BlobStore,
+    run_id: []const u8,
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    lines: usize = 0,
+    pages: u32 = 0,
+    keys: u64 = 0,
+    prefix: []const u8 = "",
+
+    fn startPrefix(self: *KeyListWriter, prefix: []const u8) !void {
+        self.prefix = prefix;
+        try self.buf.writer(self.a).print("P\t{s}\n", .{prefix});
+        self.lines += 1;
+    }
+
+    fn add(self: *KeyListWriter, key: []const u8, size: u64) !void {
+        if (self.lines >= KEY_PAGE_LINES) {
+            try self.flush();
+            try self.startPrefix(self.prefix);
+        }
+        try self.buf.writer(self.a).print("K\t{d}\t{s}\n", .{ size, key });
+        self.lines += 1;
+        self.keys += 1;
+    }
+
+    fn flush(self: *KeyListWriter) !void {
+        if (self.buf.items.len == 0) return;
+        const key = try std.fmt.allocPrint(self.a, "{s}/mirror-keys/{d:0>6}", .{ self.run_id, self.pages });
+        defer self.a.free(key);
+        try self.store.blobStore().put(key, self.buf.items);
+        self.pages += 1;
+        self.buf.clearRetainingCapacity();
+        self.lines = 0;
+    }
+
+    fn deinit(self: *KeyListWriter) void {
+        self.buf.deinit(self.a);
+    }
+};
+
 /// Copy every object under `prefix` from the live store into the backup
 /// store, skipping what is already there.
 ///
@@ -892,13 +1102,20 @@ fn mirrorPrefix(
     backup: *blob.S3BlobStore,
     prefix: []const u8,
     stats: *MirrorStats,
+    keylist: *KeyListWriter,
 ) !void {
+    keylist.startPrefix(prefix) catch return error.MirrorIncomplete;
     var token: ?[]u8 = null;
     defer if (token) |t| a.free(t);
     while (true) {
         var page = try live.listPrefix(a, prefix, token);
         defer page.deinit(a);
-        for (page.keys) |key| {
+        for (page.keys, 0..) |key, i| {
+            const size: u64 = if (i < page.sizes.len) page.sizes[i] else 0;
+            keylist.add(key, size) catch |e| {
+                std.debug.print("  FAILED recording {s}: {s}\n", .{ key, @errorName(e) });
+                return error.MirrorIncomplete;
+            };
             if (backup.blobStore().exists(key) catch false) {
                 stats.skipped += 1;
                 continue;
@@ -939,6 +1156,8 @@ fn cmdMirror(a: std.mem.Allocator, args: Args) !u8 {
     defer parsed.deinit();
 
     var stats: MirrorStats = .{};
+    var keylist: KeyListWriter = .{ .a = a, .store = &target.store, .run_id = run_id };
+    defer keylist.deinit();
     var covered: std.ArrayListUnmanaged(u8) = .empty;
     defer covered.deinit(a);
     var first = true;
@@ -948,7 +1167,7 @@ fn cmdMirror(a: std.mem.Allocator, args: Args) !u8 {
         const prefixes = entry.object.get("object_prefixes") orelse continue;
         for (prefixes.array.items) |p| {
             const prefix = p.string;
-            mirrorPrefix(a, &live.store, &target.store, prefix, &stats) catch {
+            mirrorPrefix(a, &live.store, &target.store, prefix, &stats, &keylist) catch {
                 std.debug.print("mirror {s}: INCOMPLETE at {s}\n", .{ run_id, prefix });
                 return 1;
             };
@@ -978,7 +1197,7 @@ fn cmdMirror(a: std.mem.Allocator, args: Args) !u8 {
             const prefix = sp.string;
             if (seen_shared.contains(prefix)) continue;
             seen_shared.put(a, prefix, {}) catch @panic("OOM");
-            mirrorPrefix(a, &live.store, &target.store, prefix, &stats) catch {
+            mirrorPrefix(a, &live.store, &target.store, prefix, &stats, &keylist) catch {
                 std.debug.print("mirror {s}: INCOMPLETE at {s}\n", .{ run_id, prefix });
                 return 1;
             };
@@ -997,13 +1216,16 @@ fn cmdMirror(a: std.mem.Allocator, args: Args) !u8 {
         return 1;
     }
 
+    keylist.flush() catch |e| fatal("mirror key list write failed: {s}", .{@errorName(e)});
+
     // Written LAST, and only on a complete pass — the same rule the run
     // manifest follows. A mirror record present is the claim that every
-    // prefix it names was walked to the end.
+    // prefix it names was walked to the end, and its `key_pages` name the
+    // list of what that walk found, which is what `verify` checks.
     const rec = std.fmt.allocPrint(
         a,
-        "{{\"run_id\":\"{s}\",\"copied\":{d},\"skipped\":{d},\"bytes\":{d},\"prefixes\":[{s}]}}",
-        .{ run_id, stats.copied, stats.skipped, stats.bytes, covered.items },
+        "{{\"run_id\":\"{s}\",\"copied\":{d},\"skipped\":{d},\"bytes\":{d},\"keys\":{d},\"key_pages\":{d},\"prefixes\":[{s}]}}",
+        .{ run_id, stats.copied, stats.skipped, stats.bytes, keylist.keys, keylist.pages, covered.items },
     ) catch @panic("OOM");
     defer a.free(rec);
     const rkey = std.fmt.allocPrint(a, "{s}/mirror.json", .{run_id}) catch @panic("OOM");
